@@ -4,7 +4,7 @@ inputs:
   version:
     description: Hooversion package version to run.
     required: false
-    default: "0.1.0"
+    default: "0.0.0"
   bun-version:
     description: Bun version to install.
     required: false
