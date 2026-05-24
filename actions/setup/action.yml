@@ -1,0 +1,40 @@
+name: Setup Hooversion
+description: Install Bun and add a Hooversion CLI wrapper to PATH.
+inputs:
+  version:
+    description: Hooversion package version to run.
+    required: false
+    default: "0.1.0"
+  bun-version:
+    description: Bun version to install.
+    required: false
+    default: "1.3.14"
+outputs:
+  version:
+    description: Hooversion package version configured by this action.
+    value: ${{ steps.wrapper.outputs.version }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
+
+    - name: Add Hooversion wrapper
+      id: wrapper
+      shell: bash
+      env:
+        HOOVERSION_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        bin_dir="${RUNNER_TEMP}/hooversion-bin"
+        mkdir -p "$bin_dir"
+        cat > "$bin_dir/hooversion" <<EOF
+        #!/usr/bin/env bash
+        set -euo pipefail
+        exec bunx --bun "@openhoo/hooversion@${HOOVERSION_VERSION}" "\$@"
+        EOF
+        chmod +x "$bin_dir/hooversion"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "version=${HOOVERSION_VERSION}" >> "$GITHUB_OUTPUT"

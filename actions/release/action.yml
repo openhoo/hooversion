@@ -1,0 +1,123 @@
+name: Release With Hooversion
+description: Run Hooversion semantic release automation.
+inputs:
+  version:
+    description: Hooversion package version to run.
+    required: false
+    default: "0.1.0"
+  bun-version:
+    description: Bun version to install.
+    required: false
+    default: "1.3.14"
+  working-directory:
+    description: Repository directory where Hooversion should run.
+    required: false
+    default: "."
+  config:
+    description: Optional Hooversion config path.
+    required: false
+    default: ""
+  dry-run:
+    description: Set to true to preview the release without mutations.
+    required: false
+    default: "false"
+  push:
+    description: Set to false to skip pushing release commits and tags.
+    required: false
+    default: "true"
+  github:
+    description: Set to false to skip GitHub Release creation.
+    required: false
+    default: "true"
+  github-token:
+    description: Token used for git push and GitHub Release creation.
+    required: false
+    default: ""
+  install-command:
+    description: Optional project dependency install command to run before release.
+    required: false
+    default: ""
+  git-user-name:
+    description: Git user.name for release commits.
+    required: false
+    default: "github-actions[bot]"
+  git-user-email:
+    description: Git user.email for release commits.
+    required: false
+    default: "41898282+github-actions[bot]@users.noreply.github.com"
+outputs:
+  published:
+    description: true when Hooversion created at least one release.
+    value: ${{ steps.release.outputs.published }}
+  version:
+    description: Single-package release version, when exactly one package released.
+    value: ${{ steps.release.outputs.version }}
+  tag:
+    description: Single-package release tag, when exactly one package released.
+    value: ${{ steps.release.outputs.tag }}
+  releases-json:
+    description: JSON array of package release outputs.
+    value: ${{ steps.release.outputs.releases_json }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
+
+    - name: Configure release git author
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GIT_USER_NAME: ${{ inputs.git-user-name }}
+        GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        git config user.name "$GIT_USER_NAME"
+        git config user.email "$GIT_USER_EMAIL"
+        if [[ -n "$INPUT_GITHUB_TOKEN" && -n "${GITHUB_REPOSITORY:-}" ]]; then
+          server="${GITHUB_SERVER_URL:-https://github.com}"
+          server="${server#https://}"
+          git remote set-url origin "https://x-access-token:${INPUT_GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git"
+        fi
+
+    - name: Install project dependencies
+      if: ${{ inputs.install-command != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INSTALL_COMMAND: ${{ inputs.install-command }}
+      run: |
+        set -euo pipefail
+        eval "$INSTALL_COMMAND"
+
+    - name: Release
+      id: release
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HOOVERSION_VERSION: ${{ inputs.version }}
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+        INPUT_PUSH: ${{ inputs.push }}
+        INPUT_GITHUB: ${{ inputs.github }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GH_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        args=(release)
+        if [[ -n "$INPUT_CONFIG" ]]; then
+          args+=(--config "$INPUT_CONFIG")
+        fi
+        if [[ "$INPUT_DRY_RUN" == "true" ]]; then
+          args+=(--dry-run)
+        fi
+        if [[ "$INPUT_PUSH" != "true" ]]; then
+          args+=(--no-push)
+        fi
+        if [[ "$INPUT_GITHUB" != "true" ]]; then
+          args+=(--no-github)
+        fi
+        bunx --bun "@openhoo/hooversion@${HOOVERSION_VERSION}" "${args[@]}"

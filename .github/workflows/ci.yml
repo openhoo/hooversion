@@ -1,0 +1,113 @@
+name: CI and Release
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  commitlint:
+    name: Lint commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Validate latest commit
+        if: github.event_name == 'push'
+        run: bun run src/cli.ts lint --last
+
+      - name: Validate PR commits
+        if: github.event_name == 'pull_request'
+        run: bun run src/cli.ts lint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}"
+
+  build:
+    name: Test and build
+    runs-on: ubuntu-latest
+    needs: commitlint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run checks
+        run: bun run check
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+      issues: write
+      packages: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Release
+        id: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bun run release
+
+      - name: Set up Node for GitHub Packages
+        if: steps.release.outputs.published == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20.x"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@openhoo"
+
+      - name: Check published package version
+        if: steps.release.outputs.published == 'true'
+        id: package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if npm view "@openhoo/hooversion@${PACKAGE_VERSION}" version --registry=https://npm.pkg.github.com >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish package to GitHub Packages
+        if: steps.release.outputs.published == 'true' && steps.package.outputs.exists != 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm publish

@@ -1,0 +1,5 @@
+node_modules
+.hooversion
+.release-version
+coverage
+*.log

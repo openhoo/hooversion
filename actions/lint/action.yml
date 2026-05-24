@@ -1,0 +1,69 @@
+name: Lint Hooversion Commits
+description: Validate Conventional Commit messages with Hooversion.
+inputs:
+  version:
+    description: Hooversion package version to run.
+    required: false
+    default: "0.1.0"
+  bun-version:
+    description: Bun version to install.
+    required: false
+    default: "1.3.14"
+  working-directory:
+    description: Repository directory where Hooversion should run.
+    required: false
+    default: "."
+  from:
+    description: Start ref for commit range linting.
+    required: false
+    default: ""
+  to:
+    description: End ref for commit range linting.
+    required: false
+    default: ""
+  edit:
+    description: Commit message file to lint, for commit-msg hooks.
+    required: false
+    default: ""
+  last:
+    description: Set to true to lint only HEAD. Leave auto to infer from event context.
+    required: false
+    default: "auto"
+runs:
+  using: composite
+  steps:
+    - name: Set up Bun
+      uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: ${{ inputs.bun-version }}
+
+    - name: Lint commits
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        HOOVERSION_VERSION: ${{ inputs.version }}
+        INPUT_FROM: ${{ inputs.from }}
+        INPUT_TO: ${{ inputs.to }}
+        INPUT_EDIT: ${{ inputs.edit }}
+        INPUT_LAST: ${{ inputs.last }}
+        EVENT_NAME: ${{ github.event_name }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        args=(lint)
+        if [[ -n "$INPUT_EDIT" ]]; then
+          args+=(--edit "$INPUT_EDIT")
+        elif [[ -n "$INPUT_FROM" ]]; then
+          args+=(--from "$INPUT_FROM")
+          if [[ -n "$INPUT_TO" ]]; then
+            args+=(--to "$INPUT_TO")
+          fi
+        elif [[ "$INPUT_LAST" == "true" ]]; then
+          args+=(--last)
+        elif [[ "$EVENT_NAME" == "pull_request" && -n "$PR_BASE_SHA" && -n "$PR_HEAD_SHA" ]]; then
+          args+=(--from "$PR_BASE_SHA" --to "$PR_HEAD_SHA")
+        else
+          args+=(--last)
+        fi
+        bunx --bun "@openhoo/hooversion@${HOOVERSION_VERSION}" "${args[@]}"

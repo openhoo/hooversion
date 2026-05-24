@@ -1,0 +1,41 @@
+{
+  "name": "@openhoo/hooversion",
+  "version": "0.1.0",
+  "description": "Conventional commit linting and semantic release automation for multi-ecosystem repositories.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/openhoo/hooversion.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "type": "module",
+  "bin": {
+    "hooversion": "./dist/cli.js"
+  },
+  "files": [
+    "actions",
+    "dist",
+    "examples",
+    "README.md"
+  ],
+  "scripts": {
+    "dev": "bun run src/cli.ts",
+    "build": "bun build src/cli.ts --target=bun --format=esm --outfile=dist/cli.js && chmod +x dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "check": "bun run typecheck && bun test && bun run build",
+    "sync:actions": "bun run scripts/sync-action-versions.ts",
+    "plan": "bun run src/cli.ts plan",
+    "release": "bun run src/cli.ts release",
+    "prepack": "bun run build"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.14",
+    "typescript": "^6.0.3"
+  },
+  "engines": {
+    "bun": ">=1.3.14"
+  },
+  "packageManager": "bun@1.3.14"
+}

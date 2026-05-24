@@ -1,0 +1,20 @@
+export default {
+  branches: ["main"],
+  packages: [
+    {
+      name: "labelhoo",
+      path: ".",
+      type: "node",
+      manifest: "package.json",
+      changelog: "CHANGELOG.md",
+      scopes: ["labelhoo"],
+      dependencies: [],
+    },
+  ],
+  hooks: {
+    afterVersion: ["bun install --lockfile-only"],
+  },
+  github: {
+    releases: true,
+  },
+};
