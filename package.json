@@ -4,14 +4,15 @@
   "description": "Conventional commit linting and semantic release automation for multi-ecosystem repositories.",
   "repository": {
     "type": "git",
-    "url": "https://github.com/openhoo/hooversion.git"
+    "url": "git+https://github.com/openhoo/hooversion.git"
   },
   "publishConfig": {
-    "registry": "https://npm.pkg.github.com"
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
   },
   "type": "module",
   "bin": {
-    "hooversion": "./dist/cli.js"
+    "hooversion": "dist/cli.js"
   },
   "files": [
     "actions",
