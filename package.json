@@ -1,6 +1,6 @@
 {
   "name": "@openhoo/hooversion",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Conventional commit linting and semantic release automation for multi-ecosystem repositories.",
   "repository": {
     "type": "git",

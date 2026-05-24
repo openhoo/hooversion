@@ -1,5 +1,11 @@
 # @openhoo/hooversion Changelog
 
+## 0.1.1 (2026-05-24)
+
+### Bug Fixes
+
+- **hooversion:** publish package on npm (e45bb8c)
+
 ## 0.1.0 (2026-05-24)
 
 ### Other Changes
@@ -13,5 +19,3 @@
 ### Bug Fixes
 
 - configure release git author (ff6aebd)
-
-

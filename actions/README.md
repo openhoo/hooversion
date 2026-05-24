@@ -6,9 +6,9 @@ repositories.
 ## Setup CLI
 
 ```yaml
-- uses: openhoo/hooversion/actions/setup@v0.1.0
+- uses: openhoo/hooversion/actions/setup@v0.1.1
   with:
-    version: 0.1.0
+    version: 0.1.1
 - run: hooversion plan
 ```
 
@@ -18,9 +18,9 @@ repositories.
 - uses: actions/checkout@v6
   with:
     fetch-depth: 0
-- uses: openhoo/hooversion/actions/lint@v0.1.0
+- uses: openhoo/hooversion/actions/lint@v0.1.1
   with:
-    version: 0.1.0
+    version: 0.1.1
 ```
 
 ## Release
@@ -30,9 +30,9 @@ repositories.
   with:
     fetch-depth: 0
 - id: release
-  uses: openhoo/hooversion/actions/release@v0.1.0
+  uses: openhoo/hooversion/actions/release@v0.1.1
   with:
-    version: 0.1.0
+    version: 0.1.1
     github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
