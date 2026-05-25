@@ -41,4 +41,6 @@ repositories.
 Use `steps.release.outputs.published`, `version`, `tag`, and `releases-json`
 to open release PRs or gate downstream package, Docker, or archive publishing
 jobs. For repositories where `main` requires pull requests, use a
-`RELEASE_TOKEN` that can push the release branch and open the release PR.
+`RELEASE_TOKEN` that can push the release branch and open the release PR. Skip
+release preparation when that token is absent so normal main CI does not fail
+before release automation is enabled.

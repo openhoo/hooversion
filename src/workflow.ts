@@ -112,24 +112,29 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      RELEASE_TOKEN: \${{ secrets.RELEASE_TOKEN }}
     steps:
-      - name: Require release token
-        env:
-          RELEASE_TOKEN: \${{ secrets.RELEASE_TOKEN }}
+      - name: Check release token
+        id: release-token
         run: |
           set -euo pipefail
           if [[ -z "\${RELEASE_TOKEN}" ]]; then
-            echo "::error::Configure RELEASE_TOKEN with permission to push release PR branches and open pull requests."
-            exit 1
+            echo "::notice::Skipping release preparation because RELEASE_TOKEN is not configured."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
+        if: steps.release-token.outputs.configured == 'true'
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: main
 
       - name: Prepare release
+        if: steps.release-token.outputs.configured == 'true'
         id: release
         uses: ${actionOwnerRepo}/actions/release@${actionRef}
         with:
@@ -141,7 +146,7 @@ jobs:
           install-command: bun install --frozen-lockfile
 
       - name: Ensure release PR runs CI
-        if: steps.release.outputs.published == 'true'
+        if: steps.release-token.outputs.configured == 'true' && steps.release.outputs.published == 'true'
         run: |
           set -euo pipefail
           subject="$(git log -1 --pretty=%s)"
@@ -152,7 +157,7 @@ jobs:
           fi
 
       - name: Open release PR
-        if: steps.release.outputs.published == 'true'
+        if: steps.release-token.outputs.configured == 'true' && steps.release.outputs.published == 'true'
         env:
           GH_TOKEN: \${{ secrets.RELEASE_TOKEN }}
           RELEASE_VERSION: \${{ steps.release.outputs.version }}
