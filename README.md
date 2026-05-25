@@ -87,4 +87,6 @@ jobs:
 
 `actions/lint` automatically uses the PR base/head range on pull requests and
 `--last` on pushes. `actions/release` exposes `published`, `version`, `tag`, and
-`releases-json` outputs for release PR and downstream publishing jobs.
+`releases-json` outputs for release PR and downstream publishing jobs. Release
+PR preparation should be skipped until `RELEASE_TOKEN` is configured, so regular
+main CI stays green before release automation is enabled.
