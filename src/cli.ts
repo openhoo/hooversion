@@ -8,7 +8,7 @@ import { getCommits, getLastCommit } from "./git";
 import { createReleasePlan } from "./plan";
 import { executeRelease, validatePlan } from "./release";
 import { runDoctor } from "./doctor";
-import { writeGitHubWorkflow } from "./workflow";
+import { writeGitHubWorkflows } from "./workflow";
 import type { ParsedCommit, ReleasePlan } from "./types";
 
 interface CliFlags {
@@ -61,15 +61,17 @@ async function initCommand(cwd: string, flags: CliFlags): Promise<void> {
 
   const packages = detectPackages(cwd);
   const configPath = writeDefaultConfig(cwd, packages);
-  const workflowPath = flags.booleans.has("no-workflow")
+  const workflowPaths = flags.booleans.has("no-workflow")
     ? undefined
-    : writeGitHubWorkflow(cwd, {
+    : writeGitHubWorkflows(cwd, {
         actionOwnerRepo: flags.values.get("action-owner-repo"),
         actionRef: flags.values.get("action-ref"),
         hooversionVersion: flags.values.get("hooversion-version"),
       });
   console.log(`Wrote ${configPath}`);
-  if (workflowPath) console.log(`Wrote ${workflowPath}`);
+  for (const workflowPath of workflowPaths ?? []) {
+    console.log(`Wrote ${workflowPath}`);
+  }
 }
 
 function lintCommand(cwd: string, flags: CliFlags): void {
