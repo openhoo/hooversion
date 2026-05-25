@@ -33,14 +33,11 @@ repositories.
   uses: openhoo/hooversion/actions/release@v0.1.1
   with:
     version: 0.1.1
-    push: "false"
-    github: "false"
-    github-token: ${{ secrets.RELEASE_TOKEN }}
+    github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 Use `steps.release.outputs.published`, `version`, `tag`, and `releases-json`
-to open release PRs or gate downstream package, Docker, or archive publishing
-jobs. For repositories where `main` requires pull requests, use a
-`RELEASE_TOKEN` that can push the release branch and open the release PR. Skip
-release preparation when that token is absent so normal main CI does not fail
-before release automation is enabled.
+to gate downstream package, Docker, or archive publishing jobs. In repositories
+where `main` requires pull requests, allow GitHub Actions to bypass release-only
+branch protections so Hooversion can keep releases automatic while human changes
+remain pull-request gated.

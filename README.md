@@ -35,9 +35,9 @@ The release command updates manifests and changelogs, runs configured hooks,
 creates a release commit and tags, pushes them by default, creates GitHub
 Releases with `GITHUB_TOKEN`, and writes CI outputs to `.hooversion/outputs.json`.
 For a single release it also writes `.release-version` for compatibility with
-existing workflows. In protected repositories, run release preparation with
-`push: "false"` and `github: "false"`, open a release PR, then publish tags and
-GitHub Releases after that PR merges.
+existing workflows. In protected repositories that allow GitHub Actions to
+bypass release-only branch protections, this keeps releases automatic while
+human changes to `main` remain pull-request gated.
 
 ## GitHub Actions
 
@@ -80,13 +80,10 @@ jobs:
         uses: openhoo/hooversion/actions/release@v0.1.1
         with:
           version: 0.1.1
-          push: "false"
-          github: "false"
-          github-token: ${{ secrets.RELEASE_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
 `actions/lint` automatically uses the PR base/head range on pull requests and
 `--last` on pushes. `actions/release` exposes `published`, `version`, `tag`, and
-`releases-json` outputs for release PR and downstream publishing jobs. Release
-PR preparation should be skipped until `RELEASE_TOKEN` is configured, so regular
-main CI stays green before release automation is enabled.
+`releases-json` outputs for downstream package, Docker, or archive publishing
+jobs.
