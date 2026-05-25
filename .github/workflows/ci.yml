@@ -1,4 +1,4 @@
-name: CI and Release
+name: CI
 
 on:
   pull_request:
@@ -28,7 +28,7 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Validate latest commit
-        if: github.event_name == 'push'
+        if: github.event_name != 'pull_request'
         run: bun run src/cli.ts lint --last
 
       - name: Validate PR commits
@@ -53,66 +53,3 @@ jobs:
 
       - name: Run checks
         run: bun run check
-
-  release:
-    name: Release
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    permissions:
-      contents: write
-      id-token: write
-      issues: write
-      pull-requests: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.3.14
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      - name: Configure release git author
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Release
-        id: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: bun run release
-
-      - name: Set up Node for npm
-        if: steps.release.outputs.published == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20.x"
-          registry-url: "https://registry.npmjs.org"
-
-      - name: Set up latest npm
-        if: steps.release.outputs.published == 'true'
-        run: npm install -g npm@latest
-
-      - name: Check published package version
-        if: steps.release.outputs.published == 'true'
-        id: package
-        env:
-          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
-        run: |
-          set -euo pipefail
-          if npm view "@openhoo/hooversion@${PACKAGE_VERSION}" version --registry=https://registry.npmjs.org >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Publish package to npm
-        if: steps.release.outputs.published == 'true' && steps.package.outputs.exists != 'true'
-        run: npm publish --access public --provenance

@@ -95,14 +95,14 @@ export function validatePlan(cwd: string, config: NormalizedConfig, plan: Releas
 function releaseCommitMessage(plan: ReleasePlan): string {
   if (plan.releases.length === 1) {
     const release = plan.releases[0];
-    return `chore(release): ${release.package.name} ${release.nextVersion} [skip ci]\n\n${release.notes}`;
+    return `chore(release): ${release.package.name} ${release.nextVersion}\n\n${release.notes}`;
   }
 
   const summary = plan.releases.map((release) => `${release.package.name}@${release.nextVersion}`).join(", ");
   const notes = plan.releases
     .map((release) => `# ${release.package.name} ${release.nextVersion}\n\n${release.notes}`)
     .join("\n\n");
-  return `chore(release): ${summary} [skip ci]\n\n${notes}`;
+  return `chore(release): ${summary}\n\n${notes}`;
 }
 
 function runHooks(cwd: string, hooks: string[]): void {
