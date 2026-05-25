@@ -46,22 +46,15 @@ describe("GitHub Actions integration", () => {
     expect(workflows.release).toContain("github.event.workflow_run.conclusion == 'success'");
     expect(workflows.release).toContain("github.event.workflow_run.event == 'push'");
     expect(workflows.release).toContain("contains(github.event.workflow_run.head_commit.message, 'chore(release):')");
-    expect(workflows.release).toContain("Prepare release PR");
-    expect(workflows.release).toContain("RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}");
-    expect(workflows.release).toContain("Check release token");
-    expect(workflows.release).toContain("Skipping release preparation because RELEASE_TOKEN is not configured.");
-    expect(workflows.release).toContain("if: steps.release-token.outputs.configured == 'true'");
-    expect(workflows.release).toContain(
-      "if: steps.release-token.outputs.configured == 'true' && steps.release.outputs.published == 'true'",
-    );
-    expect(workflows.release).toContain('push: "false"');
-    expect(workflows.release).toContain('github: "false"');
-    expect(workflows.release).toContain("gh pr create --base main");
-    expect(workflows.release).toContain("Publish release");
-    expect(workflows.release).toContain("gh release create");
+    expect(workflows.release).toContain("name: Release");
+    expect(workflows.release).toContain("github-token: ${{ secrets.GITHUB_TOKEN }}");
+    expect(workflows.release).not.toContain("RELEASE_TOKEN");
+    expect(workflows.release).not.toContain("Prepare release PR");
+    expect(workflows.release).not.toContain('push: "false"');
+    expect(workflows.release).not.toContain('github: "false"');
+    expect(workflows.release).not.toContain("gh pr create");
     expect(workflows.release).toContain("fetch-depth: 0");
     expect(workflows.release).toContain("contents: write");
-    expect(workflows.release).toContain("github-token: ${{ secrets.RELEASE_TOKEN }}");
     expect(workflows.release).toContain("install-command: bun install --frozen-lockfile");
   });
 
