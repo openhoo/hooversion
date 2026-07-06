@@ -3,7 +3,7 @@
 
 // src/cli.ts
 import { existsSync as existsSync4, readFileSync as readFileSync6 } from "fs";
-import { basename as basename2 } from "path";
+import { basename as basename3 } from "path";
 
 // src/errors.ts
 class HooversionError extends Error {
@@ -91,7 +91,7 @@ function parseCommits(rawCommits) {
 
 // src/config.ts
 import { existsSync, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
-import { join as join2, normalize, relative } from "path";
+import { basename, join as join2, normalize, relative } from "path";
 import { pathToFileURL } from "url";
 
 // src/manifest.ts
@@ -102,6 +102,8 @@ function defaultManifestPath(type, packagePath) {
     return join(packagePath, "package.json");
   if (type === "rust")
     return join(packagePath, "Cargo.toml");
+  if (type === "version-file")
+    return join(packagePath, "version");
   return join(packagePath, "pyproject.toml");
 }
 function readManifest(cwd, pkg) {
@@ -110,6 +112,8 @@ function readManifest(cwd, pkg) {
     return readPackageJson(path);
   if (pkg.type === "rust")
     return readTomlPackage(path, "package");
+  if (pkg.type === "version-file")
+    return readVersionFile(path, pkg.name);
   return readTomlPackage(path, "project");
 }
 function updateManifestVersion(cwd, pkg, version) {
@@ -118,6 +122,11 @@ function updateManifestVersion(cwd, pkg, version) {
     const json = JSON.parse(readFileSync(path, "utf8"));
     json.version = version;
     writeFileSync(path, `${JSON.stringify(json, null, 2)}
+`);
+    return;
+  }
+  if (pkg.type === "version-file") {
+    writeFileSync(path, `${version}
 `);
     return;
   }
@@ -148,6 +157,13 @@ function readTomlPackage(path, sectionName) {
   const version = readTomlString(section, "version");
   if (!name || !version) {
     throw new HooversionError(`${path} [${sectionName}] must contain name and version`);
+  }
+  return { name, version };
+}
+function readVersionFile(path, name) {
+  const version = readFileSync(path, "utf8").trim();
+  if (!version) {
+    throw new HooversionError(`${path} must contain a version`);
   }
   return { name, version };
 }
@@ -310,6 +326,9 @@ function detectPackages(cwd) {
   if (existsSync(join2(cwd, "pyproject.toml"))) {
     candidates.push({ type: "python", path: ".", name: readTomlName(join2(cwd, "pyproject.toml"), "project") });
   }
+  if (existsSync(join2(cwd, "version"))) {
+    candidates.push({ type: "version-file", path: ".", name: basename(cwd) });
+  }
   const seen = new Set;
   return candidates.filter((pkg) => {
     const key = `${pkg.type}:${normalize(pkg.path)}`;
@@ -321,7 +340,7 @@ function detectPackages(cwd) {
 }
 function writeDefaultConfig(cwd, packages = detectPackages(cwd)) {
   if (packages.length === 0) {
-    throw new HooversionError("Could not detect package.json, Cargo.toml, or pyproject.toml.");
+    throw new HooversionError("Could not detect package.json, Cargo.toml, pyproject.toml, or version.");
   }
   const body = `export default {
   branches: ["main"],
@@ -861,7 +880,7 @@ import { join as join6 } from "path";
 
 // src/github.ts
 import { readFileSync as readFileSync4 } from "fs";
-import { basename, join as join4 } from "path";
+import { basename as basename2, join as join4 } from "path";
 async function publishGitHubRelease(cwd, config, release) {
   if (config.github === false || !config.github.releases)
     return;
@@ -894,7 +913,7 @@ async function publishGitHubRelease(cwd, config, release) {
 }
 async function uploadAsset(uploadUrlTemplate, token, path) {
   const uploadUrl = uploadUrlTemplate.replace(/\{.*$/, "");
-  const name = basename(path);
+  const name = basename2(path);
   const data = readFileSync4(path);
   await githubFetch(`${uploadUrl}?name=${encodeURIComponent(name)}`, token, {
     method: "POST",
@@ -1399,7 +1418,7 @@ function printVersion() {
     const json = JSON.parse(readFileSync6(packagePath, "utf8"));
     console.log(`${json.name ?? "hooversion"} ${json.version ?? "unknown"}`);
   } else {
-    console.log(`${basename2(process.argv[1] ?? "hooversion")} unknown`);
+    console.log(`${basename3(process.argv[1] ?? "hooversion")} unknown`);
   }
 }
 main().catch((error) => {
