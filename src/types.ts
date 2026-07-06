@@ -1,4 +1,4 @@
-export type PackageType = "node" | "rust" | "python";
+export type PackageType = "node" | "rust" | "python" | "version-file";
 
 export type ReleaseType = "major" | "minor" | "patch";
 

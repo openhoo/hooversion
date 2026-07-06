@@ -30,6 +30,10 @@ hooversion doctor
 
 Run `hooversion init` to generate `hooversion.config.ts`. See `examples/` for a
 single-package Node/Bun setup and an independent Rust workspace setup.
+Packages can use `node`, `rust`, `python`, or `version-file` manifests. The
+`version-file` type reads and writes a plain text file containing only the
+semantic version, which fits container or Go repos that already keep release
+versions in files such as `transports/version`.
 
 The release command updates manifests and changelogs, runs configured hooks,
 creates a release commit and tags, pushes them by default, creates GitHub

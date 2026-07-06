@@ -27,6 +27,27 @@ describe("release planning", () => {
     expect(plan.releases[0].tag).toBe("v0.2.0");
   });
 
+  it("plans a release from a plain version file", () => {
+    const cwd = makeRepo();
+    writeFileSync(join(cwd, "version"), "1.2.3\n");
+    commitAll(cwd, "initial import");
+    git(cwd, "tag", "-a", "v1.2.3", "-m", "v1.2.3");
+    writeFileSync(join(cwd, "Dockerfile"), "FROM scratch\n");
+    commitAll(cwd, "fix(image): repair container metadata");
+
+    const config = normalizeConfig(cwd, {
+      packages: [{ name: "image", path: ".", type: "version-file", manifest: "version" }],
+      github: false,
+      push: false,
+    });
+    const plan = createReleasePlan(cwd, config);
+
+    expect(plan.releases).toHaveLength(1);
+    expect(plan.releases[0].currentVersion).toBe("1.2.3");
+    expect(plan.releases[0].nextVersion).toBe("1.2.4");
+    expect(plan.releases[0].tag).toBe("v1.2.4");
+  });
+
   it("routes independent releases by path and propagates dependents as patch releases", () => {
     const cwd = makeRepo();
     mkdirSync(join(cwd, "crates", "hoot-plugin-sdk"), { recursive: true });

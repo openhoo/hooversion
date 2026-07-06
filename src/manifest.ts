@@ -11,6 +11,7 @@ export interface ManifestInfo {
 export function defaultManifestPath(type: PackageType, packagePath: string): string {
   if (type === "node") return join(packagePath, "package.json");
   if (type === "rust") return join(packagePath, "Cargo.toml");
+  if (type === "version-file") return join(packagePath, "version");
   return join(packagePath, "pyproject.toml");
 }
 
@@ -18,6 +19,7 @@ export function readManifest(cwd: string, pkg: NormalizedPackageConfig): Manifes
   const path = join(cwd, pkg.manifest);
   if (pkg.type === "node") return readPackageJson(path);
   if (pkg.type === "rust") return readTomlPackage(path, "package");
+  if (pkg.type === "version-file") return readVersionFile(path, pkg.name);
   return readTomlPackage(path, "project");
 }
 
@@ -27,6 +29,10 @@ export function updateManifestVersion(cwd: string, pkg: NormalizedPackageConfig,
     const json = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
     json.version = version;
     writeFileSync(path, `${JSON.stringify(json, null, 2)}\n`);
+    return;
+  }
+  if (pkg.type === "version-file") {
+    writeFileSync(path, `${version}\n`);
     return;
   }
 
@@ -64,6 +70,14 @@ function readTomlPackage(path: string, sectionName: string): ManifestInfo {
   const version = readTomlString(section, "version");
   if (!name || !version) {
     throw new HooversionError(`${path} [${sectionName}] must contain name and version`);
+  }
+  return { name, version };
+}
+
+function readVersionFile(path: string, name: string): ManifestInfo {
+  const version = readFileSync(path, "utf8").trim();
+  if (!version) {
+    throw new HooversionError(`${path} must contain a version`);
   }
   return { name, version };
 }
