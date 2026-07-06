@@ -36,6 +36,32 @@ describe("release execution", () => {
     expect(existsSync(join(cwd, ".release-version"))).toBe(true);
     expect(readFileSync(join(cwd, ".hooversion", "outputs.json"), "utf8")).toContain('"published": true');
   });
+
+  it("updates plain version-file manifests", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-release-version-file-"));
+    git(cwd, "init", "-b", "main");
+    git(cwd, "config", "user.email", "test@example.com");
+    git(cwd, "config", "user.name", "Hooversion Test");
+    writeFileSync(join(cwd, "version"), "2.4.0\n");
+    git(cwd, "add", "--all");
+    git(cwd, "commit", "-m", "initial import");
+    git(cwd, "tag", "-a", "v2.4.0", "-m", "v2.4.0");
+    writeFileSync(join(cwd, "image.txt"), "metadata\n");
+    git(cwd, "add", "--all");
+    git(cwd, "commit", "-m", "feat(image): add runtime metadata");
+
+    const config = normalizeConfig(cwd, {
+      packages: [{ name: "image", path: ".", type: "version-file", manifest: "version" }],
+      github: false,
+      push: false,
+    });
+    const plan = createReleasePlan(cwd, config);
+    await executeRelease(cwd, config, plan, { push: false, github: false });
+
+    expect(readFileSync(join(cwd, "version"), "utf8")).toBe("2.5.0\n");
+    expect(readFileSync(join(cwd, "CHANGELOG.md"), "utf8")).toContain("## 2.5.0");
+    expect(git(cwd, "tag", "--list", "v2.5.0")).toBe("v2.5.0");
+  });
 });
 
 function git(cwd: string, ...args: string[]): string {

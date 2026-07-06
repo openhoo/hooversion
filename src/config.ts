@@ -1,5 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join, normalize, relative } from "node:path";
+import { basename, join, normalize, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { HooversionError } from "./errors";
 import { defaultManifestPath, readManifest } from "./manifest";
@@ -94,6 +94,10 @@ export function detectPackages(cwd: string): NormalizedPackageConfig[] {
     candidates.push({ type: "python", path: ".", name: readTomlName(join(cwd, "pyproject.toml"), "project") });
   }
 
+  if (existsSync(join(cwd, "version"))) {
+    candidates.push({ type: "version-file", path: ".", name: basename(cwd) });
+  }
+
   const seen = new Set<string>();
   return candidates
     .filter((pkg) => {
@@ -107,7 +111,7 @@ export function detectPackages(cwd: string): NormalizedPackageConfig[] {
 
 export function writeDefaultConfig(cwd: string, packages = detectPackages(cwd)): string {
   if (packages.length === 0) {
-    throw new HooversionError("Could not detect package.json, Cargo.toml, or pyproject.toml.");
+    throw new HooversionError("Could not detect package.json, Cargo.toml, pyproject.toml, or version.");
   }
 
   const body = `export default {
