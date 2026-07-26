@@ -14,6 +14,12 @@ describe("commit parsing", () => {
     expect(parseCommit(raw("feat(api): change payload", "BREAKING CHANGE: payload is now nested")).releaseType).toBe(
       "major",
     );
+    expect(parseCommit(raw("feat(api): mention a phrase", "BREAKING CHANGE: prose\nstill ordinary body text")).releaseType).toBe(
+      "minor",
+    );
+    expect(parseCommit(raw("feat(api): change payload", "details about the payload\n\nBREAKING CHANGE: payload is now nested")).releaseType).toBe(
+      "major",
+    );
   });
 
   it("lints invalid headers", () => {

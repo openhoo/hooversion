@@ -2,8 +2,8 @@
 // @bun
 
 // src/cli.ts
-import { existsSync as existsSync4, readFileSync as readFileSync6 } from "fs";
-import { basename as basename3 } from "path";
+import { existsSync as existsSync4, readFileSync as readFileSync7, unlinkSync as unlinkSync3 } from "fs";
+import { basename as basename3, join as join8 } from "path";
 
 // src/errors.ts
 class HooversionError extends Error {
@@ -17,14 +17,14 @@ class HooversionError extends Error {
 
 // src/commit.ts
 var conventionalHeaderPattern = /^([a-z][a-z0-9-]*)(?:\(([^()\r\n]+)\))?(!)?: (.+)$/;
-var breakingFooterPattern = /(?:^|\n)BREAKING[ -]CHANGE: /;
+var breakingFooterLinePattern = /^BREAKING[ -]CHANGE:\s*\S.*$/;
 var ignoredSubjectPatterns = [
   /^Merge /,
   /^Revert "/,
   /^revert: /i,
   /^chore\(release\)!?: /
 ];
-var releaseRules = {
+var defaultReleaseRules = {
   feat: "minor",
   fix: "patch",
   perf: "patch"
@@ -32,7 +32,7 @@ var releaseRules = {
 function isIgnoredSubject(subject) {
   return ignoredSubjectPatterns.some((pattern) => pattern.test(subject));
 }
-function parseCommit(raw) {
+function parseCommit(raw, policy = {}) {
   const ignored = isIgnoredSubject(raw.subject);
   const match = conventionalHeaderPattern.exec(raw.subject);
   if (!match) {
@@ -45,7 +45,8 @@ function parseCommit(raw) {
     };
   }
   const [, type, scope, bang, description] = match;
-  const breaking = Boolean(bang) || breakingFooterPattern.test(raw.body);
+  const releaseRules = { ...defaultReleaseRules, ...policy.releaseTypes };
+  const breaking = Boolean(breakingChangeDescription(raw.body)) || Boolean(bang);
   return {
     ...raw,
     type,
@@ -56,7 +57,7 @@ function parseCommit(raw) {
     ignored
   };
 }
-function lintCommit(raw) {
+function lintCommit(raw, policy = {}) {
   if (isIgnoredSubject(raw.subject))
     return [];
   const issues = [];
@@ -70,6 +71,9 @@ function lintCommit(raw) {
     return issues;
   }
   const [, type, , , description] = match;
+  if (policy.allowedTypes && !policy.allowedTypes.includes(type)) {
+    issues.push({ hash: raw.hash, subject: raw.subject, message: `type '${type}' is not allowed` });
+  }
   if (!type) {
     issues.push({ hash: raw.hash, subject: raw.subject, message: "type is required" });
   }
@@ -85,17 +89,39 @@ function lintCommit(raw) {
   }
   return issues;
 }
-function parseCommits(rawCommits) {
-  return rawCommits.map(parseCommit);
+function parseCommits(rawCommits, policy = {}) {
+  return rawCommits.map((raw) => parseCommit(raw, policy));
+}
+function breakingChangeDescription(body) {
+  const lines = body.split(/\r?\n/);
+  for (let index = 0;index < lines.length; index += 1) {
+    const match = breakingFooterLinePattern.exec(lines[index].trim());
+    if (!match)
+      continue;
+    if (index === 0 && lines.length === 1 || lines[index - 1]?.trim() === "") {
+      return lines[index].trim().replace(/^BREAKING[ -]CHANGE:\s*/, "").trim();
+    }
+  }
+  return;
 }
 
 // src/config.ts
 import { existsSync, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
-import { basename, join as join2, normalize, relative } from "path";
+import { basename, join as join2, normalize, relative as relative2 } from "path";
 import { pathToFileURL } from "url";
 
 // src/manifest.ts
-import { readFileSync, writeFileSync } from "fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  openSync,
+  readFileSync,
+  writeSync,
+  writeFileSync
+} from "fs";
 import { dirname, join } from "path";
 function defaultManifestPath(type, packagePath) {
   if (type === "node")
@@ -134,14 +160,125 @@ function updateManifestVersion(cwd, pkg, version) {
   updateTomlSectionVersion(path, section, version);
 }
 function updateLocalDependencyVersions(cwd, packages, releasedVersions) {
+  const packageNames = new Map(packages.map((pkg) => [normalizePackageName(pkg.name), pkg.name]));
+  const rustReleasedVersions = new Map(Array.from(releasedVersions).filter(([name]) => packages.some((pkg) => pkg.type === "rust" && normalizePackageName(pkg.name) === normalizePackageName(name))));
   for (const pkg of packages) {
+    const localVersions = new Map;
+    for (const dependency of pkg.dependencies) {
+      const actualName = packageNames.get(normalizePackageName(dependency));
+      const version = actualName ? releasedVersions.get(actualName) ?? releasedVersions.get(dependency) : undefined;
+      if (actualName && version)
+        localVersions.set(actualName, version);
+    }
+    if (localVersions.size === 0)
+      continue;
     const path = join(cwd, pkg.manifest);
     if (pkg.type === "node") {
-      updateNodeLocalDependencies(path, releasedVersions);
+      updateNodeLocalDependencies(path, pkg, localVersions);
+    } else if (pkg.type === "python") {
+      updatePythonLocalDependencies(path, pkg, localVersions);
     } else if (pkg.type === "rust") {
-      updateRustLocalDependencies(path, releasedVersions);
+      updateRustLocalDependencies(path, pkg, localVersions);
     }
   }
+  const workspaceManifest = join(cwd, "Cargo.toml");
+  if (rustReleasedVersions.size > 0) {
+    try {
+      updateRustWorkspaceDependencies(workspaceManifest, rustReleasedVersions);
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
+  }
+  if (rustReleasedVersions.size > 0)
+    updateCargoLock(cwd, rustReleasedVersions);
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizePackageName(name) {
+  return name.trim().toLowerCase();
+}
+function findReleasedName(name, releasedVersions) {
+  const normalized = normalizePackageName(name);
+  return Array.from(releasedVersions.keys()).find((candidate) => normalizePackageName(candidate) === normalized);
+}
+function assertAllDependenciesFound(path, owner, releasedVersions, found) {
+  for (const target of releasedVersions.keys()) {
+    if (!found.has(target)) {
+      throw new HooversionError(`${path} package ${owner.name} declares local dependency ${target}, but it was not found`);
+    }
+  }
+}
+function rewriteNodeRequirement(current, version, path, name) {
+  if (current.startsWith("workspace:"))
+    return current;
+  if (/^(?:file|git|https?):/.test(current)) {
+    throw new HooversionError(`${path} dependency ${name} has unsupported specifier ${current}`);
+  }
+  const prefix = current.match(/^[~^]/)?.[0] ?? "";
+  return `${prefix}${version}`;
+}
+function isPythonDependencySection(section) {
+  return section === "project" || section === "project.optional-dependencies" || section.startsWith("project.optional-dependencies.") || section === "tool.poetry.dependencies" || section.startsWith("tool.poetry.group.") && section.endsWith(".dependencies");
+}
+function rewritePythonRequirementsLine(line, releasedVersions, found, path) {
+  let changed = false;
+  const output = line.replace(/(["'])([^"']*)\1/g, (full, quote, requirement) => {
+    const nameMatch = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(requirement);
+    if (!nameMatch)
+      return full;
+    const target = findReleasedName(nameMatch[1], releasedVersions);
+    if (!target)
+      return full;
+    found.add(target);
+    const next = rewritePythonRequirement(requirement, releasedVersions.get(target), path, nameMatch[1]);
+    if (next === requirement)
+      return full;
+    changed = true;
+    return `${quote}${next}${quote}`;
+  });
+  return { line: output, changed };
+}
+function rewritePythonRequirement(requirement, version, path, name) {
+  const suffix = requirement.slice(name.length);
+  if (suffix.trimStart().startsWith("@")) {
+    throw new HooversionError(`${path} dependency ${name} has unsupported direct URL syntax`);
+  }
+  return `${name}${rewritePythonConstraint(suffix, version, path, name)}`;
+}
+function rewritePythonConstraint(current, version, path, name) {
+  if (current.includes("@")) {
+    throw new HooversionError(`${path} dependency ${name} has unsupported direct URL syntax`);
+  }
+  const match = /([<>=!~]{1,3})\s*([0-9][^,\s;]*)/.exec(current);
+  if (match)
+    return current.replace(match[2], version);
+  const marker = current.search(/\s*;/);
+  if (marker >= 0)
+    return `${current.slice(0, marker)}==${version}${current.slice(marker)}`;
+  return `${current}==${version}`;
+}
+function isRustDependencySection(section, workspaceOnly) {
+  if (workspaceOnly)
+    return section === "workspace.dependencies";
+  return ["dependencies", "dev-dependencies", "build-dependencies"].includes(section) || /^target\..+\.(dependencies|dev-dependencies|build-dependencies)$/.test(section);
+}
+function findRustDottedDependency(section, releasedVersions, workspaceOnly) {
+  const match = (workspaceOnly ? /^workspace\.dependencies\.((?:"[^"]+"|[A-Za-z0-9_-]+))$/ : /^(?:(?:dependencies|dev-dependencies|build-dependencies)|(?:target\..+\.(?:dependencies|dev-dependencies|build-dependencies)))\.((?:"[^"]+"|[A-Za-z0-9_-]+))$/).exec(section);
+  if (!match)
+    return;
+  const name = match[1].replace(/^"|"$/g, "");
+  return findReleasedName(name, releasedVersions);
+}
+function finishRustDottedDependency(path, dependency, found) {
+  if (!dependency.workspace && !dependency.versionUpdated) {
+    throw new HooversionError(`${path} dependency ${dependency.target} has no supported version field`);
+  }
+  found.add(dependency.target);
+}
+function braceDelta(value) {
+  return (value.match(/\{/g)?.length ?? 0) - (value.match(/\}/g)?.length ?? 0);
 }
 function readPackageJson(path) {
   const json = JSON.parse(readFileSync(path, "utf8"));
@@ -212,52 +349,475 @@ function updateTomlSectionVersion(path, sectionName, version) {
   writeFileSync(path, output.join(`
 `));
 }
-function updateNodeLocalDependencies(path, releasedVersions) {
+function updateNodeLocalDependencies(path, owner, releasedVersions) {
   const json = JSON.parse(readFileSync(path, "utf8"));
+  const sections = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+  const found = new Set;
   let changed = false;
-  for (const section of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
-    const deps = json[section];
-    if (!deps || typeof deps !== "object")
+  for (const section of sections) {
+    const value = json[section];
+    if (value === undefined)
       continue;
-    for (const [name, version] of releasedVersions) {
-      if (typeof deps[name] === "string") {
-        const current = deps[name];
-        const prefix = current.match(/^[~^]/)?.[0] ?? "";
-        deps[name] = `${prefix}${version}`;
+    if (!isRecord(value))
+      throw new HooversionError(`${path} ${section} must be an object`);
+    for (const [name, current] of Object.entries(value)) {
+      const target = findReleasedName(name, releasedVersions);
+      if (!target)
+        continue;
+      found.add(target);
+      if (typeof current !== "string") {
+        throw new HooversionError(`${path} package ${owner.name} has unsupported dependency ${name}`);
+      }
+      const next = rewriteNodeRequirement(current, releasedVersions.get(target), path, name);
+      if (next !== current) {
+        value[name] = next;
         changed = true;
       }
     }
   }
-  if (changed) {
+  assertAllDependenciesFound(path, owner, releasedVersions, found);
+  if (changed)
     writeFileSync(path, `${JSON.stringify(json, null, 2)}
 `);
+}
+function updatePythonLocalDependencies(path, owner, releasedVersions) {
+  const lines = readFileSync(path, "utf8").split(/\r?\n/);
+  const found = new Set;
+  let changed = false;
+  let section = "";
+  let inArray = false;
+  for (let index = 0;index < lines.length; index += 1) {
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(lines[index]);
+    if (heading) {
+      section = heading[1];
+      inArray = false;
+      continue;
+    }
+    const relevant = isPythonDependencySection(section);
+    if (!relevant)
+      continue;
+    if (inArray) {
+      const result = rewritePythonRequirementsLine(lines[index], releasedVersions, found, path);
+      lines[index] = result.line;
+      changed ||= result.changed;
+      if (/\]/.test(lines[index]))
+        inArray = false;
+      continue;
+    }
+    const assignment = /^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*)$/.exec(lines[index]);
+    if (!assignment)
+      continue;
+    const key = assignment[1];
+    const value = assignment[2];
+    if (value.startsWith("[") && (key === "dependencies" || section === "project.optional-dependencies" || section.startsWith("project.optional-dependencies."))) {
+      const result = rewritePythonRequirementsLine(lines[index], releasedVersions, found, path);
+      lines[index] = result.line;
+      changed ||= result.changed;
+      if (!/\]/.test(value))
+        inArray = true;
+      continue;
+    }
+    if (section.startsWith("tool.poetry") && findReleasedName(key, releasedVersions)) {
+      if (!/^["']/.test(value)) {
+        throw new HooversionError(`${path} package ${owner.name} has unsupported dependency ${key}`);
+      }
+      const quote = value[0];
+      const end = value.indexOf(quote, 1);
+      if (end < 0)
+        throw new HooversionError(`${path} has malformed dependency ${key}`);
+      const target = findReleasedName(key, releasedVersions);
+      const next = rewritePythonConstraint(value.slice(1, end), releasedVersions.get(target), path, key);
+      found.add(target);
+      if (next !== value.slice(1, end)) {
+        lines[index] = `${lines[index].slice(0, lines[index].indexOf(value) + 1)}${next}${value.slice(end)}`;
+        changed = true;
+      }
+    } else if (key === "dependencies" && value.startsWith("{")) {
+      if (Array.from(releasedVersions.keys()).some((name) => value.includes(name))) {
+        throw new HooversionError(`${path} has unsupported inline dependency table`);
+      }
+    }
+  }
+  assertAllDependenciesFound(path, owner, releasedVersions, found);
+  if (changed)
+    writeFileSync(path, lines.join(`
+`));
+}
+function updateRustLocalDependencies(path, owner, releasedVersions) {
+  updateRustDependencyTables(path, owner, releasedVersions, false);
+}
+function updateRustWorkspaceDependencies(path, releasedVersions) {
+  updateRustDependencyTables(path, undefined, releasedVersions, true);
+}
+function updateRustDependencyTables(path, owner, releasedVersions, workspaceOnly) {
+  const lines = readFileSync(path, "utf8").split(/\r?\n/);
+  const found = new Set;
+  let section = "";
+  let active;
+  let dotted;
+  let changed = false;
+  for (let index = 0;index < lines.length; index += 1) {
+    const line = lines[index];
+    if (active) {
+      if (/workspace\s*=\s*true/.test(line))
+        active.workspace = true;
+      if (!active.workspace && /^\s*version\s*=/.test(line)) {
+        lines[index] = line.replace(/=\s*["'][^"']+["']/, `= "${releasedVersions.get(active.target)}"`);
+        active.versionUpdated = true;
+        changed = true;
+      }
+      active.depth += braceDelta(line);
+      if (active.depth <= 0) {
+        if (!active.workspace && !active.versionUpdated) {
+          throw new HooversionError(`${path} dependency ${active.target} has no supported version field`);
+        }
+        found.add(active.target);
+        active = undefined;
+      }
+      continue;
+    }
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (heading) {
+      if (dotted)
+        finishRustDottedDependency(path, dotted, found);
+      section = heading[1];
+      const target2 = findRustDottedDependency(section, releasedVersions, workspaceOnly);
+      dotted = target2 ? { target: target2, workspace: false, versionUpdated: false } : undefined;
+      continue;
+    }
+    if (dotted) {
+      if (/workspace\s*=\s*true/.test(line))
+        dotted.workspace = true;
+      if (!dotted.workspace && /^\s*version\s*=/.test(line)) {
+        lines[index] = line.replace(/=\s*["'][^"']+["']/, `= "${releasedVersions.get(dotted.target)}"`);
+        dotted.versionUpdated = true;
+        changed = true;
+      }
+      continue;
+    }
+    if (!isRustDependencySection(section, workspaceOnly))
+      continue;
+    const entry = /^\s*(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*=\s*(.*)$/.exec(line);
+    if (!entry)
+      continue;
+    const name = entry[1] ?? entry[2];
+    const target = findReleasedName(name, releasedVersions);
+    if (!target)
+      continue;
+    const value = entry[3].trim();
+    if (value.startsWith("{")) {
+      const workspace = /workspace\s*=\s*true/.test(value);
+      const versionMatch = /version\s*=\s*["'][^"']+["']/.test(value);
+      const depth = braceDelta(value);
+      if (depth > 0) {
+        active = { target, depth, workspace, versionUpdated: false };
+      } else if (!workspace && versionMatch) {
+        lines[index] = line.replace(/(version\s*=\s*)["'][^"']+["']/, `$1"${releasedVersions.get(target)}"`);
+        found.add(target);
+        changed = true;
+      } else if (workspace) {
+        found.add(target);
+      } else {
+        throw new HooversionError(`${path} dependency ${name} has unsupported table syntax`);
+      }
+      continue;
+    }
+    if (/^["']/.test(value)) {
+      const quote = value[0];
+      const end = value.indexOf(quote, 1);
+      if (end < 0)
+        throw new HooversionError(`${path} has malformed dependency ${name}`);
+      lines[index] = `${line.slice(0, line.indexOf(value) + 1)}${releasedVersions.get(target)}${value.slice(end)}`;
+      found.add(target);
+      changed = true;
+      continue;
+    }
+    throw new HooversionError(`${path} dependency ${name} has unsupported value`);
+  }
+  if (dotted)
+    finishRustDottedDependency(path, dotted, found);
+  if (!workspaceOnly && owner)
+    assertAllDependenciesFound(path, owner, releasedVersions, found);
+  if (changed)
+    writeFileSync(path, lines.join(`
+`));
+}
+function updateCargoLock(cwd, releasedVersions) {
+  const path = join(cwd, "Cargo.lock");
+  let fd;
+  try {
+    fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile())
+      throw new HooversionError(`${path} must be a regular file`);
+    const lines = readFileSync(fd, "utf8").split(/\r?\n/);
+    const starts = lines.flatMap((line, index) => line.trim() === "[[package]]" ? [index] : []);
+    let changed = false;
+    for (let block = 0;block < starts.length; block += 1) {
+      const start = starts[block];
+      const end = starts[block + 1] ?? lines.length;
+      const nameLine = lines.slice(start, end).find((line) => /^\s*name\s*=/.test(line));
+      const name = nameLine ? readTomlString(nameLine, "name") : undefined;
+      const target = name ? findReleasedName(name, releasedVersions) : undefined;
+      const hasSource = lines.slice(start, end).some((line) => /^\s*source\s*=/.test(line));
+      if (target && !hasSource) {
+        const versionIndex = lines.findIndex((line, index) => index >= start && index < end && /^\s*version\s*=/.test(line));
+        if (versionIndex < 0)
+          throw new HooversionError(`${path} package ${name} has no version field`);
+        const version = releasedVersions.get(target);
+        const updatedVersion = lines[versionIndex].replace(/=\s*["'][^"']+["']/, `= "${version}"`);
+        if (updatedVersion !== lines[versionIndex]) {
+          lines[versionIndex] = updatedVersion;
+          changed = true;
+        }
+      }
+      let inDependencies = false;
+      for (let index = start;index < end; index += 1) {
+        if (/^\s*dependencies\s*=\s*\[/.test(lines[index])) {
+          inDependencies = true;
+          if (/\]/.test(lines[index]))
+            inDependencies = false;
+          continue;
+        }
+        if (!inDependencies || hasSource)
+          continue;
+        lines[index] = lines[index].replace(/(["'])([^"']+) \d[^"']*\1/g, (full, quote, dependencyName) => {
+          const dependencyTarget = findReleasedName(dependencyName, releasedVersions);
+          if (!dependencyTarget || /\s\(/.test(full))
+            return full;
+          changed = true;
+          return `${quote}${dependencyName} ${releasedVersions.get(dependencyTarget)}${quote}`;
+        });
+        if (/\]/.test(lines[index]))
+          inDependencies = false;
+      }
+    }
+    if (changed) {
+      ftruncateSync(fd, 0);
+      writeFileDescriptor(fd, lines.join(`
+`));
+      fsyncSync(fd);
+    }
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  } finally {
+    if (fd !== undefined)
+      closeSync(fd);
   }
 }
-function updateRustLocalDependencies(path, releasedVersions) {
-  let text = readFileSync(path, "utf8");
-  let changed = false;
-  for (const [name, version] of releasedVersions) {
-    const escaped = escapeRegExp(name);
-    const inlinePattern = new RegExp(`(^\\s*${escaped}\\s*=\\s*\\{[^\\n}]*version\\s*=\\s*)["'][^"']+["']`, "m");
-    if (inlinePattern.test(text)) {
-      text = text.replace(inlinePattern, `$1"${version}"`);
-      changed = true;
-    }
-    const simplePattern = new RegExp(`(^\\s*${escaped}\\s*=\\s*)["'][^"']+["']`, "m");
-    if (simplePattern.test(text) && !new RegExp(`^\\s*${escaped}\\s*=\\s*\\{`, "m").test(text)) {
-      text = text.replace(simplePattern, `$1"${version}"`);
-      changed = true;
-    }
-  }
-  if (changed) {
-    writeFileSync(path, text);
+function writeFileDescriptor(fd, content) {
+  const data = Buffer.from(content);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = writeSync(fd, data, offset, data.byteLength - offset, offset);
+    if (written <= 0)
+      throw new HooversionError("Failed to write Cargo.lock");
+    offset += written;
   }
 }
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// src/git.ts
+import { relative, resolve, sep } from "path";
+
+// src/process.ts
+import { spawnSync } from "child_process";
+function runCommand(command, args, cwd, env) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? ""
+  };
+}
+function runShell(command, cwd, env) {
+  const result = spawnSync(command, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env,
+    shell: (env ?? process.env).SHELL ?? "/bin/sh"
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? ""
+  };
+}
+
+// src/git.ts
+function assertValidGitRef(value, kind) {
+  if (typeof value !== "string" || value.length === 0 || value === "@" || value.startsWith("-") || value.startsWith("refs/") || value.startsWith("/") || value.endsWith("/") || value.includes("//") || value.includes("..") || value.includes("@{") || /[\u0000-\u0020\u007f~^:?*\\]/u.test(value) || value.includes("[")) {
+    throw new HooversionError(`Invalid Git ${kind} name: ${JSON.stringify(value)}`);
+  }
+  const components = value.split("/");
+  if (components.some((component) => component.length === 0 || component === "." || component === ".." || component.startsWith(".") || component.endsWith(".") || component.toLowerCase().endsWith(".lock"))) {
+    throw new HooversionError(`Invalid Git ${kind} name: ${JSON.stringify(value)}`);
+  }
+}
+function commandEnv(auth) {
+  return auth ? { ...process.env, ...auth } : undefined;
+}
+function git(cwd, args, allowFailure = false, auth) {
+  const result = runCommand("git", args, cwd, commandEnv(auth));
+  if (result.code !== 0 && !allowFailure) {
+    throw new HooversionError(`git ${args.join(" ")} failed:
+${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trimEnd();
+}
+function isGitRepository(cwd) {
+  return runCommand("git", ["rev-parse", "--is-inside-work-tree"], cwd).code === 0;
+}
+function getCurrentBranch(cwd) {
+  const branch = git(cwd, ["branch", "--show-current"]).trim();
+  if (branch)
+    return branch;
+  if (process.env.GITHUB_HEAD_REF)
+    return process.env.GITHUB_HEAD_REF;
+  if (process.env.GITHUB_REF_TYPE !== "tag" && process.env.GITHUB_REF_NAME)
+    return process.env.GITHUB_REF_NAME;
+  return git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+}
+function ensureCleanWorkingTree(cwd, ignoredPaths = [], scopedOutputDir) {
+  const ignored = new Set(ignoredPaths.map((path) => resolve(cwd, path)));
+  const unexpected = git(cwd, ["status", "--porcelain", "--untracked-files=all"]).split(`
+`).filter((line) => {
+    if (!line.trim())
+      return false;
+    const path = line.slice(3).trim();
+    return !ignored.has(resolve(cwd, path));
+  });
+  if (scopedOutputDir) {
+    const resolvedOutputDir = resolve(cwd, scopedOutputDir);
+    const relativeOutputDir = relative(cwd, resolvedOutputDir);
+    if (relativeOutputDir && !relativeOutputDir.startsWith(`..${sep}`) && relativeOutputDir !== "..") {
+      const ignoredOutputFiles = git(cwd, ["ls-files", "--others", "--ignored", "--exclude-standard", "--", relativeOutputDir], true).split(`
+`).filter((path) => path.trim() && !ignored.has(resolve(cwd, path.trim())));
+      unexpected.push(...ignoredOutputFiles.map((path) => `?? ${path}`));
+    }
+  }
+  if (unexpected.length > 0) {
+    throw new HooversionError(`Working tree must be clean before release:
+${unexpected.join(`
+`)}`);
+  }
+}
+function getLatestTag(cwd, pattern) {
+  const output = git(cwd, ["describe", "--tags", "--abbrev=0", "--match", pattern], true).trim();
+  return output || undefined;
+}
+function tagExists(cwd, tag) {
+  assertValidGitRef(tag, "tag");
+  return runCommand("git", ["rev-parse", "--verify", "--quiet", "--", `refs/tags/${tag}`], cwd).code === 0;
+}
+function getHeadSha(cwd) {
+  return git(cwd, ["rev-parse", "HEAD"]).trim();
+}
+function getRefSha(cwd, ref) {
+  let commitRef;
+  if (typeof ref !== "string") {
+    throw new HooversionError(`Invalid Git revision: ${JSON.stringify(ref)}`);
+  }
+  if (ref === "HEAD" || ref === "HEAD^" || /^[0-9a-fA-F]{40}$/u.test(ref)) {
+    commitRef = ref;
+  } else if (ref.startsWith("refs/tags/")) {
+    const tag = ref.slice("refs/tags/".length);
+    assertValidGitRef(tag, "tag");
+    commitRef = `${ref}^{commit}`;
+  } else if (ref.startsWith("refs/heads/")) {
+    assertValidGitRef(ref.slice("refs/heads/".length), "branch");
+    commitRef = ref;
+  } else {
+    throw new HooversionError(`Invalid Git revision: ${JSON.stringify(ref)}`);
+  }
+  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", "--end-of-options", commitRef], cwd);
+  return result.code === 0 ? result.stdout.trim() : undefined;
+}
+function getRemoteBranchSha(cwd, branch, auth) {
+  assertValidGitRef(branch, "branch");
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote)
+    return;
+  const output = git(cwd, ["ls-remote", "--", "origin", `refs/heads/${branch}`], true, auth).trim();
+  return output ? output.split(/\s+/, 1)[0] : "";
+}
+function getCommitMessage(cwd, ref = "HEAD") {
+  return git(cwd, ["show", "-s", "--format=%B", ref]).trimEnd();
+}
+function pushRelease(cwd, branch, tags, auth) {
+  assertValidGitRef(branch, "branch");
+  for (const tag of tags)
+    assertValidGitRef(tag, "tag");
+  git(cwd, [
+    "push",
+    "--atomic",
+    "--no-verify",
+    "--",
+    "origin",
+    `HEAD:refs/heads/${branch}`,
+    ...tags.map((tag) => `refs/tags/${tag}`)
+  ], false, auth);
+}
+function getCommits(cwd, fromRef, toRef = "HEAD") {
+  const range = fromRef ? `${fromRef}..${toRef}` : toRef;
+  const revList = git(cwd, ["rev-list", "--reverse", range], true).trim();
+  if (!revList)
+    return [];
+  return revList.split(`
+`).map((hash) => {
+    const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
+    const body = git(cwd, ["show", "-s", "--format=%b", hash]);
+    const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
+`).map((file) => file.trim()).filter(Boolean);
+    return { hash, subject, body, files };
+  });
+}
+function getLastCommit(cwd) {
+  const hash = git(cwd, ["rev-parse", "HEAD"]).trim();
+  const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
+  const body = git(cwd, ["show", "-s", "--format=%b", hash]);
+  const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
+`).map((file) => file.trim()).filter(Boolean);
+  return { hash, subject, body, files };
+}
+function createReleaseCommit(cwd, message) {
+  git(cwd, ["add", "--all"]);
+  const status = git(cwd, ["status", "--porcelain"]);
+  if (!status.trim())
+    return;
+  git(cwd, ["commit", "-m", message]);
+}
+function createAnnotatedTag(cwd, tag, message) {
+  assertValidGitRef(tag, "tag");
+  git(cwd, ["tag", "-a", tag, "-m", message]);
+}
+function getOriginRepository(cwd) {
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote)
+    return;
+  const sshMatch = /^git@[^:]+:([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
+  if (sshMatch)
+    return sshMatch[1];
+  const httpsMatch = /^https?:\/\/[^/]+\/([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
+  if (httpsMatch)
+    return httpsMatch[1];
+  return;
+}
+
 // src/config.ts
+function assertValidTagFormat(format, packages) {
+  for (const pkg of packages) {
+    const candidate = format.replaceAll("${name}", pkg.name).replaceAll("${version}", "0.0.0");
+    assertValidGitRef(candidate, "tag");
+  }
+}
 var configFiles = [
   "hooversion.config.ts",
   "hooversion.config.mjs",
@@ -287,19 +847,44 @@ function normalizeConfig(cwd, raw) {
     throw new HooversionError("Config must define at least one package.");
   }
   const packages = raw.packages.map((pkg) => normalizePackage(cwd, pkg));
-  const packageNames = new Set(packages.map((pkg) => pkg.name));
+  const packageNames = new Map;
   for (const pkg of packages) {
+    const normalizedName = normalizeGraphName(pkg.name);
+    const duplicate = packageNames.get(normalizedName);
+    if (duplicate) {
+      throw new HooversionError(`Duplicate package name after normalization: ${duplicate.name} and ${pkg.name}`);
+    }
+    packageNames.set(normalizedName, pkg);
+  }
+  const graph = new Map;
+  for (const pkg of packages) {
+    const dependencies = [];
     for (const dependency of pkg.dependencies) {
-      if (!packageNames.has(dependency)) {
+      const target = packageNames.get(normalizeGraphName(dependency));
+      if (!target) {
         throw new HooversionError(`Package ${pkg.name} depends on unknown package ${dependency}`);
       }
+      if (target === pkg) {
+        throw new HooversionError(`Package ${pkg.name} cannot depend on itself`);
+      }
+      dependencies.push(target.name);
     }
+    pkg.dependencies = dependencies;
+    graph.set(normalizeGraphName(pkg.name), dependencies.map(normalizeGraphName));
   }
+  assertAcyclicPackageGraph(packages, graph);
+  const branches = raw.branches ?? ["main"];
+  const tagFormat = raw.tagFormat ?? "v${version}";
+  const independentTagFormat = raw.independentTagFormat ?? "${name}@v${version}";
+  for (const branch of branches)
+    assertValidGitRef(branch, "branch");
+  assertValidTagFormat(tagFormat, packages);
+  assertValidTagFormat(independentTagFormat, packages);
   return {
     ...raw,
-    branches: raw.branches ?? ["main"],
-    tagFormat: raw.tagFormat ?? "v${version}",
-    independentTagFormat: raw.independentTagFormat ?? "${name}@v${version}",
+    branches,
+    tagFormat,
+    independentTagFormat,
     packages,
     hooks: {
       beforeRelease: raw.hooks?.beforeRelease ?? [],
@@ -379,7 +964,7 @@ function normalizePackage(cwd, pkg) {
     dependencies: pkg.dependencies ?? [],
     assets: pkg.assets ?? []
   });
-  const name = pkg.name || info.name;
+  const name = (pkg.name || info.name).trim();
   return {
     ...pkg,
     name,
@@ -388,9 +973,32 @@ function normalizePackage(cwd, pkg) {
     manifest,
     changelog: normalizeRelative(pkg.changelog ?? defaultChangelog(packagePath)),
     scopes: [...new Set([name, ...pkg.scopes ?? []])],
-    dependencies: pkg.dependencies ?? [],
+    dependencies: (pkg.dependencies ?? []).map((dependency) => dependency.trim()),
     assets: pkg.assets ?? []
   };
+}
+function normalizeGraphName(name) {
+  return name.trim().toLowerCase();
+}
+function assertAcyclicPackageGraph(packages, graph) {
+  const state = new Map;
+  const stack = [];
+  const visit = (name) => {
+    if (state.get(name) === "visited")
+      return;
+    if (state.get(name) === "visiting") {
+      const cycleStart = stack.indexOf(name);
+      throw new HooversionError(`Package dependency cycle detected: ${[...stack.slice(cycleStart), name].join(" -> ")}`);
+    }
+    state.set(name, "visiting");
+    stack.push(name);
+    for (const dependency of graph.get(name) ?? [])
+      visit(dependency);
+    stack.pop();
+    state.set(name, "visited");
+  };
+  for (const pkg of packages)
+    visit(normalizeGraphName(pkg.name));
 }
 function detectCargoPackages(cwd) {
   const root = join2(cwd, "Cargo.toml");
@@ -480,121 +1088,6 @@ function normalizeRelative(path) {
   return normalized === "" ? "." : normalized;
 }
 
-// src/process.ts
-import { spawnSync } from "child_process";
-function runCommand(command, args, cwd) {
-  const result = spawnSync(command, args, {
-    cwd,
-    encoding: "utf8",
-    env: process.env
-  });
-  return {
-    code: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? ""
-  };
-}
-function runShell(command, cwd) {
-  const result = spawnSync(command, {
-    cwd,
-    encoding: "utf8",
-    env: process.env,
-    shell: process.env.SHELL ?? "/bin/sh"
-  });
-  return {
-    code: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? ""
-  };
-}
-
-// src/git.ts
-function git(cwd, args, allowFailure = false) {
-  const result = runCommand("git", args, cwd);
-  if (result.code !== 0 && !allowFailure) {
-    throw new HooversionError(`git ${args.join(" ")} failed:
-${result.stderr || result.stdout}`);
-  }
-  return result.stdout.trimEnd();
-}
-function isGitRepository(cwd) {
-  return runCommand("git", ["rev-parse", "--is-inside-work-tree"], cwd).code === 0;
-}
-function getCurrentBranch(cwd) {
-  const branch = git(cwd, ["branch", "--show-current"]).trim();
-  if (branch)
-    return branch;
-  if (process.env.GITHUB_HEAD_REF)
-    return process.env.GITHUB_HEAD_REF;
-  if (process.env.GITHUB_REF_TYPE !== "tag" && process.env.GITHUB_REF_NAME)
-    return process.env.GITHUB_REF_NAME;
-  return git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
-}
-function ensureCleanWorkingTree(cwd) {
-  const status = git(cwd, ["status", "--porcelain"]);
-  if (status.trim()) {
-    throw new HooversionError(`Working tree must be clean before release:
-${status}`);
-  }
-}
-function getLatestTag(cwd, pattern) {
-  const output = git(cwd, ["describe", "--tags", "--abbrev=0", "--match", pattern], true).trim();
-  return output || undefined;
-}
-function tagExists(cwd, tag) {
-  return runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`], cwd).code === 0;
-}
-function getCommits(cwd, fromRef, toRef = "HEAD") {
-  const range = fromRef ? `${fromRef}..${toRef}` : toRef;
-  const revList = git(cwd, ["rev-list", "--reverse", range], true).trim();
-  if (!revList)
-    return [];
-  return revList.split(`
-`).map((hash) => {
-    const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
-    const body = git(cwd, ["show", "-s", "--format=%b", hash]);
-    const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
-`).map((file) => file.trim()).filter(Boolean);
-    return { hash, subject, body, files };
-  });
-}
-function getLastCommit(cwd) {
-  const hash = git(cwd, ["rev-parse", "HEAD"]).trim();
-  const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
-  const body = git(cwd, ["show", "-s", "--format=%b", hash]);
-  const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
-`).map((file) => file.trim()).filter(Boolean);
-  return { hash, subject, body, files };
-}
-function createReleaseCommit(cwd, message) {
-  git(cwd, ["add", "--all"]);
-  const status = git(cwd, ["status", "--porcelain"]);
-  if (!status.trim())
-    return;
-  git(cwd, ["commit", "-m", message]);
-}
-function createAnnotatedTag(cwd, tag, message) {
-  git(cwd, ["tag", "-a", tag, "-m", message]);
-}
-function pushRelease(cwd, branch, tags) {
-  git(cwd, ["push", "origin", `HEAD:${branch}`]);
-  if (tags.length > 0) {
-    git(cwd, ["push", "origin", ...tags]);
-  }
-}
-function getOriginRepository(cwd) {
-  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
-  if (!remote)
-    return;
-  const sshMatch = /^git@[^:]+:([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
-  if (sshMatch)
-    return sshMatch[1];
-  const httpsMatch = /^https?:\/\/[^/]+\/([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
-  if (httpsMatch)
-    return httpsMatch[1];
-  return;
-}
-
 // src/semver.ts
 var versionPattern = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
 function parseVersion(version) {
@@ -632,14 +1125,21 @@ function highestReleaseType(types) {
   }
   return result;
 }
-function minReleaseType(current, minimum) {
-  return highestReleaseType([current, minimum]) ?? minimum;
-}
 
 // src/changelog.ts
-import { existsSync as existsSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "fs";
+import {
+  closeSync as closeSync2,
+  constants as fsConstants2,
+  fstatSync as fstatSync2,
+  fsyncSync as fsyncSync2,
+  mkdirSync,
+  openSync as openSync2,
+  readFileSync as readFileSync3,
+  renameSync,
+  unlinkSync,
+  writeSync as writeSync2
+} from "fs";
 import { dirname as dirname2, join as join3 } from "path";
-import { mkdirSync } from "fs";
 var groupTitles = {
   major: "Breaking Changes",
   feat: "Features",
@@ -656,7 +1156,7 @@ function generateReleaseNotes(release) {
       const scope = commit.scope ? `**${commit.scope}:** ` : "";
       lines.push(`- ${scope}${commit.description} (${commit.hash.slice(0, 7)})`);
       if (commit.breaking && commit.body) {
-        const breaking = extractBreakingChange(commit.body);
+        const breaking = breakingChangeDescription(commit.body);
         if (breaking)
           lines.push(`  - BREAKING: ${breaking}`);
       }
@@ -669,7 +1169,20 @@ function generateReleaseNotes(release) {
 function updateChangelog(cwd, release) {
   const path = join3(cwd, release.changelogPath);
   mkdirSync(dirname2(path), { recursive: true });
-  const existing = existsSync2(path) ? readFileSync3(path, "utf8") : "";
+  let existing = "";
+  let sourceFd;
+  try {
+    sourceFd = openSync2(path, fsConstants2.O_RDONLY | fsConstants2.O_NOFOLLOW | fsConstants2.O_NONBLOCK);
+    if (!fstatSync2(sourceFd).isFile())
+      throw new HooversionError(`${path} must be a regular file`);
+    existing = readFileSync3(sourceFd, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      throw error;
+  } finally {
+    if (sourceFd !== undefined)
+      closeSync2(sourceFd);
+  }
   const title = `# ${release.package.name} Changelog`;
   const normalizedExisting = existing.trim() ? existing : `${title}
 `;
@@ -683,7 +1196,43 @@ ${release.notes}
 
 ${body.trimEnd()}
 `;
-  writeFileSync3(path, next);
+  const tempPath = `${path}.hooversion-${process.pid}-${Math.random().toString(16).slice(2)}.tmp`;
+  let tempFd;
+  let tempOwned = false;
+  try {
+    tempFd = openSync2(tempPath, fsConstants2.O_WRONLY | fsConstants2.O_CREAT | fsConstants2.O_EXCL | fsConstants2.O_NOFOLLOW, 384);
+    tempOwned = true;
+    writeChangelogFile(tempFd, next);
+    fsyncSync2(tempFd);
+    closeSync2(tempFd);
+    tempFd = undefined;
+    renameSync(tempPath, path);
+    tempOwned = false;
+  } finally {
+    if (tempFd !== undefined) {
+      try {
+        closeSync2(tempFd);
+      } catch {}
+    }
+    if (tempOwned) {
+      try {
+        unlinkSync(tempPath);
+      } catch (error) {
+        if (error.code !== "ENOENT")
+          throw error;
+      }
+    }
+  }
+}
+function writeChangelogFile(fd, content) {
+  const data = Buffer.from(content);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = writeSync2(fd, data, offset, data.byteLength - offset, offset);
+    if (written <= 0)
+      throw new HooversionError("Failed to write changelog");
+    offset += written;
+  }
 }
 function groupCommits(commits) {
   const buckets = new Map;
@@ -696,20 +1245,17 @@ function groupCommits(commits) {
       pushBucket(buckets, "Other Changes", commit);
     }
   }
-  return Array.from(buckets.entries()).filter(([, values]) => values.length > 0);
+  const orderedTitles = [...Object.values(groupTitles), "Other Changes"];
+  return orderedTitles.map((title) => [title, buckets.get(title) ?? []]).filter(([, values]) => values.length > 0);
 }
 function pushBucket(map, key, commit) {
   const bucket = map.get(key) ?? [];
   bucket.push(commit);
   map.set(key, bucket);
 }
-function extractBreakingChange(body) {
-  const match = /(?:^|\n)BREAKING[ -]CHANGE:\s*([^\n]+)/.exec(body);
-  return match?.[1]?.trim();
-}
 
 // src/routing.ts
-import { relative as relative2 } from "path";
+import { relative as relative3 } from "path";
 function directAffectedPackages(commit, packages) {
   const affected = new Set;
   const scoped = scopeTargets(commit.scope, packages);
@@ -724,22 +1270,6 @@ function directAffectedPackages(commit, packages) {
     }
   }
   return affected;
-}
-function propagateDependencies(affected, packages) {
-  const result = new Set(affected);
-  let changed = true;
-  while (changed) {
-    changed = false;
-    for (const pkg of packages) {
-      if (result.has(pkg.name))
-        continue;
-      if (pkg.dependencies.some((dependency) => result.has(dependency))) {
-        result.add(pkg.name);
-        changed = true;
-      }
-    }
-  }
-  return result;
 }
 function scopeTargets(scope, packages) {
   const result = new Set;
@@ -762,7 +1292,7 @@ function fileBelongsToPackage(file, pkg, packages) {
   return isInside(file, pkg.path);
 }
 function isInside(file, packagePath) {
-  const rel = relative2(packagePath, file);
+  const rel = relative3(packagePath, file);
   return rel === "" || !rel.startsWith("..") && rel !== ".";
 }
 
@@ -771,69 +1301,68 @@ function renderTag(format, pkg, version) {
   return format.replaceAll("${name}", pkg.name).replaceAll("${version}", version);
 }
 function tagPatternForPackage(config, pkg) {
-  if (config.packages.length === 1)
-    return "v[0-9]*";
-  return config.independentTagFormat.replaceAll("${name}", pkg.name).replaceAll("${version}", "[0-9]*");
+  const format = config.packages.length === 1 ? config.tagFormat : config.independentTagFormat;
+  return format.replaceAll("${name}", pkg.name).replaceAll("${version}", "[0-9]*");
 }
 function tagForPackage(config, pkg, version) {
   return renderTag(config.packages.length === 1 ? config.tagFormat : config.independentTagFormat, pkg, version);
 }
 function createReleasePlan(cwd, config) {
   const branch = getCurrentBranch(cwd);
+  const sourceSha = git(cwd, ["rev-parse", "HEAD"]).trim();
   const independent = config.packages.length > 1;
-  return independent ? createIndependentPlan(cwd, config, branch) : createSinglePackagePlan(cwd, config, branch);
+  return independent ? createIndependentPlan(cwd, config, branch, sourceSha) : createSinglePackagePlan(cwd, config, branch, sourceSha);
 }
-function createSinglePackagePlan(cwd, config, branch) {
+function createSinglePackagePlan(cwd, config, branch, sourceSha) {
   const pkg = config.packages[0];
   const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
-  const commits = parseCommits(getCommits(cwd, latestTag)).filter((commit) => !commit.ignored);
+  const commits = parseCommits(getCommits(cwd, latestTag, sourceSha)).filter((commit) => !commit.ignored);
   const releaseType = highestReleaseType(commits.map((commit) => commit.releaseType));
   const releases = releaseType ? [buildRelease(cwd, config, pkg, commits, releaseType, latestTag, false)] : [];
-  return { cwd, branch, independent: false, releases, unmatchedCommits: [] };
+  return { cwd, branch, sourceSha, independent: false, releases, unmatchedCommits: [] };
 }
-function createIndependentPlan(cwd, config, branch) {
+function createIndependentPlan(cwd, config, branch, sourceSha) {
   const latestTags = new Map;
-  const parsedCommitsByPackage = new Map;
   const candidateCommits = new Map;
-  const directAffectedByCommit = new Map;
-  const affectedByCommit = new Map;
   for (const pkg of config.packages) {
     const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
     latestTags.set(pkg.name, latestTag);
-    const commits = parseCommits(getCommits(cwd, latestTag)).filter((commit) => !commit.ignored);
-    parsedCommitsByPackage.set(pkg.name, commits);
+    const commits = parseCommits(getCommits(cwd, latestTag, sourceSha)).filter((commit) => !commit.ignored);
     for (const commit of commits) {
       candidateCommits.set(commit.hash, commit);
     }
   }
+  const directAffectedByCommit = new Map;
+  const releaseTypes = new Map;
+  const releaseCommits = new Map;
   for (const commit of candidateCommits.values()) {
     const direct = directAffectedPackages(commit, config.packages);
     directAffectedByCommit.set(commit.hash, direct);
-    affectedByCommit.set(commit.hash, propagateDependencies(direct, config.packages));
+    if (!commit.releaseType)
+      continue;
+    for (const packageName of direct) {
+      releaseTypes.set(packageName, highestReleaseType([releaseTypes.get(packageName), commit.releaseType]));
+      const commits = releaseCommits.get(packageName) ?? [];
+      commits.push(commit);
+      releaseCommits.set(packageName, commits);
+    }
   }
   const unmatchedCommits = Array.from(candidateCommits.values()).filter((commit) => commit.releaseType && (directAffectedByCommit.get(commit.hash)?.size ?? 0) === 0);
   if (unmatchedCommits.length > 0) {
-    return { cwd, branch, independent: true, releases: [], unmatchedCommits };
+    return { cwd, branch, sourceSha, independent: true, releases: [], unmatchedCommits };
   }
-  const releaseTypes = new Map;
-  const releaseCommits = new Map;
   const dependencyTriggered = new Set;
-  for (const pkg of config.packages) {
-    const packageCommits = parsedCommitsByPackage.get(pkg.name) ?? [];
-    for (const commit of packageCommits) {
-      const affected = affectedByCommit.get(commit.hash) ?? new Set;
-      if (!affected.has(pkg.name))
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pkg of config.packages) {
+      if (releaseTypes.has(pkg.name))
         continue;
-      if (!commit.releaseType)
+      if (!pkg.dependencies.some((dependency) => releaseTypes.has(dependency)))
         continue;
-      const direct = directAffectedByCommit.get(commit.hash) ?? new Set;
-      const typeForPackage = direct.has(pkg.name) ? commit.releaseType : "patch";
-      if (!direct.has(pkg.name))
-        dependencyTriggered.add(pkg.name);
-      releaseTypes.set(pkg.name, minReleaseType(releaseTypes.get(pkg.name), typeForPackage));
-      const commits = releaseCommits.get(pkg.name) ?? [];
-      commits.push(commit);
-      releaseCommits.set(pkg.name, commits);
+      releaseTypes.set(pkg.name, "patch");
+      dependencyTriggered.add(pkg.name);
+      changed = true;
     }
   }
   const releases = [];
@@ -843,7 +1372,7 @@ function createIndependentPlan(cwd, config, branch) {
       continue;
     releases.push(buildRelease(cwd, config, pkg, uniqueCommits(releaseCommits.get(pkg.name) ?? []), releaseType, latestTags.get(pkg.name), dependencyTriggered.has(pkg.name)));
   }
-  return { cwd, branch, independent: true, releases, unmatchedCommits: [] };
+  return { cwd, branch, sourceSha, independent: true, releases, unmatchedCommits: [] };
 }
 function buildRelease(cwd, config, pkg, commits, releaseType, latestTag, dependencyTriggered) {
   const currentVersion = readManifest(cwd, pkg).version;
@@ -876,15 +1405,16 @@ function uniqueCommits(commits) {
 
 // src/release.ts
 import { mkdirSync as mkdirSync3 } from "fs";
-import { join as join6 } from "path";
+import { join as join5 } from "path";
 
 // src/github.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { basename as basename2, join as join4 } from "path";
-async function publishGitHubRelease(cwd, config, release) {
+import { constants as fsConstants3 } from "fs";
+import * as fs from "fs/promises";
+import { basename as basename2, isAbsolute, relative as relative4, resolve as resolve2, sep as sep2, win32 } from "path";
+async function publishGitHubRelease(cwd, config, release, options = {}) {
   if (config.github === false || !config.github.releases)
     return;
-  const token = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  const token = options.token || process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
   if (!token) {
     throw new HooversionError("GITHUB_TOKEN or GH_TOKEN is required to create GitHub releases.");
   }
@@ -893,28 +1423,225 @@ async function publishGitHubRelease(cwd, config, release) {
     throw new HooversionError("Could not determine GitHub repository. Set github.repository in hooversion config.");
   }
   const apiUrl = config.github.apiUrl.replace(/\/$/, "");
-  const response = await githubFetch(`${apiUrl}/repos/${repository}/releases`, token, {
-    method: "POST",
-    body: JSON.stringify({
-      tag_name: release.tag,
-      name: `${release.package.name} ${release.nextVersion}`,
-      body: release.notes,
-      draft: false,
-      prerelease: false
-    }),
-    headers: {
-      "content-type": "application/json"
+  const releaseName = `${release.package.name} ${release.nextVersion}`;
+  const existing = await githubFetch(`${apiUrl}/repos/${repository}/releases/tags/${encodeURIComponent(release.tag)}`, token, { method: "GET" }, true);
+  let response;
+  let existingAssetNames = new Set;
+  if (existing) {
+    const matches = existing.tag_name === release.tag && existing.name === releaseName && existing.body === release.notes && existing.draft === false && existing.prerelease === false;
+    if (!matches) {
+      throw new HooversionError(`GitHub release already exists for tag ${release.tag} with different metadata.`);
     }
-  });
-  for (const asset of release.package.assets) {
-    await uploadAsset(response.upload_url, token, join4(cwd, asset));
+    response = existing;
+    existingAssetNames = releaseAssetNames(existing.assets);
+  } else {
+    response = await githubFetch(`${apiUrl}/repos/${repository}/releases`, token, {
+      method: "POST",
+      body: JSON.stringify({
+        tag_name: release.tag,
+        name: releaseName,
+        body: release.notes,
+        draft: false,
+        prerelease: false
+      }),
+      headers: {
+        "content-type": "application/json"
+      }
+    });
   }
+  await uploadMissingAssets(response.upload_url, apiUrl, token, cwd, release.package.assets, existingAssetNames);
   return response.html_url;
 }
-async function uploadAsset(uploadUrlTemplate, token, path) {
-  const uploadUrl = uploadUrlTemplate.replace(/\{.*$/, "");
-  const name = basename2(path);
-  const data = readFileSync4(path);
+async function uploadMissingAssets(uploadUrlTemplate, apiUrl, token, cwd, assets, existingAssetNames) {
+  const missingAssets = new Map;
+  for (const asset of assets) {
+    assertSafeReleaseAssetPath(asset);
+    const name = basename2(asset);
+    if (!existingAssetNames.has(name) && !missingAssets.has(name)) {
+      missingAssets.set(name, asset);
+    }
+  }
+  if (missingAssets.size === 0)
+    return;
+  const uploadUrl = validateGitHubUploadUrl(uploadUrlTemplate, apiUrl);
+  const preparedAssets = await readMissingReleaseAssets(cwd, missingAssets);
+  try {
+    for (const prepared of preparedAssets.values()) {
+      await assertStableReleaseAssetDescriptor(prepared);
+    }
+    for (const prepared of preparedAssets.values()) {
+      await assertStableReleaseAssetDescriptor(prepared);
+      await uploadAsset(uploadUrl, token, prepared.data, prepared.name);
+    }
+  } finally {
+    await Promise.all(preparedAssets.map(async ({ file }) => file.close()));
+  }
+}
+var maxReleaseAssetSizeBytes = 100 * 1024 * 1024;
+async function readMissingReleaseAssets(cwd, missingAssets) {
+  let root;
+  try {
+    root = await fs.realpath(cwd);
+    if (!(await fs.lstat(root)).isDirectory()) {
+      throw new HooversionError(`Release asset root is not a directory: ${cwd}`);
+    }
+  } catch (error) {
+    if (error instanceof HooversionError)
+      throw error;
+    throw new HooversionError(`Could not resolve release asset root: ${cwd}`);
+  }
+  const preparedAssets = [];
+  try {
+    for (const [name, asset] of missingAssets) {
+      preparedAssets.push(await readValidatedReleaseAsset(root, asset, name));
+    }
+    return preparedAssets;
+  } catch (error) {
+    await Promise.all(preparedAssets.map(async ({ file }) => file.close()));
+    throw error;
+  }
+}
+function assertSafeReleaseAssetPath(asset) {
+  if (asset.length === 0 || asset.includes("\x00") || isAbsolute(asset) || win32.isAbsolute(asset) || asset.split(/[\\/]+/u).includes("..")) {
+    throw new HooversionError(`Release asset path must be relative without parent traversal: ${asset}`);
+  }
+}
+function isContainedPath(root, path) {
+  const pathFromRoot = relative4(root, path);
+  return pathFromRoot === "" || pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep2}`) && !isAbsolute(pathFromRoot);
+}
+function resolveReleaseAssetPath(root, asset) {
+  const path = resolve2(root, asset);
+  if (!isContainedPath(root, path)) {
+    throw new HooversionError(`Release asset path escapes the repository: ${asset}`);
+  }
+  return path;
+}
+async function readValidatedReleaseAsset(root, asset, name) {
+  const path = resolveReleaseAssetPath(root, asset);
+  let file;
+  try {
+    const noFollow = fsConstants3.O_NOFOLLOW;
+    if (typeof noFollow !== "number") {
+      throw new HooversionError("Secure release asset uploads require O_NOFOLLOW support.");
+    }
+    file = await fs.open(path, fsConstants3.O_RDONLY | noFollow);
+    const descriptorStats = await file.stat();
+    assertRegularReleaseAsset(descriptorStats, asset);
+    const descriptorMetadata = releaseAssetMetadata(descriptorStats);
+    await assertStableReleaseAssetPath(root, path, asset, descriptorMetadata);
+    const data = await readReleaseAssetDescriptor(file, descriptorMetadata.size, asset);
+    const afterReadMetadata = releaseAssetMetadata(await file.stat());
+    if (!sameReleaseAssetMetadata(descriptorMetadata, afterReadMetadata) || data.byteLength !== descriptorMetadata.size) {
+      throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+    }
+    await assertStableReleaseAssetPath(root, path, asset, afterReadMetadata);
+    return { name, path, root, data, file, metadata: afterReadMetadata };
+  } catch (error) {
+    if (file)
+      await file.close();
+    if (error instanceof HooversionError)
+      throw error;
+    const reason = error instanceof Error ? error.message : "unknown error";
+    throw new HooversionError(`Could not securely read release asset ${asset}: ${reason}`);
+  }
+}
+async function assertStableReleaseAssetDescriptor(asset) {
+  const descriptorMetadata = releaseAssetMetadata(await asset.file.stat());
+  if (!sameReleaseAssetMetadata(asset.metadata, descriptorMetadata)) {
+    throw new HooversionError(`Release asset changed while it was being read: ${asset.name}`);
+  }
+  await assertStableReleaseAssetPath(asset.root, asset.path, asset.name, descriptorMetadata);
+}
+function assertRegularReleaseAsset(stats, asset) {
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new HooversionError(`Release asset must be a regular file, not a symbolic link: ${asset}`);
+  }
+  if (!Number.isSafeInteger(stats.size) || stats.size < 0 || stats.size > maxReleaseAssetSizeBytes) {
+    throw new HooversionError(`Release asset exceeds the ${maxReleaseAssetSizeBytes} byte upload limit: ${asset}`);
+  }
+}
+function releaseAssetMetadata(stats) {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs
+  };
+}
+function sameReleaseAssetMetadata(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+async function assertStableReleaseAssetPath(root, path, asset, expected) {
+  const canonicalPath = await fs.realpath(path);
+  if (!isContainedPath(root, canonicalPath)) {
+    throw new HooversionError(`Release asset path escapes the repository: ${asset}`);
+  }
+  if (canonicalPath !== path) {
+    throw new HooversionError(`Release asset path must not traverse a symbolic link: ${asset}`);
+  }
+  const pathStats = await fs.lstat(path);
+  assertRegularReleaseAsset(pathStats, asset);
+  if (!sameReleaseAssetMetadata(expected, releaseAssetMetadata(pathStats))) {
+    throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+  }
+}
+async function readReleaseAssetDescriptor(file, size, asset) {
+  const data = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const { bytesRead } = await file.read(data, offset, data.byteLength - offset, offset);
+    if (bytesRead === 0) {
+      throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+    }
+    offset += bytesRead;
+  }
+  return data;
+}
+function releaseAssetNames(assets) {
+  if (assets === undefined)
+    return new Set;
+  if (!Array.isArray(assets)) {
+    throw new HooversionError("GitHub release response has invalid assets.");
+  }
+  const assetNames = new Set;
+  for (const asset of assets) {
+    if (typeof asset !== "object" || asset === null || !("name" in asset) || typeof asset.name !== "string") {
+      throw new HooversionError("GitHub release response has invalid assets.");
+    }
+    assetNames.add(basename2(asset.name));
+  }
+  return assetNames;
+}
+function validateGitHubUploadUrl(uploadUrlTemplate, apiUrl) {
+  if (typeof uploadUrlTemplate !== "string") {
+    throw new HooversionError("Invalid GitHub release upload URL.");
+  }
+  const uploadUrl = uploadUrlTemplate.replace(/\{\?[^}]*\}$/, "");
+  if (uploadUrl.includes("{") || uploadUrl.includes("}")) {
+    throw new HooversionError(`Invalid GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(uploadUrl);
+  } catch {
+    throw new HooversionError(`Invalid GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  const authority = uploadUrl.slice(uploadUrl.indexOf("//") + 2).split(/[/?#]/, 1)[0] ?? "";
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  const hasExplicitPort = host.startsWith("[") ? host.includes("]:") : host.includes(":");
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || hasExplicitPort) {
+    throw new HooversionError(`Invalid GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  const apiOrigin = new URL(apiUrl).origin;
+  const trusted = parsed.origin === apiOrigin || apiOrigin === "https://api.github.com" && parsed.origin === "https://uploads.github.com";
+  if (!trusted) {
+    throw new HooversionError(`Untrusted GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  return parsed.toString();
+}
+async function uploadAsset(uploadUrl, token, data, name) {
   await githubFetch(`${uploadUrl}?name=${encodeURIComponent(name)}`, token, {
     method: "POST",
     body: data,
@@ -923,7 +1650,7 @@ async function uploadAsset(uploadUrlTemplate, token, path) {
     }
   });
 }
-async function githubFetch(url, token, init) {
+async function githubFetch(url, token, init, notFoundIsEmpty = false) {
   const response = await fetch(url, {
     ...init,
     headers: {
@@ -933,6 +1660,8 @@ async function githubFetch(url, token, init) {
       ...init.headers ?? {}
     }
   });
+  if (response.status === 404 && notFoundIsEmpty)
+    return;
   if (!response.ok) {
     const body = await response.text();
     throw new HooversionError(`GitHub API request failed (${response.status} ${response.statusText}): ${body}`);
@@ -941,13 +1670,62 @@ async function githubFetch(url, token, init) {
 }
 
 // src/output.ts
-import { appendFileSync, mkdirSync as mkdirSync2, writeFileSync as writeFileSync4 } from "fs";
-import { join as join5 } from "path";
+import {
+  appendFileSync,
+  closeSync as closeSync3,
+  constants as fsConstants4,
+  fstatSync as fstatSync3,
+  mkdirSync as mkdirSync2,
+  openSync as openSync3,
+  readFileSync as readFileSync4,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync3
+} from "fs";
+import { join as join4, relative as relative5, sep as sep3 } from "path";
+function getReleaseOutputPaths(cwd, outputDir = ".hooversion") {
+  const resolvedOutputDir = join4(cwd, outputDir);
+  const outputsPath = join4(resolvedOutputDir, "outputs.json");
+  const paths = new Set([outputsPath, join4(cwd, ".release-version")]);
+  let fd;
+  try {
+    fd = openSync3(outputsPath, fsConstants4.O_RDONLY | fsConstants4.O_NOFOLLOW | fsConstants4.O_NONBLOCK);
+    if (!fstatSync3(fd).isFile())
+      return [...paths];
+    const payload = JSON.parse(readFileSync4(fd, "utf8"));
+    for (const release of payload.releases ?? []) {
+      if (typeof release.tag !== "string")
+        continue;
+      const notePath = join4(resolvedOutputDir, `${sanitizeFileName(release.tag)}-notes.md`);
+      const noteRelativePath = relative5(resolvedOutputDir, notePath);
+      if (noteRelativePath && noteRelativePath !== ".." && !noteRelativePath.startsWith(`..${sep3}`)) {
+        paths.add(notePath);
+      }
+    }
+  } catch {} finally {
+    if (fd !== undefined) {
+      try {
+        closeSync3(fd);
+      } catch {}
+    }
+  }
+  return [...paths];
+}
+function clearReleaseOutputs(cwd, outputDir = ".hooversion") {
+  for (const outputPath of getReleaseOutputPaths(cwd, outputDir)) {
+    try {
+      unlinkSync2(outputPath);
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
+  }
+}
 function writeReleaseOutputs(cwd, config, plan) {
-  const outputDir = join5(cwd, config.outputDir);
+  clearReleaseOutputs(cwd, config.outputDir);
+  const outputDir = join4(cwd, config.outputDir);
   mkdirSync2(outputDir, { recursive: true });
   for (const release of plan.releases) {
-    writeFileSync4(join5(outputDir, `${sanitizeFileName(release.tag)}-notes.md`), `${release.notes}
+    writeFileSync3(join4(outputDir, `${sanitizeFileName(release.tag)}-notes.md`), `${release.notes}
 `);
   }
   const payload = {
@@ -960,11 +1738,18 @@ function writeReleaseOutputs(cwd, config, plan) {
       notesPath: `${config.outputDir}/${sanitizeFileName(release.tag)}-notes.md`
     }))
   };
-  writeFileSync4(join5(outputDir, "outputs.json"), `${JSON.stringify(payload, null, 2)}
+  writeFileSync3(join4(outputDir, "outputs.json"), `${JSON.stringify(payload, null, 2)}
 `);
   if (plan.releases.length === 1) {
-    writeFileSync4(join5(cwd, ".release-version"), `${plan.releases[0].nextVersion}
+    writeFileSync3(join4(cwd, ".release-version"), `${plan.releases[0].nextVersion}
 `);
+  } else {
+    try {
+      unlinkSync2(join4(cwd, ".release-version"));
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
   }
   if (process.env.GITHUB_OUTPUT) {
     const lines = [`published=${payload.published}`, `releases_json=${JSON.stringify(payload.releases)}`];
@@ -982,43 +1767,53 @@ function sanitizeFileName(value) {
 
 // src/release.ts
 async function executeRelease(cwd, config, plan, options = {}) {
-  validatePlan(cwd, config, plan);
-  if (plan.releases.length === 0) {
-    if (!options.dryRun)
-      writeReleaseOutputs(cwd, config, plan);
-    return;
+  const effectivePlan = deriveResumablePlan(cwd, config, plan) ?? plan;
+  const resumable = isResumableRelease(cwd, effectivePlan);
+  if (resumable) {
+    verifyResumableRemote(cwd, effectivePlan, options.gitAuth);
+  } else {
+    verifySource(cwd, effectivePlan, options.gitAuth);
   }
+  validatePlan(cwd, config, effectivePlan, resumable);
   if (options.dryRun)
-    return;
-  ensureCleanWorkingTree(cwd);
-  runHooks(cwd, config.hooks.beforeRelease);
-  const releasedVersions = new Map(plan.releases.map((release) => [release.package.name, release.nextVersion]));
-  for (const release of plan.releases) {
-    updateManifestVersion(cwd, release.package, release.nextVersion);
+    return { plan: effectivePlan, published: false };
+  ensureCleanWorkingTree(cwd, getReleaseOutputPaths(cwd, config.outputDir), config.outputDir);
+  clearReleaseOutputs(cwd, config.outputDir);
+  if (effectivePlan.releases.length === 0) {
+    writeReleaseOutputs(cwd, config, effectivePlan);
+    return { plan: effectivePlan, published: false };
   }
-  updateLocalDependencyVersions(cwd, config.packages, releasedVersions);
-  for (const release of plan.releases) {
-    updateChangelog(cwd, release);
-  }
-  runHooks(cwd, config.hooks.afterVersion);
-  createReleaseCommit(cwd, releaseCommitMessage(plan));
-  for (const release of plan.releases) {
-    createAnnotatedTag(cwd, release.tag, `${release.package.name} ${release.nextVersion}`);
+  if (!resumable) {
+    runHooks(cwd, config.hooks.beforeRelease);
+    const releasedVersions = new Map(effectivePlan.releases.map((release) => [release.package.name, release.nextVersion]));
+    for (const release of effectivePlan.releases) {
+      updateManifestVersion(cwd, release.package, release.nextVersion);
+    }
+    updateLocalDependencyVersions(cwd, config.packages, releasedVersions);
+    for (const release of effectivePlan.releases) {
+      updateChangelog(cwd, release);
+    }
+    runHooks(cwd, config.hooks.afterVersion);
+    createReleaseCommit(cwd, releaseCommitMessage(effectivePlan));
+    for (const release of effectivePlan.releases) {
+      createAnnotatedTag(cwd, release.tag, `${release.package.name} ${release.nextVersion}`);
+    }
   }
   const shouldPush = options.push ?? config.push;
   if (shouldPush) {
-    pushRelease(cwd, plan.branch, plan.releases.map((release) => release.tag));
+    pushRelease(cwd, effectivePlan.branch, effectivePlan.releases.map((release) => release.tag), options.gitAuth);
   }
-  mkdirSync3(join6(cwd, config.outputDir), { recursive: true });
+  mkdirSync3(join5(cwd, config.outputDir), { recursive: true });
   if (options.github ?? true) {
-    for (const release of plan.releases) {
-      await publishGitHubRelease(cwd, config, release);
+    for (const release of effectivePlan.releases) {
+      await publishGitHubRelease(cwd, config, release, { token: options.githubToken });
     }
   }
-  writeReleaseOutputs(cwd, config, plan);
+  writeReleaseOutputs(cwd, config, effectivePlan);
   runHooks(cwd, config.hooks.afterRelease);
+  return { plan: effectivePlan, published: true };
 }
-function validatePlan(cwd, config, plan) {
+function validatePlan(cwd, config, plan, resumable = isResumableRelease(cwd, plan)) {
   if (!config.branches.includes(plan.branch)) {
     throw new HooversionError(`Current branch '${plan.branch}' is not a release branch. Allowed branches: ${config.branches.join(", ")}`);
   }
@@ -1029,6 +1824,8 @@ function validatePlan(cwd, config, plan) {
 ${details}`);
   }
   for (const release of plan.releases) {
+    if (resumable)
+      continue;
     if (tagExists(cwd, release.tag)) {
       throw new HooversionError(`Tag already exists: ${release.tag}`);
     }
@@ -1060,12 +1857,125 @@ ${result.stderr || result.stdout}`);
     }
   }
 }
+function deriveResumablePlan(cwd, config, plan) {
+  if (plan.releases.length > 0)
+    return;
+  const head = getHeadSha(cwd);
+  const sourceSha = getRefSha(cwd, "HEAD^");
+  if (!sourceSha)
+    return;
+  const taggedPackages = config.packages.map((pkg) => {
+    const nextVersion = readManifest(cwd, pkg).version;
+    const tag = tagForPackage(config, pkg, nextVersion);
+    return getRefSha(cwd, `refs/tags/${tag}`) === head ? { pkg, nextVersion, tag } : undefined;
+  }).filter((release) => Boolean(release));
+  if (taggedPackages.length === 0)
+    return;
+  const message = getCommitMessage(cwd);
+  const separator = message.indexOf(`
+`);
+  const subject = separator < 0 ? message : message.slice(0, separator);
+  const body = separator < 0 ? "" : message.slice(separator).trim();
+  const expectedSubject = taggedPackages.length === 1 ? `chore(release): ${taggedPackages[0].pkg.name} ${taggedPackages[0].nextVersion}` : `chore(release): ${taggedPackages.map(({ pkg, nextVersion }) => `${pkg.name}@${nextVersion}`).join(", ")}`;
+  if (subject !== expectedSubject)
+    return;
+  const transitions = taggedPackages.map(({ pkg, nextVersion }) => inferReleaseTransition(cwd, config, pkg, nextVersion));
+  if (transitions.some((transition) => !transition))
+    return;
+  const releases = taggedPackages.map(({ pkg, nextVersion, tag }, index) => {
+    const transition = transitions[index];
+    const marker = `# ${pkg.name} ${nextVersion}
+
+`;
+    const markerStart = body.indexOf(marker);
+    const notes = taggedPackages.length === 1 ? body : markerStart < 0 ? "" : body.slice(markerStart + marker.length).split(/\n\n# /, 1)[0];
+    return {
+      package: pkg,
+      currentVersion: transition.currentVersion,
+      nextVersion,
+      releaseType: transition.releaseType,
+      tag,
+      commits: [],
+      notes,
+      changelogPath: pkg.changelog,
+      dependencyTriggered: false
+    };
+  });
+  const reconstructed = {
+    ...plan,
+    sourceSha,
+    releases,
+    unmatchedCommits: []
+  };
+  return getCommitMessage(cwd) === releaseCommitMessage(reconstructed) ? reconstructed : undefined;
+}
+function inferReleaseTransition(cwd, config, pkg, nextVersion) {
+  const parts = parseVersion(nextVersion);
+  const candidates = [
+    ["major", `${parts.major - 1}.0.0`],
+    ["minor", `${parts.major}.${parts.minor - 1}.0`],
+    ["patch", `${parts.major}.${parts.minor}.${parts.patch - 1}`]
+  ];
+  for (const [releaseType, currentVersion] of candidates) {
+    if (parts.major < 1 && releaseType === "major")
+      continue;
+    if (parts.minor < 1 && releaseType === "minor")
+      continue;
+    if (parts.patch < 1 && releaseType === "patch")
+      continue;
+    const tag = tagForPackage(config, pkg, currentVersion);
+    if (getRefSha(cwd, `refs/tags/${tag}`))
+      return { currentVersion, releaseType };
+  }
+  return;
+}
+function isResumableRelease(cwd, plan) {
+  if (plan.releases.length === 0)
+    return false;
+  const head = getHeadSha(cwd);
+  if (head === plan.sourceSha)
+    return false;
+  if (getRefSha(cwd, "HEAD^") !== plan.sourceSha)
+    return false;
+  if (getCommitMessage(cwd) !== releaseCommitMessage(plan))
+    return false;
+  return plan.releases.every((release) => getRefSha(cwd, `refs/tags/${release.tag}`) === head);
+}
+function verifySource(cwd, plan, gitAuth) {
+  const head = getHeadSha(cwd);
+  if (head !== plan.sourceSha) {
+    throw new HooversionError(`Release source changed locally: expected ${plan.sourceSha}, found ${head}.`);
+  }
+  const remote = getRemoteBranchSha(cwd, plan.branch, gitAuth);
+  if (remote !== undefined && remote !== plan.sourceSha) {
+    throw new HooversionError(`Release source changed remotely: expected ${plan.sourceSha}, found ${remote || "missing"}.`);
+  }
+}
+function verifyResumableRemote(cwd, plan, gitAuth) {
+  const head = getHeadSha(cwd);
+  const remote = getRemoteBranchSha(cwd, plan.branch, gitAuth);
+  if (remote !== undefined && remote !== head && remote !== plan.sourceSha) {
+    throw new HooversionError(`Release resume found remote drift: expected ${head}, found ${remote || "missing"}.`);
+  }
+}
 
 // src/doctor.ts
 function runDoctor(cwd, config) {
   const result = { errors: [], warnings: [], info: [] };
+  if (config.branches.length === 0 || config.branches.some((branch2) => !branch2.trim())) {
+    result.errors.push("Config must define at least one non-empty release branch.");
+  }
+  if (config.packages.length === 0) {
+    result.errors.push("Config must define at least one package.");
+  }
+  if (result.errors.length > 0)
+    return result;
   if (!isGitRepository(cwd)) {
     result.errors.push("Current directory is not a git repository.");
+    return result;
+  }
+  if (!git(cwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], true).trim()) {
+    result.errors.push("Repository has no resolvable HEAD commit.");
     return result;
   }
   const branch = getCurrentBranch(cwd);
@@ -1098,18 +2008,30 @@ function extractTagVersion(tag) {
 }
 
 // src/workflow.ts
-import { existsSync as existsSync3, mkdirSync as mkdirSync4, readFileSync as readFileSync5, writeFileSync as writeFileSync5 } from "fs";
-import { join as join7 } from "path";
+import { existsSync as existsSync2, mkdirSync as mkdirSync4, readFileSync as readFileSync5, writeFileSync as writeFileSync4 } from "fs";
+import { join as join6 } from "path";
 var defaultActionOwnerRepo = "openhoo/hooversion";
 var defaultBunVersion = "1.3.14";
+var defaultReleaseBranch = "main";
+var checkoutSha = "d23441a48e516b6c34aea4fa41551a30e30af803";
+var generatedWorkflowMarker = "# Generated by Hooversion";
+var setupBunSha = "0c5077e51419868618aeaa5fe8019c62421857d6";
 function writeGitHubWorkflows(cwd, options = {}) {
-  const workflowDir = join7(cwd, ".github", "workflows");
-  const ciPath = join7(workflowDir, "ci.yml");
-  const releasePath = join7(workflowDir, "release.yml");
+  const workflowDir = join6(cwd, ".github", "workflows");
+  const ciPath = join6(workflowDir, "ci.yml");
+  const releasePath = join6(workflowDir, "release.yml");
   const workflows = renderGitHubWorkflows(options);
+  for (const [path, content] of [
+    [ciPath, workflows.ci],
+    [releasePath, workflows.release]
+  ]) {
+    if (existsSync2(path) && (!options.force || !isGeneratedWorkflow(path, content))) {
+      throw new HooversionError(`Refusing to overwrite existing workflow ${path}; remove it or rerun init with --force for a Hooversion-generated workflow.`);
+    }
+  }
   mkdirSync4(workflowDir, { recursive: true });
-  writeFileSync5(ciPath, workflows.ci);
-  writeFileSync5(releasePath, workflows.release);
+  writeFileSync4(ciPath, workflows.ci);
+  writeFileSync4(releasePath, workflows.release);
   return [ciPath, releasePath];
 }
 function renderGitHubWorkflows(options = {}) {
@@ -1117,13 +2039,15 @@ function renderGitHubWorkflows(options = {}) {
   const actionOwnerRepo = options.actionOwnerRepo ?? defaultActionOwnerRepo;
   const actionRef = options.actionRef ?? `v${hooversionVersion}`;
   const bunVersion = options.bunVersion ?? defaultBunVersion;
-  const ci = `name: CI
+  const releaseBranch = options.releaseBranch ?? defaultReleaseBranch;
+  const ci = `${generatedWorkflowMarker}
+name: CI
 
 on:
   pull_request:
   push:
     branches:
-      - main
+      - ${releaseBranch}
 
 permissions:
   contents: read
@@ -1137,7 +2061,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@${checkoutSha} # v6
         with:
           fetch-depth: 0
 
@@ -1153,10 +2077,10 @@ jobs:
     needs: commitlint
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@${checkoutSha} # v6
 
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@${setupBunSha} # v2
         with:
           bun-version: ${bunVersion}
 
@@ -1166,19 +2090,25 @@ jobs:
       - name: Run checks
         run: bun run check
 `;
-  const release = `name: Release
+  const release = `${generatedWorkflowMarker}
+name: Release
 
 on:
   workflow_run:
     workflows:
       - CI
     branches:
-      - main
+      - ${releaseBranch}
     types:
       - completed
+  workflow_dispatch:
 
 permissions:
   contents: read
+concurrency:
+  group: release-\${{ github.repository }}
+  cancel-in-progress: false
+
 
 env:
   HOOVERSION_VERSION: ${hooversionVersion}
@@ -1186,7 +2116,9 @@ env:
 jobs:
   release:
     name: Release
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && !contains(github.event.workflow_run.head_commit.message, 'chore(release):')
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == '${releaseBranch}' && !contains(github.event.workflow_run.head_commit.message, 'chore(release):')) ||
+      (github.event_name == 'workflow_dispatch' && github.ref_name == '${releaseBranch}')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1194,10 +2126,10 @@ jobs:
       pull-requests: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@${checkoutSha} # v6
         with:
           fetch-depth: 0
-          ref: main
+          ref: \${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
 
       - name: Release
         id: release
@@ -1210,18 +2142,845 @@ jobs:
 `;
   return { ci, release };
 }
+function isGeneratedWorkflow(path, expected) {
+  try {
+    const current = readFileSync5(path, "utf8");
+    return current.startsWith(`${generatedWorkflowMarker}
+`) || current === expected;
+  } catch {
+    return false;
+  }
+}
 function getPackageVersion() {
   const packagePath = new URL("../package.json", import.meta.url);
-  if (!existsSync3(packagePath))
+  if (!existsSync2(packagePath))
     return "0.1.0";
   const json = JSON.parse(readFileSync5(packagePath, "utf8"));
   return json.version ?? "0.1.0";
 }
 
+// src/app-auth.ts
+import { createHmac, createSign, timingSafeEqual } from "crypto";
+import { readFileSync as readFileSync6 } from "fs";
+var githubApiVersion = "2022-11-28";
+function readGitHubAppPrivateKey(env = process.env) {
+  const inline = env.VERSIONHOO_PRIVATE_KEY ?? env.HOOVERSION_PRIVATE_KEY;
+  if (inline)
+    return normalizePrivateKey(inline);
+  const path = env.VERSIONHOO_PRIVATE_KEY_PATH ?? env.HOOVERSION_PRIVATE_KEY_PATH;
+  if (path)
+    return readFileSync6(path, "utf8");
+  throw new HooversionError("VERSIONHOO_PRIVATE_KEY or VERSIONHOO_PRIVATE_KEY_PATH is required to authenticate as a GitHub App.");
+}
+function createGitHubAppJwt(config, nowSeconds = Math.floor(Date.now() / 1000)) {
+  const header = base64UrlJson({ alg: "RS256", typ: "JWT" });
+  const payload = base64UrlJson({
+    iat: nowSeconds - 60,
+    exp: nowSeconds + 9 * 60,
+    iss: String(config.appId)
+  });
+  const signingInput = `${header}.${payload}`;
+  const signature = createSign("RSA-SHA256").update(signingInput).sign(config.privateKey);
+  return `${signingInput}.${base64Url(signature)}`;
+}
+async function createInstallationAccessToken(config, installationId, repository) {
+  validateRepositoryFullName(repository.fullName);
+  if (!Number.isSafeInteger(installationId) || installationId <= 0) {
+    throw new HooversionError("GitHub App installation id must be a positive integer.");
+  }
+  if (!Number.isSafeInteger(repository.id) || repository.id <= 0) {
+    throw new HooversionError("GitHub webhook repository id must be a positive integer.");
+  }
+  const apiUrl = validateGitHubApiUrl(config.apiUrl ?? "https://api.github.com", config.trustedApiUrls);
+  const jwt = createGitHubAppJwt(config);
+  const response = await fetch(`${apiUrl}/app/installations/${installationId}/access_tokens`, {
+    method: "POST",
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${jwt}`,
+      "content-type": "application/json",
+      "user-agent": "versionhoo-app",
+      "x-github-api-version": githubApiVersion
+    },
+    body: JSON.stringify({ repository_ids: [repository.id] })
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new HooversionError(`GitHub App installation token request failed (${response.status} ${response.statusText}): ${body}`);
+  }
+  const data = await response.json();
+  return { token: data.token, expiresAt: data.expires_at };
+}
+function verifyGitHubWebhookSignature(secret, body, signatureHeader) {
+  if (!signatureHeader?.startsWith("sha256="))
+    return false;
+  const expected = Buffer.from(`sha256=${createHmac("sha256", secret).update(body).digest("hex")}`, "utf8");
+  const actual = Buffer.from(signatureHeader, "utf8");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
+}
+function validateGitHubApiUrl(apiUrl, trustedApiUrls = []) {
+  const parsed = parseHttpsUrl(apiUrl, "GitHub API");
+  const normalized = normalizeOrigin(parsed);
+  const trusted = trustedApiUrls.map((value) => normalizeOrigin(parseHttpsUrl(value, "trusted GitHub API")));
+  if (parsed.hostname !== "api.github.com" || parsed.pathname !== "/") {
+    if (!trusted.includes(normalized)) {
+      throw new HooversionError(`Untrusted GitHub API URL: ${apiUrl}`);
+    }
+  }
+  return normalized.endsWith("/") ? normalized.slice(0, -1) : normalized;
+}
+function validateRepositoryFullName(repository) {
+  const parts = repository.split("/");
+  if (parts.length !== 2 || parts.some((part) => !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(part)) || parts.some((part) => part === "." || part === "..")) {
+    throw new HooversionError(`Invalid GitHub repository identity: ${repository}`);
+  }
+  return `${parts[0]}/${parts[1]}`;
+}
+function parseHttpsUrl(value, label) {
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new HooversionError(`Invalid ${label} URL: ${value}`);
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) {
+    throw new HooversionError(`Invalid ${label} URL: ${value}`);
+  }
+  return parsed;
+}
+function normalizeOrigin(value) {
+  return `${value.protocol}//${value.host}${value.pathname.replace(/\/+$/, "") || "/"}`;
+}
+function normalizePrivateKey(value) {
+  return value.includes("\\n") ? value.replaceAll("\\n", `
+`) : value;
+}
+function base64UrlJson(value) {
+  return base64Url(Buffer.from(JSON.stringify(value), "utf8"));
+}
+function base64Url(value) {
+  return value.toString("base64").replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+// src/app-runner.ts
+import { chmodSync, existsSync as existsSync3, mkdtempSync, mkdirSync as mkdirSync5, rmSync, writeFileSync as writeFileSync5 } from "fs";
+import { tmpdir } from "os";
+import { join as join7 } from "path";
+var GIT_ASKPASS_FILENAME = ".git-askpass";
+var GIT_TOKEN_ENV = "VERSIONHOO_GIT_TOKEN";
+var GIT_ASKPASS_SCRIPT = `#!/bin/sh
+case "$1" in
+  *[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]*) printf "%s\\n" "x-access-token" ;;
+  *) printf "%s\\n" "$VERSIONHOO_GIT_TOKEN" ;;
+esac
+`;
+async function runVersionhooRelease(job) {
+  const parent = job.workDir ?? join7(tmpdir(), "versionhoo");
+  mkdirSync5(parent, { recursive: true });
+  const workDir = mkdtempSync(join7(parent, "release-"));
+  const repoDir = join7(workDir, "repo");
+  const repositoryHome = mkdtempSync(join7(workDir, ".home-"));
+  try {
+    return await withRepositoryEnvironment(job, async () => {
+      try {
+        const cloneUrl = validateCloneUrl(job.cloneUrl, job.repositoryFullName, job.trustedCloneHosts);
+        const gitAuth = createGitAuthArtifacts(workDir, job.token);
+        try {
+          checked("git", ["clone", "--branch", job.branch, "--no-single-branch", cloneUrl, repoDir], workDir, job.token, gitAuth.env);
+          checked("git", ["config", "user.name", job.gitAuthorName ?? "versionhoo[bot]"], repoDir, job.token);
+          checked("git", ["config", "user.email", job.gitAuthorEmail ?? "versionhoo[bot]@users.noreply.github.com"], repoDir, job.token);
+          const branchHead = runCommand("git", ["rev-parse", "HEAD"], repoDir).stdout.trim();
+          if (branchHead !== job.headSha) {
+            return {
+              repositoryFullName: job.repositoryFullName,
+              branch: job.branch,
+              headSha: job.headSha,
+              workDir,
+              outcome: "stale",
+              published: false,
+              message: `Skipped stale workflow run for ${job.repositoryFullName}@${job.branch}: branch is ${branchHead}, workflow passed on ${job.headSha}.`,
+              releases: []
+            };
+          }
+          installProjectDependencies(repoDir, job.installCommand, job.token);
+          const config = await loadConfig(repoDir, job.configPath);
+          const trustedApiUrl = validateGitHubApiUrl(job.apiUrl ?? "https://api.github.com", job.trustedApiUrls);
+          if (config.github !== false) {
+            config.github.repository = validateRepositoryFullName(job.repositoryFullName);
+            config.github.apiUrl = trustedApiUrl;
+          }
+          const plan = createReleasePlan(repoDir, config);
+          const execution = await executeRelease(repoDir, config, plan, {
+            push: true,
+            github: true,
+            githubToken: job.token,
+            gitAuth: gitAuth.env
+          });
+          return {
+            repositoryFullName: job.repositoryFullName,
+            branch: job.branch,
+            headSha: job.headSha,
+            workDir,
+            outcome: execution.published ? "published" : "no_release",
+            published: execution.published,
+            releases: execution.plan.releases.map((release) => ({
+              name: release.package.name,
+              version: release.nextVersion,
+              tag: release.tag
+            }))
+          };
+        } finally {
+          gitAuth.cleanup();
+        }
+      } finally {
+        if (!job.keepWorkDir) {
+          rmSync(workDir, { recursive: true, force: true });
+        }
+      }
+    }, repositoryHome);
+  } finally {
+    rmSync(repositoryHome, { recursive: true, force: true });
+  }
+}
+function createGitAuthArtifacts(workDir, token) {
+  const askpassPath = join7(workDir, GIT_ASKPASS_FILENAME);
+  let created = false;
+  const cleanup = () => {
+    if (!created)
+      return;
+    rmSync(askpassPath, { force: true });
+    created = false;
+  };
+  try {
+    writeFileSync5(askpassPath, GIT_ASKPASS_SCRIPT, { encoding: "utf8", flag: "wx", mode: 448 });
+    created = true;
+    chmodSync(askpassPath, 448);
+    return {
+      env: {
+        GIT_ASKPASS: askpassPath,
+        GIT_TERMINAL_PROMPT: "0",
+        [GIT_TOKEN_ENV]: token
+      },
+      cleanup
+    };
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
+}
+function installProjectDependencies(repoDir, configuredCommand, secret) {
+  const command = configuredCommand ?? (existsSync3(join7(repoDir, "bun.lock")) ? "bun install --frozen-lockfile" : "");
+  if (!command)
+    return;
+  const result = runShell(command, repoDir);
+  if (result.code !== 0) {
+    throw new HooversionError(`Install command failed: ${redact(command, secret)}
+${redact(result.stderr || result.stdout, secret)}`);
+  }
+}
+function checked(command, args, cwd, secret, env) {
+  const result = runCommand(command, args, cwd, env ? { ...process.env, ...env } : undefined);
+  if (result.code !== 0) {
+    const rendered = `${command} ${args.map((arg) => redact(arg, secret)).join(" ")}`;
+    throw new HooversionError(`${rendered} failed:
+${redact(result.stderr || result.stdout, secret)}`);
+  }
+}
+function validateCloneUrl(cloneUrl, repositoryFullName, trustedCloneHosts = []) {
+  const expected = validateRepositoryFullName(repositoryFullName);
+  let parsed;
+  try {
+    parsed = new URL(cloneUrl);
+  } catch {
+    throw new HooversionError(`Invalid GitHub clone URL: ${cloneUrl}`);
+  }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.port || parsed.search || parsed.hash) {
+    throw new HooversionError(`Invalid GitHub clone URL: ${cloneUrl}`);
+  }
+  const allowedHosts = new Set(["github.com", ...trustedCloneHosts.map((host) => host.toLowerCase())]);
+  if (!allowedHosts.has(parsed.hostname.toLowerCase())) {
+    throw new HooversionError(`Untrusted GitHub clone host: ${parsed.hostname}`);
+  }
+  const path = decodeURIComponent(parsed.pathname).replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "");
+  if (path.toLowerCase() !== expected.toLowerCase()) {
+    throw new HooversionError(`GitHub clone repository mismatch: expected ${expected}, got ${path}`);
+  }
+  return parsed.toString().replace(/\/+$/, "");
+}
+var repositoryEnvironmentTail = Promise.resolve();
+async function withRepositoryEnvironment(job, operation, repositoryHome) {
+  const previous = repositoryEnvironmentTail;
+  let release;
+  repositoryEnvironmentTail = new Promise((resolve3) => {
+    release = resolve3;
+  });
+  await previous;
+  const original = { ...process.env };
+  const allowed = {
+    PATH: original.PATH ?? "",
+    HOME: repositoryHome,
+    SHELL: original.SHELL ?? "/bin/sh",
+    LANG: original.LANG ?? "C.UTF-8",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_TERMINAL_PROMPT: "0",
+    GITHUB_REPOSITORY: job.repositoryFullName,
+    GITHUB_REF_NAME: job.branch,
+    GITHUB_SHA: job.headSha,
+    VERSIONHOO_REPOSITORY: job.repositoryFullName,
+    VERSIONHOO_BRANCH: job.branch,
+    VERSIONHOO_SHA: job.headSha
+  };
+  for (const key of Object.keys(process.env))
+    delete process.env[key];
+  Object.assign(process.env, allowed);
+  try {
+    return await operation();
+  } finally {
+    for (const key of Object.keys(process.env))
+      delete process.env[key];
+    Object.assign(process.env, original);
+    release();
+  }
+}
+function redact(value, secret) {
+  return value.replaceAll(secret, "[redacted]");
+}
+
+// src/app-github.ts
+var checkName = "Versionhoo Release";
+var githubApiVersion2 = "2022-11-28";
+async function createReleaseCheckRun(apiUrl, repository, token, headSha, expectedRepository, trustedApiUrls = []) {
+  const response = await githubFetch2(apiUrl, `/repos/${validatedRepository(repository, expectedRepository)}/check-runs`, token, {
+    method: "POST",
+    body: JSON.stringify({
+      name: checkName,
+      head_sha: headSha,
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+      output: {
+        title: "Versionhoo release started",
+        summary: "Versionhoo accepted this workflow run and started release processing."
+      }
+    })
+  }, trustedApiUrls);
+  return { id: response.id, htmlUrl: response.html_url };
+}
+async function completeReleaseCheckRun(apiUrl, repository, token, checkRunId, conclusion, title, summary, expectedRepository, trustedApiUrls = []) {
+  await githubFetch2(apiUrl, `/repos/${validatedRepository(repository, expectedRepository)}/check-runs/${checkRunId}`, token, {
+    method: "PATCH",
+    body: JSON.stringify({
+      status: "completed",
+      conclusion,
+      completed_at: new Date().toISOString(),
+      output: { title, summary }
+    })
+  }, trustedApiUrls);
+}
+function releaseCheckResult(result) {
+  if (result.outcome === "stale") {
+    return {
+      conclusion: "neutral",
+      title: "Versionhoo skipped a stale workflow run",
+      summary: result.message ?? "The release branch moved after this workflow run completed."
+    };
+  }
+  if (!result.published) {
+    return {
+      conclusion: "neutral",
+      title: "Versionhoo found no release",
+      summary: "No release-worthy commits were found for this workflow run."
+    };
+  }
+  const releases = result.releases.map((release) => `- ${release.name} ${release.version} (${release.tag})`).join(`
+`);
+  return {
+    conclusion: "success",
+    title: "Versionhoo published releases",
+    summary: releases || "Versionhoo published releases."
+  };
+}
+function releaseFailureCheckResult(error) {
+  const message = error instanceof Error ? error.message : String(error);
+  return {
+    conclusion: "failure",
+    title: "Versionhoo release failed",
+    summary: truncate(message, 60000)
+  };
+}
+async function githubFetch2(apiUrl, path, token, init, trustedApiUrls) {
+  const trustedApiUrl = validateGitHubApiUrl(apiUrl, trustedApiUrls);
+  const response = await fetch(`${trustedApiUrl}${path}`, {
+    ...init,
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "user-agent": "versionhoo-app",
+      "x-github-api-version": githubApiVersion2,
+      ...init.headers ?? {}
+    }
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new HooversionError(`GitHub API request failed (${response.status} ${response.statusText}): ${body}`);
+  }
+  return await response.json();
+}
+function validatedRepository(repository, expectedRepository) {
+  const validated = validateRepositoryFullName(repository);
+  const expected = validateRepositoryFullName(expectedRepository);
+  if (validated.toLowerCase() !== expected.toLowerCase()) {
+    throw new HooversionError(`GitHub repository mismatch: expected ${expected}, got ${validated}`);
+  }
+  return validated;
+}
+function truncate(value, maxLength) {
+  return value.length <= maxLength ? value : `${value.slice(0, maxLength - 3)}...`;
+}
+
+// src/app-server.ts
+var DEFAULT_WEBHOOK_MAX_BODY_BYTES = 1024 * 1024;
+function isPositiveInteger(value) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0;
+}
+
+class ReleaseTaskQueue {
+  tails = new Map;
+  lastFailure;
+  onFailure;
+  maxAttempts;
+  retryDelayMs;
+  constructor(onFailure = (error) => {
+    console.error(error);
+  }, options = {}) {
+    this.onFailure = onFailure;
+    this.maxAttempts = Math.max(1, Math.min(3, Math.floor(options.maxAttempts ?? 1)));
+    this.retryDelayMs = Math.max(0, Math.min(30000, Math.floor(options.retryDelayMs ?? 0)));
+  }
+  enqueue(key, task, onFinalFailure) {
+    const previous = this.tails.get(key) ?? Promise.resolve();
+    const next = previous.then(() => this.runWithRetry(task), () => this.runWithRetry(task)).catch((error) => {
+      this.lastFailure = error;
+      try {
+        onFinalFailure?.(error);
+        this.onFailure(error);
+      } catch (callbackError) {
+        this.lastFailure = callbackError;
+      }
+    }).finally(() => {
+      if (this.tails.get(key) === next)
+        this.tails.delete(key);
+    });
+    this.tails.set(key, next);
+    return next;
+  }
+  get failure() {
+    return this.lastFailure;
+  }
+  async runWithRetry(task) {
+    for (let attempt = 1;; attempt += 1) {
+      try {
+        await task();
+        return;
+      } catch (error) {
+        if (attempt >= this.maxAttempts)
+          throw error;
+        if (this.retryDelayMs > 0) {
+          const { promise, resolve: resolve3 } = Promise.withResolvers();
+          setTimeout(resolve3, this.retryDelayMs);
+          await promise;
+        }
+      }
+    }
+  }
+}
+
+class WebhookDeduper {
+  ttlMs;
+  now;
+  seen = new Map;
+  constructor(ttlMs = 24 * 60 * 60 * 1000, now = () => Date.now()) {
+    this.ttlMs = ttlMs;
+    this.now = now;
+  }
+  reserve(key) {
+    if (!key)
+      return true;
+    this.prune();
+    if (this.seen.has(key))
+      return false;
+    this.seen.set(key, { state: "in_flight", expiresAt: this.now() + this.ttlMs });
+    return true;
+  }
+  succeed(key) {
+    if (!key)
+      return;
+    const entry = this.seen.get(key);
+    if (entry) {
+      entry.state = "succeeded";
+      entry.expiresAt = this.now() + this.ttlMs;
+    }
+  }
+  release(key) {
+    if (key)
+      this.seen.delete(key);
+  }
+  remember(key) {
+    const reserved = this.reserve(key);
+    if (reserved)
+      this.succeed(key);
+    return reserved;
+  }
+  prune() {
+    const now = this.now();
+    for (const [key, entry] of this.seen) {
+      if (entry.expiresAt <= now)
+        this.seen.delete(key);
+    }
+  }
+}
+function loadVersionhooAppConfigFromEnv(env = process.env) {
+  const appId = readRequiredEnv(env, ["VERSIONHOO_APP_ID", "HOOVERSION_APP_ID"]);
+  const webhookSecret = readRequiredEnv(env, ["VERSIONHOO_WEBHOOK_SECRET", "HOOVERSION_WEBHOOK_SECRET"]);
+  const port = Number(readEnv(env, ["VERSIONHOO_PORT", "HOOVERSION_PORT"]) ?? "3000");
+  if (!Number.isInteger(port) || port <= 0) {
+    throw new HooversionError("VERSIONHOO_PORT must be a positive integer.");
+  }
+  const webhookMaxBodyBytes = Number(readEnv(env, ["VERSIONHOO_WEBHOOK_MAX_BODY_BYTES", "HOOVERSION_WEBHOOK_MAX_BODY_BYTES"]) ?? String(DEFAULT_WEBHOOK_MAX_BODY_BYTES));
+  if (!Number.isInteger(webhookMaxBodyBytes) || webhookMaxBodyBytes <= 0) {
+    throw new HooversionError("VERSIONHOO_WEBHOOK_MAX_BODY_BYTES must be a positive integer.");
+  }
+  const apiUrl = readEnv(env, ["VERSIONHOO_GITHUB_API_URL", "HOOVERSION_GITHUB_API_URL"]) ?? "https://api.github.com";
+  const trustedApiUrls = splitCsv(readEnv(env, [
+    "VERSIONHOO_TRUSTED_GITHUB_API_URLS",
+    "HOOVERSION_TRUSTED_GITHUB_API_URLS",
+    "VERSIONHOO_TRUSTED_API_URLS",
+    "HOOVERSION_TRUSTED_API_URLS"
+  ]));
+  const trustedCloneHosts = splitCsv(readEnv(env, [
+    "VERSIONHOO_TRUSTED_GITHUB_CLONE_HOSTS",
+    "HOOVERSION_TRUSTED_GITHUB_CLONE_HOSTS",
+    "VERSIONHOO_TRUSTED_CLONE_HOSTS",
+    "HOOVERSION_TRUSTED_CLONE_HOSTS"
+  ]));
+  return {
+    appId,
+    privateKey: readGitHubAppPrivateKey(env),
+    webhookSecret,
+    apiUrl,
+    trustedApiUrls,
+    trustedCloneHosts,
+    host: readEnv(env, ["VERSIONHOO_HOST", "HOOVERSION_HOST"]) ?? "0.0.0.0",
+    port,
+    workDir: readEnv(env, ["VERSIONHOO_WORKDIR", "HOOVERSION_WORKDIR"]),
+    configPath: readEnv(env, ["VERSIONHOO_CONFIG", "HOOVERSION_CONFIG"]),
+    installCommand: readEnv(env, ["VERSIONHOO_INSTALL_COMMAND", "HOOVERSION_INSTALL_COMMAND"]),
+    allowedRepositories: splitCsv(readEnv(env, ["VERSIONHOO_ALLOWED_REPOS", "HOOVERSION_ALLOWED_REPOS"])),
+    releaseBranches: splitCsv(readEnv(env, ["VERSIONHOO_RELEASE_BRANCHES", "HOOVERSION_RELEASE_BRANCHES"]) ?? "main"),
+    ciWorkflowNames: splitCsv(readEnv(env, ["VERSIONHOO_CI_WORKFLOWS", "HOOVERSION_CI_WORKFLOWS"]) ?? "CI"),
+    gitAuthorName: readEnv(env, ["VERSIONHOO_GIT_AUTHOR_NAME", "HOOVERSION_GIT_AUTHOR_NAME"]),
+    gitAuthorEmail: readEnv(env, ["VERSIONHOO_GIT_AUTHOR_EMAIL", "HOOVERSION_GIT_AUTHOR_EMAIL"]),
+    keepWorkDir: readBoolean(readEnv(env, ["VERSIONHOO_KEEP_WORKDIR", "HOOVERSION_KEEP_WORKDIR"])),
+    webhookMaxBodyBytes
+  };
+}
+function startVersionhooApp(config) {
+  const queue = new ReleaseTaskQueue;
+  const deduper = new WebhookDeduper;
+  const handler = createVersionhooWebhookHandler(config, runVersionhooRelease, queue, deduper);
+  const server = Bun.serve({
+    hostname: config.host,
+    port: config.port,
+    async fetch(request) {
+      const url = new URL(request.url);
+      if (request.method === "GET" && url.pathname === "/health") {
+        return json({ ok: true });
+      }
+      if (request.method === "POST" && url.pathname === "/webhooks/github") {
+        return handler(request);
+      }
+      return json({ error: "not found" }, 404);
+    }
+  });
+  console.log(`versionhoo app listening on http://${server.hostname}:${server.port}`);
+  return server;
+}
+function createVersionhooWebhookHandler(config, runner, queue = new ReleaseTaskQueue, deduper = new WebhookDeduper) {
+  return async (request) => {
+    const event = request.headers.get("x-github-event");
+    const delivery = request.headers.get("x-github-delivery") ?? "unknown";
+    const maxBodyBytes = resolveWebhookMaxBodyBytes(config.webhookMaxBodyBytes);
+    const body = await readWebhookBody(request, maxBodyBytes);
+    if (body instanceof Response)
+      return body;
+    if (!verifyGitHubWebhookSignature(config.webhookSecret, body, request.headers.get("x-hub-signature-256"))) {
+      return json({ error: "invalid webhook signature" }, 401);
+    }
+    if (event === "ping") {
+      return json({ ok: true, delivery });
+    }
+    if (event !== "workflow_run") {
+      return json({ ok: true, status: "ignored", reason: `unsupported event: ${event ?? "unknown"}` }, 202);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      return json({ error: "invalid JSON webhook body" }, 400);
+    }
+    const validationError = validateWorkflowRunPayload(parsed, config.trustedCloneHosts);
+    if (validationError)
+      return json({ error: validationError }, 400);
+    assertWorkflowRunPayload(parsed, config.trustedCloneHosts);
+    const payload = parsed;
+    const deliveryKey = delivery === "unknown" ? undefined : `delivery:${delivery}`;
+    const workflowKey = `workflow_run:${workflowRunKey(payload)}`;
+    if (!deduper.reserve(deliveryKey)) {
+      return json({ ok: true, status: "ignored", reason: "duplicate delivery", delivery }, 202);
+    }
+    if (!deduper.reserve(workflowKey)) {
+      deduper.release(deliveryKey);
+      return json({ ok: true, status: "ignored", reason: "duplicate workflow run", delivery }, 202);
+    }
+    queue.enqueue(releaseQueueKey(payload), async () => {
+      await releaseFromWorkflowRun(payload, config, runner);
+      deduper.succeed(deliveryKey);
+      deduper.succeed(workflowKey);
+    }, () => {
+      deduper.release(deliveryKey);
+      deduper.release(workflowKey);
+    });
+    return json({ ok: true, status: "accepted", delivery }, 202);
+  };
+}
+function resolveWebhookMaxBodyBytes(value) {
+  const resolvedValue = value ?? DEFAULT_WEBHOOK_MAX_BODY_BYTES;
+  return isPositiveInteger(resolvedValue) ? resolvedValue : DEFAULT_WEBHOOK_MAX_BODY_BYTES;
+}
+async function readWebhookBody(request, maxBytes) {
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null) {
+    const length = Number(declaredLength);
+    if (Number.isFinite(length) && length > maxBytes) {
+      return json({ error: "webhook payload too large" }, 413);
+    }
+  }
+  if (!request.body)
+    return "";
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done)
+        break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      if (total + chunk.byteLength > maxBytes) {
+        await reader.cancel().catch(() => {
+          return;
+        });
+        return json({ error: "webhook payload too large" }, 413);
+      }
+      chunks.push(chunk);
+      total += chunk.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(body);
+}
+function validateWorkflowRunPayload(value, trustedCloneHosts = []) {
+  if (!value || typeof value !== "object")
+    return "invalid webhook payload: expected an object";
+  const payload = value;
+  if (typeof payload.action !== "string")
+    return "invalid webhook payload: missing workflow_run action";
+  if (!payload.repository || typeof payload.repository !== "object") {
+    return "invalid webhook payload: missing repository";
+  }
+  const repository = payload.repository;
+  const repositoryId = repository.id;
+  if (!isPositiveInteger(repositoryId) || typeof repository.full_name !== "string" || !/^[^/\s]+\/[^/\s]+$/.test(repository.full_name) || typeof repository.clone_url !== "string" || typeof repository.default_branch !== "string" || repository.default_branch.length === 0) {
+    return "invalid webhook payload: malformed repository metadata";
+  }
+  let cloneUrl;
+  try {
+    cloneUrl = new URL(repository.clone_url);
+  } catch {
+    return "invalid webhook payload: malformed clone metadata";
+  }
+  if (cloneUrl.protocol !== "https:" || !["github.com", ...trustedCloneHosts.map((host) => host.toLowerCase())].includes(cloneUrl.hostname.toLowerCase()) || cloneUrl.port || cloneUrl.username || cloneUrl.password || cloneUrl.search || cloneUrl.hash || cloneUrl.pathname !== `/${repository.full_name}.git`) {
+    return "invalid webhook payload: malformed clone metadata";
+  }
+  if (!payload.installation || typeof payload.installation !== "object") {
+    return "invalid webhook payload: missing installation";
+  }
+  const installation = payload.installation;
+  const installationId = installation.id;
+  if (!isPositiveInteger(installationId)) {
+    return "invalid webhook payload: malformed installation";
+  }
+  if (!payload.workflow_run || typeof payload.workflow_run !== "object") {
+    return "invalid webhook payload: missing workflow_run";
+  }
+  const workflowRun = payload.workflow_run;
+  if (typeof workflowRun.name !== "string" || typeof workflowRun.event !== "string" || typeof workflowRun.conclusion !== "string" && workflowRun.conclusion !== null || typeof workflowRun.head_branch !== "string" && workflowRun.head_branch !== null || typeof workflowRun.head_sha !== "string" || workflowRun.head_sha.length === 0) {
+    return "invalid webhook payload: malformed workflow_run metadata";
+  }
+  if (workflowRun.head_repository !== undefined && workflowRun.head_repository !== null && (typeof workflowRun.head_repository !== "object" || typeof workflowRun.head_repository.full_name !== "string")) {
+    return "invalid webhook payload: malformed workflow_run repository metadata";
+  }
+  return;
+}
+function assertWorkflowRunPayload(value, trustedCloneHosts = []) {
+  const validationError = validateWorkflowRunPayload(value, trustedCloneHosts);
+  if (validationError)
+    throw new HooversionError(validationError);
+}
+function shouldHandleWorkflowRun(payload, config) {
+  const validationError = validateWorkflowRunPayload(payload, config.trustedCloneHosts);
+  if (validationError)
+    return ignored(validationError);
+  if (payload.action !== "completed")
+    return ignored(`workflow_run action is ${payload.action}`);
+  if (payload.workflow_run.conclusion !== "success") {
+    return ignored(`workflow_run conclusion is ${payload.workflow_run.conclusion ?? "missing"}`);
+  }
+  if (payload.workflow_run.event !== "push")
+    return ignored(`workflow_run event is ${payload.workflow_run.event}`);
+  if (!config.ciWorkflowNames.includes(payload.workflow_run.name)) {
+    return ignored(`workflow ${payload.workflow_run.name} is not configured for releases`);
+  }
+  const branch = payload.workflow_run.head_branch;
+  if (!branch || !config.releaseBranches.includes(branch)) {
+    return ignored(`branch ${branch ?? "missing"} is not a release branch`);
+  }
+  if (payload.workflow_run.head_repository?.full_name && payload.workflow_run.head_repository.full_name !== payload.repository.full_name) {
+    return ignored("workflow_run came from a fork");
+  }
+  if (config.allowedRepositories.length > 0 && !config.allowedRepositories.includes(payload.repository.full_name)) {
+    return ignored(`repository ${payload.repository.full_name} is not allowed`);
+  }
+  if (isReleaseCommit(payload.workflow_run.head_commit?.message ?? ""))
+    return ignored("release commit");
+  if (!payload.installation?.id)
+    return ignored("missing installation id");
+  if (!payload.workflow_run.head_sha)
+    return ignored("missing workflow head sha");
+  return { status: "accepted" };
+}
+async function releaseFromWorkflowRun(payload, config, runner = runVersionhooRelease) {
+  const decision = shouldHandleWorkflowRun(payload, config);
+  if (decision.status === "ignored")
+    return;
+  assertWorkflowRunPayload(payload, config.trustedCloneHosts);
+  const installation = payload.installation;
+  if (!installation)
+    throw new HooversionError("Workflow run payload is missing installation id or branch.");
+  const installationId = installation.id;
+  const branch = payload.workflow_run.head_branch;
+  if (branch === null)
+    throw new HooversionError("Workflow run payload is missing installation id or branch.");
+  const headSha = payload.workflow_run.head_sha;
+  const repositoryId = payload.repository.id;
+  const repositoryFullName = payload.repository.full_name;
+  const cloneUrl = payload.repository.clone_url;
+  const access = await createInstallationAccessToken({ appId: config.appId, privateKey: config.privateKey, apiUrl: config.apiUrl, trustedApiUrls: config.trustedApiUrls }, installationId, { id: repositoryId, fullName: repositoryFullName });
+  let checkRun;
+  try {
+    checkRun = await createReleaseCheckRun(config.apiUrl, repositoryFullName, access.token, headSha, repositoryFullName, config.trustedApiUrls).catch((error) => {
+      console.warn(`Could not create Versionhoo Release check: ${error instanceof Error ? error.message : error}`);
+      return;
+    });
+    const result = await runner({
+      repositoryFullName,
+      cloneUrl,
+      branch,
+      headSha,
+      token: access.token,
+      apiUrl: config.apiUrl,
+      trustedApiUrls: config.trustedApiUrls,
+      trustedCloneHosts: config.trustedCloneHosts,
+      workDir: config.workDir,
+      configPath: config.configPath,
+      installCommand: config.installCommand,
+      gitAuthorName: config.gitAuthorName,
+      gitAuthorEmail: config.gitAuthorEmail,
+      keepWorkDir: config.keepWorkDir
+    });
+    if (checkRun) {
+      const check = releaseCheckResult(result);
+      await completeReleaseCheckRun(config.apiUrl, repositoryFullName, access.token, checkRun.id, check.conclusion, check.title, check.summary, repositoryFullName, config.trustedApiUrls).catch((error) => {
+        console.warn(`Could not complete Versionhoo Release check: ${error instanceof Error ? error.message : error}`);
+      });
+    }
+  } catch (error) {
+    if (checkRun) {
+      const check = releaseFailureCheckResult(error);
+      await completeReleaseCheckRun(config.apiUrl, repositoryFullName, access.token, checkRun.id, check.conclusion, check.title, check.summary, repositoryFullName, config.trustedApiUrls).catch((checkError) => {
+        console.warn(`Could not mark Versionhoo Release check failed: ${checkError instanceof Error ? checkError.message : checkError}`);
+      });
+    }
+    throw error;
+  }
+}
+function isReleaseCommit(message) {
+  return /^chore\(release\):/m.test(message) || /\[skip ci\]/i.test(message);
+}
+function ignored(reason) {
+  return { status: "ignored", reason };
+}
+function workflowRunKey(payload) {
+  return [
+    payload.repository.full_name,
+    payload.workflow_run.id ?? payload.workflow_run.head_sha,
+    payload.workflow_run.name,
+    payload.workflow_run.head_branch ?? ""
+  ].join(":");
+}
+function releaseQueueKey(payload) {
+  return `${payload.repository.full_name}:${payload.workflow_run.head_branch ?? ""}`;
+}
+function readRequiredEnv(env, names) {
+  const value = readEnv(env, names);
+  if (!value)
+    throw new HooversionError(`${names.join(" or ")} is required.`);
+  return value;
+}
+function readEnv(env, names) {
+  for (const name of names) {
+    const value = env[name];
+    if (value)
+      return value;
+  }
+  return;
+}
+function splitCsv(value) {
+  return value ? value.split(",").map((item) => item.trim()).filter(Boolean) : [];
+}
+function readBoolean(value) {
+  return value === "1" || value === "true" || value === "yes";
+}
+function json(value, status = 200) {
+  return new Response(JSON.stringify(value, null, 2), {
+    status,
+    headers: { "content-type": "application/json; charset=utf-8" }
+  });
+}
+
 // src/cli.ts
 async function main(argv = process.argv.slice(2)) {
   const [command = "help", ...rest] = argv;
-  const flags = parseFlags(rest);
+  const flags = parseFlags(command, rest);
   const cwd = process.cwd();
   switch (command) {
     case "init":
@@ -1239,6 +2998,9 @@ async function main(argv = process.argv.slice(2)) {
     case "doctor":
       await doctorCommand(cwd, flags);
       return;
+    case "app":
+      startVersionhooApp(loadVersionhooAppConfigFromEnv());
+      return;
     case "help":
     case "--help":
     case "-h":
@@ -1253,18 +3015,54 @@ async function main(argv = process.argv.slice(2)) {
       throw new HooversionError(`Unknown command: ${command}`);
   }
 }
+var commandOptions = {
+  init: {
+    values: ["action-owner-repo", "action-ref", "hooversion-version"],
+    booleans: ["force", "no-workflow"]
+  },
+  lint: { values: ["edit", "from", "to"], booleans: ["last"] },
+  plan: { values: ["config"], booleans: [] },
+  release: { values: ["config"], booleans: ["dry-run", "no-push", "no-github"] },
+  doctor: { values: ["config"], booleans: [] },
+  app: { values: [], booleans: [] },
+  help: { values: [], booleans: [] },
+  "--help": { values: [], booleans: [] },
+  "-h": { values: [], booleans: [] },
+  version: { values: [], booleans: [] },
+  "--version": { values: [], booleans: [] },
+  "-v": { values: [], booleans: [] }
+};
 async function initCommand(cwd, flags) {
   const force = flags.booleans.has("force");
-  if (findConfigPath(cwd) && !force) {
+  const configPaths = [
+    "hooversion.config.ts",
+    "hooversion.config.mjs",
+    "hooversion.config.js",
+    "hooversion.config.cjs",
+    "hooversion.config.json"
+  ].map((name) => join8(cwd, name));
+  const existingConfigs = configPaths.filter((path) => existsSync4(path));
+  const selectedConfig = findConfigPath(cwd);
+  if (existingConfigs.length > 0 && !force) {
     throw new HooversionError("Hooversion config already exists. Use --force to overwrite.");
   }
+  if (force && existingConfigs.length > 1) {
+    throw new HooversionError("Multiple Hooversion configs exist; remove duplicate config files before using --force.");
+  }
   const packages = detectPackages(cwd);
-  const configPath = writeDefaultConfig(cwd, packages);
+  if (packages.length === 0) {
+    throw new HooversionError("Could not detect package.json, Cargo.toml, pyproject.toml, or version.");
+  }
   const workflowPaths = flags.booleans.has("no-workflow") ? undefined : writeGitHubWorkflows(cwd, {
     actionOwnerRepo: flags.values.get("action-owner-repo"),
     actionRef: flags.values.get("action-ref"),
-    hooversionVersion: flags.values.get("hooversion-version")
+    hooversionVersion: flags.values.get("hooversion-version"),
+    force
   });
+  const configPath = writeDefaultConfig(cwd, packages);
+  if (force && selectedConfig && selectedConfig !== join8(cwd, "hooversion.config.ts")) {
+    unlinkSync3(selectedConfig);
+  }
   console.log(`Wrote ${configPath}`);
   for (const workflowPath of workflowPaths ?? []) {
     console.log(`Wrote ${workflowPath}`);
@@ -1272,7 +3070,7 @@ async function initCommand(cwd, flags) {
 }
 function lintCommand(cwd, flags) {
   const commits = readLintCommits(cwd, flags);
-  const issues = commits.flatMap(lintCommit);
+  const issues = commits.flatMap((commit) => lintCommit(commit));
   if (issues.length > 0) {
     for (const issue of issues) {
       const hash = issue.hash ? `${issue.hash.slice(0, 7)} ` : "";
@@ -1287,21 +3085,23 @@ async function planCommand(cwd, flags) {
   const config = await loadConfig(cwd, flags.values.get("config"));
   const plan = createReleasePlan(cwd, config);
   printPlan(plan);
+  if (plan.unmatchedCommits.length > 0) {
+    throw new HooversionError("Plan contains unmatched release-worthy commits.");
+  }
 }
 async function releaseCommand(cwd, flags) {
   const config = await loadConfig(cwd, flags.values.get("config"));
   const plan = createReleasePlan(cwd, config);
   const dryRun = flags.booleans.has("dry-run");
-  validatePlan(cwd, config, plan);
-  printPlan(plan);
-  await executeRelease(cwd, config, plan, {
+  const execution = await executeRelease(cwd, config, plan, {
     dryRun,
     push: flags.booleans.has("no-push") ? false : undefined,
     github: flags.booleans.has("no-github") ? false : undefined
   });
+  printPlan(execution.plan);
   if (dryRun) {
     console.log("Dry run complete; no files, commits, tags, or releases were created.");
-  } else if (plan.releases.length > 0) {
+  } else if (execution.published) {
     console.log("Release complete.");
   } else {
     console.log("No release needed.");
@@ -1320,17 +3120,20 @@ async function doctorCommand(cwd, flags) {
     throw new HooversionError("Doctor found blocking errors.");
 }
 function readLintCommits(cwd, flags) {
+  const selectors = [
+    flags.values.has("edit"),
+    flags.booleans.has("last"),
+    flags.values.has("from") || flags.values.has("to")
+  ].filter(Boolean).length;
+  if (selectors !== 1) {
+    throw new HooversionError("lint requires exactly one selector: --last, --edit <file>, or --from <ref> [--to <ref>].");
+  }
   const editPath = flags.values.get("edit");
   if (editPath) {
-    return [
-      {
-        hash: "",
-        subject: readFileSync6(editPath, "utf8").split(/\r?\n/)[0] ?? "",
-        body: readFileSync6(editPath, "utf8").split(/\r?\n/).slice(1).join(`
-`),
-        files: []
-      }
-    ];
+    const message = readFileSync7(editPath, "utf8");
+    const [subject = "", ...body] = message.split(/\r?\n/);
+    return [{ hash: "", subject, body: body.join(`
+`), files: [] }];
   }
   if (flags.booleans.has("last")) {
     return [getLastCommit(cwd)];
@@ -1338,16 +3141,25 @@ function readLintCommits(cwd, flags) {
   const from = flags.values.get("from");
   const to = flags.values.get("to") ?? "HEAD";
   if (!from) {
-    throw new HooversionError("lint requires --last, --edit <file>, or --from <ref> [--to <ref>].");
+    throw new HooversionError("--to requires --from.");
   }
+  validateGitRef(cwd, from, "from");
+  validateGitRef(cwd, to, "to");
   return getCommits(cwd, from, to);
+}
+function validateGitRef(cwd, ref, name) {
+  if (!ref.trim())
+    throw new HooversionError(`--${name} requires a non-empty git ref.`);
+  const resolved = git(cwd, ["rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`], true);
+  if (!resolved.trim())
+    throw new HooversionError(`Invalid git ref for --${name}: ${ref}`);
 }
 function printPlan(plan) {
   console.log(`Branch: ${plan.branch}`);
   if (plan.unmatchedCommits.length > 0) {
     console.log("Unmatched release commits:");
     for (const commit of plan.unmatchedCommits) {
-      console.log(`- ${commit.hash.slice(0, 7)} ${commit.subject}`);
+      console.log(`- ${formatCommit(commit)}`);
     }
     return;
   }
@@ -1368,36 +3180,53 @@ function printPlan(plan) {
 function formatCommit(commit) {
   const parsed = parseCommit(commit);
   const scope = parsed.scope ? `(${parsed.scope})` : "";
-  const bang = parsed.breaking ? "!" : "";
-  return `${commit.hash.slice(0, 7)} ${parsed.type}${scope}${bang}: ${parsed.description}`;
+  const breaking = parsed.breaking ? "!" : "";
+  return `${parsed.hash.slice(0, 7)} ${parsed.type}${scope}${breaking}: ${parsed.description}`;
 }
-function parseFlags(args) {
+function parseFlags(command, args) {
+  const spec = commandOptions[command];
+  if (!spec)
+    throw new HooversionError(`Unknown command: ${command}`);
   const values = new Map;
   const booleans = new Set;
   const positionals = [];
+  const valueOptions = new Set(spec.values);
+  const booleanOptions = new Set(spec.booleans);
   for (let index = 0;index < args.length; index += 1) {
     const arg = args[index];
     if (!arg.startsWith("--")) {
       positionals.push(arg);
       continue;
     }
-    const [name, inlineValue] = arg.slice(2).split("=", 2);
-    if (inlineValue !== undefined) {
-      values.set(name, inlineValue);
+    const raw = arg.slice(2);
+    const separator = raw.indexOf("=");
+    const name = separator === -1 ? raw : raw.slice(0, separator);
+    const inlineValue = separator === -1 ? undefined : raw.slice(separator + 1);
+    if (!name || !valueOptions.has(name) && !booleanOptions.has(name)) {
+      throw new HooversionError(`Unknown option for ${command}: --${name || raw}`);
+    }
+    if (values.has(name) || booleans.has(name)) {
+      throw new HooversionError(`Option may only be specified once: --${name}`);
+    }
+    if (valueOptions.has(name)) {
+      const value = inlineValue ?? args[index + 1];
+      if (value === undefined || value.startsWith("-") || !value.trim()) {
+        throw new HooversionError(`Option requires a non-empty value: --${name}`);
+      }
+      if (inlineValue === undefined)
+        index += 1;
+      values.set(name, value);
       continue;
     }
-    const next = args[index + 1];
-    if (next && !next.startsWith("--") && expectsValue(name)) {
-      values.set(name, next);
-      index += 1;
-    } else {
-      booleans.add(name);
+    if (inlineValue !== undefined) {
+      throw new HooversionError(`Boolean option does not accept a value: --${name}`);
     }
+    booleans.add(name);
+  }
+  if (positionals.length > 0) {
+    throw new HooversionError(`Unexpected positional argument: ${positionals[0]}`);
   }
   return { values, booleans, positionals };
-}
-function expectsValue(name) {
-  return ["action-owner-repo", "action-ref", "config", "edit", "from", "hooversion-version", "to"].includes(name);
 }
 function printHelp() {
   console.log(`hooversion
@@ -1410,13 +3239,14 @@ Usage:
   hooversion plan [--config <path>]
   hooversion release [--dry-run] [--no-push] [--no-github] [--config <path>]
   hooversion doctor [--config <path>]
+  hooversion app
 `);
 }
 function printVersion() {
   const packagePath = new URL("../package.json", import.meta.url);
   if (existsSync4(packagePath)) {
-    const json = JSON.parse(readFileSync6(packagePath, "utf8"));
-    console.log(`${json.name ?? "hooversion"} ${json.version ?? "unknown"}`);
+    const json2 = JSON.parse(readFileSync7(packagePath, "utf8"));
+    console.log(`${json2.name ?? "hooversion"} ${json2.version ?? "unknown"}`);
   } else {
     console.log(`${basename3(process.argv[1] ?? "hooversion")} unknown`);
   }

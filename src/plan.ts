@@ -1,9 +1,9 @@
-import { getCurrentBranch, getCommits, getLatestTag } from "./git";
+import { getCurrentBranch, getCommits, getLatestTag, git } from "./git";
 import { readManifest } from "./manifest";
-import { bumpVersion, highestReleaseType, minReleaseType } from "./semver";
+import { bumpVersion, highestReleaseType } from "./semver";
 import { generateReleaseNotes } from "./changelog";
 import { parseCommits } from "./commit";
-import { directAffectedPackages, propagateDependencies } from "./routing";
+import { directAffectedPackages } from "./routing";
 import type {
   NormalizedConfig,
   NormalizedPackageConfig,
@@ -18,10 +18,8 @@ export function renderTag(format: string, pkg: NormalizedPackageConfig, version:
 }
 
 export function tagPatternForPackage(config: NormalizedConfig, pkg: NormalizedPackageConfig): string {
-  if (config.packages.length === 1) return "v[0-9]*";
-  return config.independentTagFormat
-    .replaceAll("${name}", pkg.name)
-    .replaceAll("${version}", "[0-9]*");
+  const format = config.packages.length === 1 ? config.tagFormat : config.independentTagFormat;
+  return format.replaceAll("${name}", pkg.name).replaceAll("${version}", "[0-9]*");
 }
 
 export function tagForPackage(config: NormalizedConfig, pkg: NormalizedPackageConfig, version: string): string {
@@ -30,66 +28,74 @@ export function tagForPackage(config: NormalizedConfig, pkg: NormalizedPackageCo
 
 export function createReleasePlan(cwd: string, config: NormalizedConfig): ReleasePlan {
   const branch = getCurrentBranch(cwd);
+  const sourceSha = git(cwd, ["rev-parse", "HEAD"]).trim();
   const independent = config.packages.length > 1;
-  return independent ? createIndependentPlan(cwd, config, branch) : createSinglePackagePlan(cwd, config, branch);
+  return independent
+    ? createIndependentPlan(cwd, config, branch, sourceSha)
+    : createSinglePackagePlan(cwd, config, branch, sourceSha);
 }
 
-function createSinglePackagePlan(cwd: string, config: NormalizedConfig, branch: string): ReleasePlan {
+function createSinglePackagePlan(
+  cwd: string,
+  config: NormalizedConfig,
+  branch: string,
+  sourceSha: string,
+): ReleasePlan {
   const pkg = config.packages[0];
   const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
-  const commits = parseCommits(getCommits(cwd, latestTag)).filter((commit) => !commit.ignored);
+  const commits = parseCommits(getCommits(cwd, latestTag, sourceSha)).filter((commit) => !commit.ignored);
   const releaseType = highestReleaseType(commits.map((commit) => commit.releaseType));
   const releases = releaseType ? [buildRelease(cwd, config, pkg, commits, releaseType, latestTag, false)] : [];
-  return { cwd, branch, independent: false, releases, unmatchedCommits: [] };
+  return { cwd, branch, sourceSha, independent: false, releases, unmatchedCommits: [] };
 }
 
-function createIndependentPlan(cwd: string, config: NormalizedConfig, branch: string): ReleasePlan {
+function createIndependentPlan(cwd: string, config: NormalizedConfig, branch: string, sourceSha: string): ReleasePlan {
   const latestTags = new Map<string, string | undefined>();
-  const parsedCommitsByPackage = new Map<string, ParsedCommit[]>();
   const candidateCommits = new Map<string, ParsedCommit>();
-  const directAffectedByCommit = new Map<string, Set<string>>();
-  const affectedByCommit = new Map<string, Set<string>>();
 
   for (const pkg of config.packages) {
     const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
     latestTags.set(pkg.name, latestTag);
-    const commits = parseCommits(getCommits(cwd, latestTag)).filter((commit) => !commit.ignored);
-    parsedCommitsByPackage.set(pkg.name, commits);
+    const commits = parseCommits(getCommits(cwd, latestTag, sourceSha)).filter((commit) => !commit.ignored);
     for (const commit of commits) {
       candidateCommits.set(commit.hash, commit);
     }
   }
 
+  const directAffectedByCommit = new Map<string, Set<string>>();
+  const releaseTypes = new Map<string, ReleaseType>();
+  const releaseCommits = new Map<string, ParsedCommit[]>();
+
   for (const commit of candidateCommits.values()) {
     const direct = directAffectedPackages(commit, config.packages);
     directAffectedByCommit.set(commit.hash, direct);
-    affectedByCommit.set(commit.hash, propagateDependencies(direct, config.packages));
+    if (!commit.releaseType) continue;
+
+    for (const packageName of direct) {
+      releaseTypes.set(packageName, highestReleaseType([releaseTypes.get(packageName), commit.releaseType])!);
+      const commits = releaseCommits.get(packageName) ?? [];
+      commits.push(commit);
+      releaseCommits.set(packageName, commits);
+    }
   }
 
   const unmatchedCommits = Array.from(candidateCommits.values()).filter(
     (commit) => commit.releaseType && (directAffectedByCommit.get(commit.hash)?.size ?? 0) === 0,
   );
   if (unmatchedCommits.length > 0) {
-    return { cwd, branch, independent: true, releases: [], unmatchedCommits };
+    return { cwd, branch, sourceSha, independent: true, releases: [], unmatchedCommits };
   }
 
-  const releaseTypes = new Map<string, ReleaseType>();
-  const releaseCommits = new Map<string, ParsedCommit[]>();
   const dependencyTriggered = new Set<string>();
-
-  for (const pkg of config.packages) {
-    const packageCommits = parsedCommitsByPackage.get(pkg.name) ?? [];
-    for (const commit of packageCommits) {
-      const affected = affectedByCommit.get(commit.hash) ?? new Set<string>();
-      if (!affected.has(pkg.name)) continue;
-      if (!commit.releaseType) continue;
-      const direct = directAffectedByCommit.get(commit.hash) ?? new Set<string>();
-      const typeForPackage = direct.has(pkg.name) ? commit.releaseType : "patch";
-      if (!direct.has(pkg.name)) dependencyTriggered.add(pkg.name);
-      releaseTypes.set(pkg.name, minReleaseType(releaseTypes.get(pkg.name), typeForPackage));
-      const commits = releaseCommits.get(pkg.name) ?? [];
-      commits.push(commit);
-      releaseCommits.set(pkg.name, commits);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pkg of config.packages) {
+      if (releaseTypes.has(pkg.name)) continue;
+      if (!pkg.dependencies.some((dependency) => releaseTypes.has(dependency))) continue;
+      releaseTypes.set(pkg.name, "patch");
+      dependencyTriggered.add(pkg.name);
+      changed = true;
     }
   }
 
@@ -110,7 +116,7 @@ function createIndependentPlan(cwd: string, config: NormalizedConfig, branch: st
     );
   }
 
-  return { cwd, branch, independent: true, releases, unmatchedCommits: [] };
+  return { cwd, branch, sourceSha, independent: true, releases, unmatchedCommits: [] };
 }
 
 function buildRelease(

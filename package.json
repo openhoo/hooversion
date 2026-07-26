@@ -11,24 +11,35 @@
     "access": "public"
   },
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/types/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "types": "./dist/types/index.d.ts",
   "bin": {
-    "hooversion": "dist/cli.js"
+    "hooversion": "dist/cli.js",
+    "versionhoo-app": "dist/app.js"
   },
   "files": [
     "actions",
+    "docs",
     "dist",
     "examples",
     "README.md"
   ],
   "scripts": {
     "dev": "bun run src/cli.ts",
-    "build": "bun build src/cli.ts --target=bun --format=esm --outfile=dist/cli.js && chmod +x dist/cli.js",
+    "build": "bun build src/cli.ts --target=bun --format=esm --outfile=dist/cli.js && bun build src/app.ts --target=bun --format=esm --outfile=dist/app.js && bun build src/index.ts --target=bun --format=esm --outfile=dist/index.js && tsc -p tsconfig.build.json && chmod +x dist/cli.js dist/app.js",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
     "check": "bun run typecheck && bun test && bun run build",
     "sync:actions": "bun run scripts/sync-action-versions.ts",
     "plan": "bun run src/cli.ts plan",
     "release": "bun run src/cli.ts release",
+    "app": "bun run src/app.ts",
     "prepack": "bun run build"
   },
   "devDependencies": {

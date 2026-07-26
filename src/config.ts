@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, normalize, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { HooversionError } from "./errors";
+
 import { defaultManifestPath, readManifest } from "./manifest";
 import type {
   HooversionConfig,
@@ -10,6 +11,14 @@ import type {
   PackageConfig,
   PackageType,
 } from "./types";
+import { assertValidGitRef } from "./git";
+
+function assertValidTagFormat(format: string, packages: readonly NormalizedPackageConfig[]): void {
+  for (const pkg of packages) {
+    const candidate = format.replaceAll("${name}", pkg.name).replaceAll("${version}", "0.0.0");
+    assertValidGitRef(candidate, "tag");
+  }
+}
 
 const configFiles = [
   "hooversion.config.ts",
@@ -44,22 +53,47 @@ export function normalizeConfig(cwd: string, raw: HooversionConfig): NormalizedC
   if (!raw.packages || raw.packages.length === 0) {
     throw new HooversionError("Config must define at least one package.");
   }
-
   const packages = raw.packages.map((pkg) => normalizePackage(cwd, pkg));
-  const packageNames = new Set(packages.map((pkg) => pkg.name));
+
+  const packageNames = new Map<string, NormalizedPackageConfig>();
   for (const pkg of packages) {
+    const normalizedName = normalizeGraphName(pkg.name);
+    const duplicate = packageNames.get(normalizedName);
+    if (duplicate) {
+      throw new HooversionError(`Duplicate package name after normalization: ${duplicate.name} and ${pkg.name}`);
+    }
+    packageNames.set(normalizedName, pkg);
+  }
+
+  const graph = new Map<string, string[]>();
+  for (const pkg of packages) {
+    const dependencies: string[] = [];
     for (const dependency of pkg.dependencies) {
-      if (!packageNames.has(dependency)) {
+      const target = packageNames.get(normalizeGraphName(dependency));
+      if (!target) {
         throw new HooversionError(`Package ${pkg.name} depends on unknown package ${dependency}`);
       }
+      if (target === pkg) {
+        throw new HooversionError(`Package ${pkg.name} cannot depend on itself`);
+      }
+      dependencies.push(target.name);
     }
+    pkg.dependencies = dependencies;
+    graph.set(normalizeGraphName(pkg.name), dependencies.map(normalizeGraphName));
   }
+  assertAcyclicPackageGraph(packages, graph);
+  const branches = raw.branches ?? ["main"];
+  const tagFormat = raw.tagFormat ?? "v${version}";
+  const independentTagFormat = raw.independentTagFormat ?? "${name}@v${version}";
+  for (const branch of branches) assertValidGitRef(branch, "branch");
+  assertValidTagFormat(tagFormat, packages);
+  assertValidTagFormat(independentTagFormat, packages);
 
   return {
     ...raw,
-    branches: raw.branches ?? ["main"],
-    tagFormat: raw.tagFormat ?? "v${version}",
-    independentTagFormat: raw.independentTagFormat ?? "${name}@v${version}",
+    branches,
+    tagFormat,
+    independentTagFormat,
     packages,
     hooks: {
       beforeRelease: raw.hooks?.beforeRelease ?? [],
@@ -157,7 +191,7 @@ function normalizePackage(cwd: string, pkg: PackageConfig): NormalizedPackageCon
     assets: pkg.assets ?? [],
   } as NormalizedPackageConfig);
 
-  const name = pkg.name || info.name;
+  const name = (pkg.name || info.name).trim();
   return {
     ...pkg,
     name,
@@ -166,9 +200,33 @@ function normalizePackage(cwd: string, pkg: PackageConfig): NormalizedPackageCon
     manifest,
     changelog: normalizeRelative(pkg.changelog ?? defaultChangelog(packagePath)),
     scopes: [...new Set([name, ...(pkg.scopes ?? [])])],
-    dependencies: pkg.dependencies ?? [],
+    dependencies: (pkg.dependencies ?? []).map((dependency) => dependency.trim()),
     assets: pkg.assets ?? [],
   };
+}
+
+function normalizeGraphName(name: string): string {
+  return name.trim().toLowerCase();
+}
+
+function assertAcyclicPackageGraph(packages: NormalizedPackageConfig[], graph: Map<string, string[]>): void {
+  const state = new Map<string, "visiting" | "visited">();
+  const stack: string[] = [];
+
+  const visit = (name: string): void => {
+    if (state.get(name) === "visited") return;
+    if (state.get(name) === "visiting") {
+      const cycleStart = stack.indexOf(name);
+      throw new HooversionError(`Package dependency cycle detected: ${[...stack.slice(cycleStart), name].join(" -> ")}`);
+    }
+    state.set(name, "visiting");
+    stack.push(name);
+    for (const dependency of graph.get(name) ?? []) visit(dependency);
+    stack.pop();
+    state.set(name, "visited");
+  };
+
+  for (const pkg of packages) visit(normalizeGraphName(pkg.name));
 }
 
 function detectCargoPackages(cwd: string): PackageConfig[] {

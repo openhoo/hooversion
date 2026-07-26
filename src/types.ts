@@ -92,6 +92,11 @@ export interface CommitLintIssue {
   message: string;
 }
 
+export interface CommitPolicy {
+  allowedTypes?: readonly string[];
+  releaseTypes?: Readonly<Record<string, ReleaseType | undefined>>;
+}
+
 export interface PackageRelease {
   package: NormalizedPackageConfig;
   currentVersion: string;
@@ -108,6 +113,7 @@ export interface PackageRelease {
 export interface ReleasePlan {
   cwd: string;
   branch: string;
+  sourceSha: string;
   independent: boolean;
   releases: PackageRelease[];
   unmatchedCommits: ParsedCommit[];

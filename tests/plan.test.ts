@@ -25,6 +25,28 @@ describe("release planning", () => {
     expect(plan.releases).toHaveLength(1);
     expect(plan.releases[0].nextVersion).toBe("0.2.0");
     expect(plan.releases[0].tag).toBe("v0.2.0");
+    expect(plan.sourceSha).toBe(git(cwd, "rev-parse", "HEAD"));
+  });
+
+  it("uses the configured tag format when finding the planning baseline", () => {
+    const cwd = makeRepo();
+    writeFileSync(join(cwd, "package.json"), JSON.stringify({ name: "labelhoo", version: "0.1.0" }, null, 2));
+    commitAll(cwd, "feat: initial import");
+    git(cwd, "tag", "-a", "release-0.1.0", "-m", "release-0.1.0");
+    writeFileSync(join(cwd, "index.ts"), "export const value = 1;\n");
+    commitAll(cwd, "fix: repair public API");
+
+    const config = normalizeConfig(cwd, {
+      tagFormat: "release-${version}",
+      packages: [{ name: "labelhoo", path: ".", type: "node", manifest: "package.json" }],
+      github: false,
+      push: false,
+    });
+    const plan = createReleasePlan(cwd, config);
+
+    expect(plan.releases).toHaveLength(1);
+    expect(plan.releases[0].releaseType).toBe("patch");
+    expect(plan.releases[0].latestTag).toBe("release-0.1.0");
   });
 
   it("plans a release from a plain version file", () => {
@@ -106,7 +128,37 @@ describe("release planning", () => {
     expect(releases.get("hoot-core")?.nextVersion).toBe("0.1.1");
     expect(releases.get("hoot")?.nextVersion).toBe("0.1.1");
     expect(releases.get("hoot-core")?.dependencyTriggered).toBe(true);
+    expect(releases.get("hoot-plugin-sdk")?.commits.map((commit) => commit.subject)).toEqual([
+      "feat(hoot-plugin-sdk): add parser",
+    ]);
+    expect(releases.get("hoot-core")?.commits).toHaveLength(0);
+    expect(releases.get("hoot")?.commits).toHaveLength(0);
     expect(releases.get("hoot")?.dependencyTriggered).toBe(true);
+  });
+
+  it("does not cascade a release across packages without a declared dependency edge", () => {
+    const cwd = makeRepo();
+    mkdirSync(join(cwd, "packages", "one"), { recursive: true });
+    mkdirSync(join(cwd, "packages", "two"), { recursive: true });
+    writeFileSync(join(cwd, "packages", "one", "package.json"), JSON.stringify({ name: "one", version: "0.1.0" }));
+    writeFileSync(join(cwd, "packages", "two", "package.json"), JSON.stringify({ name: "two", version: "0.1.0" }));
+    commitAll(cwd, "initial import");
+    git(cwd, "tag", "-a", "one@v0.1.0", "-m", "one@v0.1.0");
+    git(cwd, "tag", "-a", "two@v0.1.0", "-m", "two@v0.1.0");
+    writeFileSync(join(cwd, "packages", "one", "index.ts"), "export const one = true;\n");
+    commitAll(cwd, "feat(one): add one");
+
+    const config = normalizeConfig(cwd, {
+      packages: [
+        { name: "one", path: "packages/one", type: "node", manifest: "packages/one/package.json" },
+        { name: "two", path: "packages/two", type: "node", manifest: "packages/two/package.json" },
+      ],
+      github: false,
+      push: false,
+    });
+    const plan = createReleasePlan(cwd, config);
+
+    expect(plan.releases.map((release) => release.package.name)).toEqual(["one"]);
   });
 
   it("fails the plan when a release commit cannot be assigned to a package", () => {
