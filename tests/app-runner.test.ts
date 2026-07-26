@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -11,15 +11,29 @@ interface CommandCall {
 }
 
 const commandCalls: CommandCall[] = [];
+const askpassSnapshots: Array<{ content: string; mode: number }> = [];
 const shellCalls: CommandCall[] = [];
 const releaseOptions: Array<Record<string, unknown>> = [];
 let resumedRelease = false;
 let cloneFailure = false;
 let releaseFailure = false;
 
+function filesUnder(root: string): string[] {
+  return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(root, entry.name);
+    return entry.isDirectory() ? filesUnder(path) : [path];
+  });
+}
+
 mock.module("../src/process", () => ({
   runCommand(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv) {
     commandCalls.push({ command, args, cwd, env });
+    if (args.includes("clone") && env?.GIT_ASKPASS) {
+      askpassSnapshots.push({
+        content: readFileSync(env.GIT_ASKPASS, "utf8"),
+        mode: statSync(env.GIT_ASKPASS).mode & 0o777,
+      });
+    }
     if (args.includes("clone")) {
       if (cloneFailure) return { code: 1, stdout: "", stderr: "clone failed" };
       const repoDir = args.at(-1);
@@ -83,16 +97,26 @@ describe("Versionhoo app Git credential plumbing", () => {
     commandCalls.length = 0;
     pushRelease("/repo", "main", ["v1.2.3"], {
       GIT_ASKPASS: "/tmp/askpass",
-      VERSIONHOO_GIT_TOKEN_FILE: "/tmp/token",
+      VERSIONHOO_GIT_TOKEN: "push-token",
     });
     const push = commandCalls.find((call) => call.args[0] === "push");
-    expect(push?.args).toEqual(["push", "--atomic", "origin", "HEAD:main", "v1.2.3"]);
+    expect(push?.args).toEqual([
+      "push",
+      "--atomic",
+      "--no-verify",
+      "--",
+      "origin",
+      "HEAD:refs/heads/main",
+      "refs/tags/v1.2.3",
+    ]);
+    expect(push?.args.join(" ")).not.toContain("push-token");
     expect(push?.env?.GIT_ASKPASS).toBe("/tmp/askpass");
-    expect(push?.env?.VERSIONHOO_GIT_TOKEN_FILE).toBe("/tmp/token");
+    expect(push?.env?.VERSIONHOO_GIT_TOKEN).toBe("push-token");
   });
   it("keeps credentials out of argv and ordinary child environments", async () => {
     commandCalls.length = 0;
     shellCalls.length = 0;
+    askpassSnapshots.length = 0;
     releaseOptions.length = 0;
     const parent = mkdtempSync(join(tmpdir(), "versionhoo-app-test-"));
     const token = "super-secret-token";
@@ -111,23 +135,30 @@ describe("Versionhoo app Git credential plumbing", () => {
       const clone = commandCalls.find((call) => call.args.includes("clone"));
       expect(clone).toBeDefined();
       expect(clone?.args.join(" ")).not.toContain(token);
-      expect(clone?.env?.VERSIONHOO_GIT_TOKEN_FILE).toBeDefined();
+      expect(clone?.args.at(-2)).toBe("https://github.com/openhoo/app.git");
+      expect(clone?.env?.VERSIONHOO_GIT_TOKEN).toBe(token);
       expect(clone?.env?.GIT_CONFIG_NOSYSTEM).toBe("1");
+      expect(askpassSnapshots).toHaveLength(1);
+      expect(askpassSnapshots[0]?.mode).toBe(0o700);
+      expect(askpassSnapshots[0]?.content).not.toContain(token);
       expect(clone?.env?.GIT_ASKPASS).toBeDefined();
       expect(commandCalls.filter((call) => !call.args.includes("clone")).every((call) => call.env === undefined)).toBe(true);
       expect(shellCalls.every((call) => call.env === undefined)).toBe(true);
-      expect(releaseOptions[0]?.gitAuth).toBeDefined();
       const auth = releaseOptions[0]?.gitAuth;
       expect(auth && typeof auth === "object" ? Object.keys(auth).sort() : []).toEqual([
         "GIT_ASKPASS",
         "GIT_TERMINAL_PROMPT",
-        "VERSIONHOO_GIT_TOKEN_FILE",
+        "VERSIONHOO_GIT_TOKEN",
       ]);
-      expect(process.env.VERSIONHOO_GIT_TOKEN_FILE).toBeUndefined();
+      const authToken =
+        auth && typeof auth === "object" && "VERSIONHOO_GIT_TOKEN" in auth ? auth.VERSIONHOO_GIT_TOKEN : undefined;
+      expect(authToken).toBe(token);
+      expect(process.env.VERSIONHOO_GIT_TOKEN).toBeUndefined();
+      expect(process.env.GIT_ASKPASS).toBeUndefined();
       const workDir = result.workDir;
-      expect(existsSync(join(workDir, ".git-token"))).toBe(false);
       expect(existsSync(join(workDir, ".git-askpass"))).toBe(false);
       expect(readFileSync(join(workDir, "repo", ".git", "config"), "utf8")).not.toContain(token);
+      expect(filesUnder(workDir).every((path) => !readFileSync(path, "utf8").includes(token))).toBe(true);
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }
@@ -155,8 +186,36 @@ describe("Versionhoo app Git credential plumbing", () => {
     }
   });
 
+  it("rejects an invalid clone URL before creating credential artifacts", async () => {
+    commandCalls.length = 0;
+    const token = "invalid-url-token";
+    const parent = mkdtempSync(join(tmpdir(), "versionhoo-app-invalid-url-"));
+    try {
+      await expect(
+        runVersionhooRelease({
+          repositoryFullName: "openhoo/app",
+          cloneUrl: "https://github.com/other/repo.git",
+          branch: "main",
+          headSha: "head-sha",
+          token,
+          workDir: parent,
+          keepWorkDir: true,
+        }),
+      ).rejects.toThrow("mismatch");
+      expect(commandCalls).toHaveLength(0);
+      for (const entry of readdirSync(parent)) {
+        const entryPath = join(parent, entry);
+        expect(existsSync(join(entryPath, ".git-askpass"))).toBe(false);
+        expect(filesUnder(entryPath).every((path) => !readFileSync(path, "utf8").includes(token))).toBe(true);
+      }
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
   it("cleans credentials after clone failure", async () => {
     cloneFailure = true;
+    const token = "clone-failure-token";
     const parent = mkdtempSync(join(tmpdir(), "versionhoo-app-test-"));
     try {
       await expect(
@@ -165,14 +224,15 @@ describe("Versionhoo app Git credential plumbing", () => {
           cloneUrl: "https://github.com/openhoo/app.git",
           branch: "main",
           headSha: "head-sha",
-          token: "clone-failure-token",
+          token,
           workDir: parent,
           keepWorkDir: true,
         }),
       ).rejects.toThrow("clone failed");
       for (const entry of readdirSync(parent)) {
-        expect(existsSync(join(parent, entry, ".git-token"))).toBe(false);
-        expect(existsSync(join(parent, entry, ".git-askpass"))).toBe(false);
+        const entryPath = join(parent, entry);
+        expect(existsSync(join(entryPath, ".git-askpass"))).toBe(false);
+        expect(filesUnder(entryPath).every((path) => !readFileSync(path, "utf8").includes(token))).toBe(true);
       }
     } finally {
       cloneFailure = false;
@@ -182,6 +242,7 @@ describe("Versionhoo app Git credential plumbing", () => {
 
   it("cleans credentials after release failure", async () => {
     releaseFailure = true;
+    const token = "release-failure-token";
     const parent = mkdtempSync(join(tmpdir(), "versionhoo-app-test-"));
     try {
       await expect(
@@ -190,14 +251,15 @@ describe("Versionhoo app Git credential plumbing", () => {
           cloneUrl: "https://github.com/openhoo/app.git",
           branch: "main",
           headSha: "head-sha",
-          token: "release-failure-token",
+          token,
           workDir: parent,
           keepWorkDir: true,
         }),
       ).rejects.toThrow("release failed");
       for (const entry of readdirSync(parent)) {
-        expect(existsSync(join(parent, entry, ".git-token"))).toBe(false);
-        expect(existsSync(join(parent, entry, ".git-askpass"))).toBe(false);
+        const entryPath = join(parent, entry);
+        expect(existsSync(join(entryPath, ".git-askpass"))).toBe(false);
+        expect(filesUnder(entryPath).every((path) => !readFileSync(path, "utf8").includes(token))).toBe(true);
       }
     } finally {
       releaseFailure = false;

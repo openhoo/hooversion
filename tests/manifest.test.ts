@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { updateLocalDependencyVersions, updateManifestVersion } from "../src/manifest";
@@ -103,6 +103,44 @@ describe("manifest dependency updates", () => {
     expect(lock).toContain('name = "local"\nversion = "2.0.0"');
     expect(lock).toContain('name = "local"\nversion = "1.0.0"\nsource');
     expect(lock).toContain(' "local 2.0.0",');
+  });
+
+  it("allows a missing Cargo.lock", () => {
+    const cwd = tempDirectory();
+    writeFileSync(
+      join(cwd, "Cargo.toml"),
+      "[package]\nname = \"owner\"\nversion = \"1.0.0\"\n\n[dependencies]\nlocal = { path = \"local\", version = \"1.0.0\" }\n",
+    );
+    writeFileSync(join(cwd, "local.Cargo.toml"), "[package]\nname = \"local\"\nversion = \"1.0.0\"\n");
+
+    expect(() =>
+      updateLocalDependencyVersions(
+        cwd,
+        [pkg("owner", "rust", "Cargo.toml", ["local"]), pkg("local", "rust", "local.Cargo.toml", [])],
+        new Map([["local", "2.0.0"]]),
+      ),
+    ).not.toThrow();
+    expect(() => readFileSync(join(cwd, "Cargo.lock"), "utf8")).toThrow();
+  });
+
+  it("rejects a symlinked Cargo.lock", () => {
+    const cwd = tempDirectory();
+    writeFileSync(
+      join(cwd, "Cargo.toml"),
+      "[package]\nname = \"owner\"\nversion = \"1.0.0\"\n\n[dependencies]\nlocal = { path = \"local\", version = \"1.0.0\" }\n",
+    );
+    writeFileSync(join(cwd, "local.Cargo.toml"), "[package]\nname = \"local\"\nversion = \"1.0.0\"\n");
+    writeFileSync(join(cwd, "Cargo.lock.target"), "lock contents\n");
+    symlinkSync("Cargo.lock.target", join(cwd, "Cargo.lock"));
+
+    expect(() =>
+      updateLocalDependencyVersions(
+        cwd,
+        [pkg("owner", "rust", "Cargo.toml", ["local"]), pkg("local", "rust", "local.Cargo.toml", [])],
+        new Map([["local", "2.0.0"]]),
+      ),
+    ).toThrow();
+    expect(readFileSync(join(cwd, "Cargo.lock.target"), "utf8")).toBe("lock contents\n");
   });
   it("keeps first-class version-file updates plain", () => {
     const cwd = tempDirectory();

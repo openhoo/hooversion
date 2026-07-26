@@ -3,6 +3,47 @@ import { HooversionError } from "./errors";
 import { runCommand } from "./process";
 import type { RawCommit } from "./types";
 
+export type GitRefKind = "branch" | "tag";
+
+/**
+ * Validate a short branch or tag name before it is interpolated into a Git
+ * command. This mirrors the security-relevant subset of check-ref-format and
+ * additionally rejects option-like names.
+ */
+export function assertValidGitRef(value: string, kind: GitRefKind): void {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value === "@" ||
+    value.startsWith("-") ||
+    value.startsWith("refs/") ||
+    value.startsWith("/") ||
+    value.endsWith("/") ||
+    value.includes("//") ||
+    value.includes("..") ||
+    value.includes("@{") ||
+    /[\u0000-\u0020\u007f~^:?*\\]/u.test(value) ||
+    value.includes("[")
+  ) {
+    throw new HooversionError(`Invalid Git ${kind} name: ${JSON.stringify(value)}`);
+  }
+
+  const components = value.split("/");
+  if (
+    components.some(
+      (component) =>
+        component.length === 0 ||
+        component === "." ||
+        component === ".." ||
+        component.startsWith(".") ||
+        component.endsWith(".") ||
+        component.toLowerCase().endsWith(".lock"),
+    )
+  ) {
+    throw new HooversionError(`Invalid Git ${kind} name: ${JSON.stringify(value)}`);
+  }
+}
+
 export type GitNetworkAuth = Readonly<Record<string, string>>;
 
 function commandEnv(auth?: GitNetworkAuth): NodeJS.ProcessEnv | undefined {
@@ -69,22 +110,39 @@ export function getLatestTag(cwd: string, pattern: string): string | undefined {
 }
 
 export function tagExists(cwd: string, tag: string): boolean {
-  return runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`], cwd).code === 0;
+  assertValidGitRef(tag, "tag");
+  return runCommand("git", ["rev-parse", "--verify", "--quiet", "--", `refs/tags/${tag}`], cwd).code === 0;
 }
 export function getHeadSha(cwd: string): string {
   return git(cwd, ["rev-parse", "HEAD"]).trim();
 }
 
 export function getRefSha(cwd: string, ref: string): string | undefined {
-  const commitRef = ref.startsWith("refs/tags/") ? `${ref}^{commit}` : ref;
-  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", commitRef], cwd);
+  let commitRef: string;
+  if (typeof ref !== "string") {
+    throw new HooversionError(`Invalid Git revision: ${JSON.stringify(ref)}`);
+  }
+  if (ref === "HEAD" || ref === "HEAD^" || /^[0-9a-fA-F]{40}$/u.test(ref)) {
+    commitRef = ref;
+  } else if (ref.startsWith("refs/tags/")) {
+    const tag = ref.slice("refs/tags/".length);
+    assertValidGitRef(tag, "tag");
+    commitRef = `${ref}^{commit}`;
+  } else if (ref.startsWith("refs/heads/")) {
+    assertValidGitRef(ref.slice("refs/heads/".length), "branch");
+    commitRef = ref;
+  } else {
+    throw new HooversionError(`Invalid Git revision: ${JSON.stringify(ref)}`);
+  }
+  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", "--end-of-options", commitRef], cwd);
   return result.code === 0 ? result.stdout.trim() : undefined;
 }
 
 export function getRemoteBranchSha(cwd: string, branch: string, auth?: GitNetworkAuth): string | undefined {
+  assertValidGitRef(branch, "branch");
   const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
   if (!remote) return undefined;
-  const output = git(cwd, ["ls-remote", "origin", `refs/heads/${branch}`], true, auth).trim();
+  const output = git(cwd, ["ls-remote", "--", "origin", `refs/heads/${branch}`], true, auth).trim();
   return output ? output.split(/\s+/, 1)[0] : "";
 }
 
@@ -93,7 +151,22 @@ export function getCommitMessage(cwd: string, ref = "HEAD"): string {
 }
 
 export function pushRelease(cwd: string, branch: string, tags: string[], auth?: GitNetworkAuth): void {
-  git(cwd, ["push", "--atomic", "origin", `HEAD:${branch}`, ...tags], false, auth);
+  assertValidGitRef(branch, "branch");
+  for (const tag of tags) assertValidGitRef(tag, "tag");
+  git(
+    cwd,
+    [
+      "push",
+      "--atomic",
+      "--no-verify",
+      "--",
+      "origin",
+      `HEAD:refs/heads/${branch}`,
+      ...tags.map((tag) => `refs/tags/${tag}`),
+    ],
+    false,
+    auth,
+  );
 }
 
 
@@ -136,6 +209,7 @@ export function createReleaseCommit(cwd: string, message: string): void {
 }
 
 export function createAnnotatedTag(cwd: string, tag: string, message: string): void {
+  assertValidGitRef(tag, "tag");
   git(cwd, ["tag", "-a", tag, "-m", message]);
 }
 

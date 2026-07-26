@@ -2,6 +2,7 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join, normalize, relative } from "node:path";
 import { pathToFileURL } from "node:url";
 import { HooversionError } from "./errors";
+
 import { defaultManifestPath, readManifest } from "./manifest";
 import type {
   HooversionConfig,
@@ -10,6 +11,14 @@ import type {
   PackageConfig,
   PackageType,
 } from "./types";
+import { assertValidGitRef } from "./git";
+
+function assertValidTagFormat(format: string, packages: readonly NormalizedPackageConfig[]): void {
+  for (const pkg of packages) {
+    const candidate = format.replaceAll("${name}", pkg.name).replaceAll("${version}", "0.0.0");
+    assertValidGitRef(candidate, "tag");
+  }
+}
 
 const configFiles = [
   "hooversion.config.ts",
@@ -73,12 +82,18 @@ export function normalizeConfig(cwd: string, raw: HooversionConfig): NormalizedC
     graph.set(normalizeGraphName(pkg.name), dependencies.map(normalizeGraphName));
   }
   assertAcyclicPackageGraph(packages, graph);
+  const branches = raw.branches ?? ["main"];
+  const tagFormat = raw.tagFormat ?? "v${version}";
+  const independentTagFormat = raw.independentTagFormat ?? "${name}@v${version}";
+  for (const branch of branches) assertValidGitRef(branch, "branch");
+  assertValidTagFormat(tagFormat, packages);
+  assertValidTagFormat(independentTagFormat, packages);
 
   return {
     ...raw,
-    branches: raw.branches ?? ["main"],
-    tagFormat: raw.tagFormat ?? "v${version}",
-    independentTagFormat: raw.independentTagFormat ?? "${name}@v${version}",
+    branches,
+    tagFormat,
+    independentTagFormat,
     packages,
     hooks: {
       beforeRelease: raw.hooks?.beforeRelease ?? [],

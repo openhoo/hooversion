@@ -81,6 +81,27 @@ describe("GitHub App auth", () => {
       globalThis.fetch = originalFetch;
     }
   });
+  it("does not send an installation token request to an untrusted API URL", async () => {
+    const originalFetch: typeof fetch = globalThis.fetch;
+    let called = false;
+    const mockFetch = async (_input: FetchInput, _init?: FetchInit): Promise<Response> => {
+      called = true;
+      return new Response("unexpected", { status: 500 });
+    };
+    globalThis.fetch = Object.assign(mockFetch, { preconnect: originalFetch.preconnect });
+    try {
+      await expect(
+        createInstallationAccessToken(
+          { appId: "123", privateKey: "not-used", apiUrl: "https://attacker.example/api" },
+          42,
+          { id: 987, fullName: "openhoo/app" },
+        ),
+      ).rejects.toThrow("Untrusted GitHub API URL");
+      expect(called).toBe(false);
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+  });
   it("permits an enterprise API only when explicitly trusted", () => {
     expect(
       validateGitHubApiUrl("https://github.enterprise.example/api/v3/", ["https://github.enterprise.example/api/v3"]),

@@ -90,9 +90,36 @@ function breakingChangeDescription(body) {
 }
 
 // src/changelog.ts
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync
+} from "fs";
 import { dirname, join } from "path";
-import { mkdirSync } from "fs";
+
+// src/errors.ts
+class HooversionError extends Error {
+  code;
+  constructor(message, code = 1) {
+    super(message);
+    this.code = code;
+    this.name = "HooversionError";
+  }
+}
+function assertHooversion(condition, message) {
+  if (!condition) {
+    throw new HooversionError(message);
+  }
+}
+
+// src/changelog.ts
 var groupTitles = {
   major: "Breaking Changes",
   feat: "Features",
@@ -122,7 +149,20 @@ function generateReleaseNotes(release) {
 function updateChangelog(cwd, release) {
   const path = join(cwd, release.changelogPath);
   mkdirSync(dirname(path), { recursive: true });
-  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+  let existing = "";
+  let sourceFd;
+  try {
+    sourceFd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    if (!fstatSync(sourceFd).isFile())
+      throw new HooversionError(`${path} must be a regular file`);
+    existing = readFileSync(sourceFd, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT")
+      throw error;
+  } finally {
+    if (sourceFd !== undefined)
+      closeSync(sourceFd);
+  }
   const title = `# ${release.package.name} Changelog`;
   const normalizedExisting = existing.trim() ? existing : `${title}
 `;
@@ -136,7 +176,43 @@ ${release.notes}
 
 ${body.trimEnd()}
 `;
-  writeFileSync(path, next);
+  const tempPath = `${path}.hooversion-${process.pid}-${Math.random().toString(16).slice(2)}.tmp`;
+  let tempFd;
+  let tempOwned = false;
+  try {
+    tempFd = openSync(tempPath, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 384);
+    tempOwned = true;
+    writeChangelogFile(tempFd, next);
+    fsyncSync(tempFd);
+    closeSync(tempFd);
+    tempFd = undefined;
+    renameSync(tempPath, path);
+    tempOwned = false;
+  } finally {
+    if (tempFd !== undefined) {
+      try {
+        closeSync(tempFd);
+      } catch {}
+    }
+    if (tempOwned) {
+      try {
+        unlinkSync(tempPath);
+      } catch (error) {
+        if (error.code !== "ENOENT")
+          throw error;
+      }
+    }
+  }
+}
+function writeChangelogFile(fd, content) {
+  const data = Buffer.from(content);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = writeSync(fd, data, offset, data.byteLength - offset, offset);
+    if (written <= 0)
+      throw new HooversionError("Failed to write changelog");
+    offset += written;
+  }
 }
 function groupCommits(commits) {
   const buckets = new Map;
@@ -158,27 +234,22 @@ function pushBucket(map, key, commit) {
   map.set(key, bucket);
 }
 // src/config.ts
-import { existsSync as existsSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "fs";
-import { basename, join as join3, normalize, relative } from "path";
+import { existsSync, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "fs";
+import { basename, join as join3, normalize, relative as relative2 } from "path";
 import { pathToFileURL } from "url";
 
-// src/errors.ts
-class HooversionError extends Error {
-  code;
-  constructor(message, code = 1) {
-    super(message);
-    this.code = code;
-    this.name = "HooversionError";
-  }
-}
-function assertHooversion(condition, message) {
-  if (!condition) {
-    throw new HooversionError(message);
-  }
-}
-
 // src/manifest.ts
-import { existsSync as existsSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import {
+  closeSync as closeSync2,
+  constants as fsConstants2,
+  fstatSync as fstatSync2,
+  fsyncSync as fsyncSync2,
+  ftruncateSync,
+  openSync as openSync2,
+  readFileSync as readFileSync2,
+  writeSync as writeSync2,
+  writeFileSync
+} from "fs";
 import { dirname as dirname2, join as join2 } from "path";
 function defaultManifestPath(type, packagePath) {
   if (type === "node")
@@ -204,12 +275,12 @@ function updateManifestVersion(cwd, pkg, version) {
   if (pkg.type === "node") {
     const json = JSON.parse(readFileSync2(path, "utf8"));
     json.version = version;
-    writeFileSync2(path, `${JSON.stringify(json, null, 2)}
+    writeFileSync(path, `${JSON.stringify(json, null, 2)}
 `);
     return;
   }
   if (pkg.type === "version-file") {
-    writeFileSync2(path, `${version}
+    writeFileSync(path, `${version}
 `);
     return;
   }
@@ -239,8 +310,13 @@ function updateLocalDependencyVersions(cwd, packages, releasedVersions) {
     }
   }
   const workspaceManifest = join2(cwd, "Cargo.toml");
-  if (rustReleasedVersions.size > 0 && existsSync2(workspaceManifest)) {
-    updateRustWorkspaceDependencies(workspaceManifest, rustReleasedVersions);
+  if (rustReleasedVersions.size > 0) {
+    try {
+      updateRustWorkspaceDependencies(workspaceManifest, rustReleasedVersions);
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
   }
   if (rustReleasedVersions.size > 0)
     updateCargoLock(cwd, rustReleasedVersions);
@@ -398,7 +474,7 @@ function updateTomlSectionVersion(path, sectionName, version) {
   if (!updated) {
     throw new HooversionError(`${path} [${sectionName}] does not contain a version field`);
   }
-  writeFileSync2(path, output.join(`
+  writeFileSync(path, output.join(`
 `));
 }
 function updateNodeLocalDependencies(path, owner, releasedVersions) {
@@ -429,7 +505,7 @@ function updateNodeLocalDependencies(path, owner, releasedVersions) {
   }
   assertAllDependenciesFound(path, owner, releasedVersions, found);
   if (changed)
-    writeFileSync2(path, `${JSON.stringify(json, null, 2)}
+    writeFileSync(path, `${JSON.stringify(json, null, 2)}
 `);
 }
 function updatePythonLocalDependencies(path, owner, releasedVersions) {
@@ -492,7 +568,7 @@ function updatePythonLocalDependencies(path, owner, releasedVersions) {
   }
   assertAllDependenciesFound(path, owner, releasedVersions, found);
   if (changed)
-    writeFileSync2(path, lines.join(`
+    writeFileSync(path, lines.join(`
 `));
 }
 function updateRustLocalDependencies(path, owner, releasedVersions) {
@@ -591,58 +667,82 @@ function updateRustDependencyTables(path, owner, releasedVersions, workspaceOnly
   if (!workspaceOnly && owner)
     assertAllDependenciesFound(path, owner, releasedVersions, found);
   if (changed)
-    writeFileSync2(path, lines.join(`
+    writeFileSync(path, lines.join(`
 `));
 }
 function updateCargoLock(cwd, releasedVersions) {
   const path = join2(cwd, "Cargo.lock");
-  if (!existsSync2(path))
-    return;
-  const lines = readFileSync2(path, "utf8").split(/\r?\n/);
-  const starts = lines.flatMap((line, index) => line.trim() === "[[package]]" ? [index] : []);
-  let changed = false;
-  for (let block = 0;block < starts.length; block += 1) {
-    const start = starts[block];
-    const end = starts[block + 1] ?? lines.length;
-    const nameLine = lines.slice(start, end).find((line) => /^\s*name\s*=/.test(line));
-    const name = nameLine ? readTomlString(nameLine, "name") : undefined;
-    const target = name ? findReleasedName(name, releasedVersions) : undefined;
-    const hasSource = lines.slice(start, end).some((line) => /^\s*source\s*=/.test(line));
-    if (target && !hasSource) {
-      const versionIndex = lines.findIndex((line, index) => index >= start && index < end && /^\s*version\s*=/.test(line));
-      if (versionIndex < 0)
-        throw new HooversionError(`${path} package ${name} has no version field`);
-      const version = releasedVersions.get(target);
-      const updatedVersion = lines[versionIndex].replace(/=\s*["'][^"']+["']/, `= "${version}"`);
-      if (updatedVersion !== lines[versionIndex]) {
-        lines[versionIndex] = updatedVersion;
-        changed = true;
+  let fd;
+  try {
+    fd = openSync2(path, fsConstants2.O_RDWR | fsConstants2.O_NOFOLLOW | fsConstants2.O_NONBLOCK);
+    if (!fstatSync2(fd).isFile())
+      throw new HooversionError(`${path} must be a regular file`);
+    const lines = readFileSync2(fd, "utf8").split(/\r?\n/);
+    const starts = lines.flatMap((line, index) => line.trim() === "[[package]]" ? [index] : []);
+    let changed = false;
+    for (let block = 0;block < starts.length; block += 1) {
+      const start = starts[block];
+      const end = starts[block + 1] ?? lines.length;
+      const nameLine = lines.slice(start, end).find((line) => /^\s*name\s*=/.test(line));
+      const name = nameLine ? readTomlString(nameLine, "name") : undefined;
+      const target = name ? findReleasedName(name, releasedVersions) : undefined;
+      const hasSource = lines.slice(start, end).some((line) => /^\s*source\s*=/.test(line));
+      if (target && !hasSource) {
+        const versionIndex = lines.findIndex((line, index) => index >= start && index < end && /^\s*version\s*=/.test(line));
+        if (versionIndex < 0)
+          throw new HooversionError(`${path} package ${name} has no version field`);
+        const version = releasedVersions.get(target);
+        const updatedVersion = lines[versionIndex].replace(/=\s*["'][^"']+["']/, `= "${version}"`);
+        if (updatedVersion !== lines[versionIndex]) {
+          lines[versionIndex] = updatedVersion;
+          changed = true;
+        }
       }
-    }
-    let inDependencies = false;
-    for (let index = start;index < end; index += 1) {
-      if (/^\s*dependencies\s*=\s*\[/.test(lines[index])) {
-        inDependencies = true;
+      let inDependencies = false;
+      for (let index = start;index < end; index += 1) {
+        if (/^\s*dependencies\s*=\s*\[/.test(lines[index])) {
+          inDependencies = true;
+          if (/\]/.test(lines[index]))
+            inDependencies = false;
+          continue;
+        }
+        if (!inDependencies || hasSource)
+          continue;
+        lines[index] = lines[index].replace(/(["'])([^"']+) \d[^"']*\1/g, (full, quote, dependencyName) => {
+          const dependencyTarget = findReleasedName(dependencyName, releasedVersions);
+          if (!dependencyTarget || /\s\(/.test(full))
+            return full;
+          changed = true;
+          return `${quote}${dependencyName} ${releasedVersions.get(dependencyTarget)}${quote}`;
+        });
         if (/\]/.test(lines[index]))
           inDependencies = false;
-        continue;
       }
-      if (!inDependencies || hasSource)
-        continue;
-      lines[index] = lines[index].replace(/(["'])([^"']+) \d[^"']*\1/g, (full, quote, dependencyName) => {
-        const dependencyTarget = findReleasedName(dependencyName, releasedVersions);
-        if (!dependencyTarget || /\s\(/.test(full))
-          return full;
-        changed = true;
-        return `${quote}${dependencyName} ${releasedVersions.get(dependencyTarget)}${quote}`;
-      });
-      if (/\]/.test(lines[index]))
-        inDependencies = false;
     }
-  }
-  if (changed)
-    writeFileSync2(path, lines.join(`
+    if (changed) {
+      ftruncateSync(fd, 0);
+      writeFileDescriptor(fd, lines.join(`
 `));
+      fsyncSync2(fd);
+    }
+  } catch (error) {
+    if (error.code === "ENOENT")
+      return;
+    throw error;
+  } finally {
+    if (fd !== undefined)
+      closeSync2(fd);
+  }
+}
+function writeFileDescriptor(fd, content) {
+  const data = Buffer.from(content);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = writeSync2(fd, data, offset, data.byteLength - offset, offset);
+    if (written <= 0)
+      throw new HooversionError("Failed to write Cargo.lock");
+    offset += written;
+  }
 }
 function changelogPathForPackage(pkg) {
   return pkg.changelog || join2(dirname2(pkg.manifest), "CHANGELOG.md");
@@ -651,7 +751,207 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+// src/git.ts
+import { relative, resolve, sep } from "path";
+
+// src/process.ts
+import { spawnSync } from "child_process";
+function runCommand(command, args, cwd, env) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? ""
+  };
+}
+function runShell(command, cwd, env) {
+  const result = spawnSync(command, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env,
+    shell: (env ?? process.env).SHELL ?? "/bin/sh"
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? ""
+  };
+}
+
+// src/git.ts
+function assertValidGitRef(value, kind) {
+  if (typeof value !== "string" || value.length === 0 || value === "@" || value.startsWith("-") || value.startsWith("refs/") || value.startsWith("/") || value.endsWith("/") || value.includes("//") || value.includes("..") || value.includes("@{") || /[\u0000-\u0020\u007f~^:?*\\]/u.test(value) || value.includes("[")) {
+    throw new HooversionError(`Invalid Git ${kind} name: ${JSON.stringify(value)}`);
+  }
+  const components = value.split("/");
+  if (components.some((component) => component.length === 0 || component === "." || component === ".." || component.startsWith(".") || component.endsWith(".") || component.toLowerCase().endsWith(".lock"))) {
+    throw new HooversionError(`Invalid Git ${kind} name: ${JSON.stringify(value)}`);
+  }
+}
+function commandEnv(auth) {
+  return auth ? { ...process.env, ...auth } : undefined;
+}
+function git(cwd, args, allowFailure = false, auth) {
+  const result = runCommand("git", args, cwd, commandEnv(auth));
+  if (result.code !== 0 && !allowFailure) {
+    throw new HooversionError(`git ${args.join(" ")} failed:
+${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trimEnd();
+}
+function isGitRepository(cwd) {
+  return runCommand("git", ["rev-parse", "--is-inside-work-tree"], cwd).code === 0;
+}
+function getCurrentBranch(cwd) {
+  const branch = git(cwd, ["branch", "--show-current"]).trim();
+  if (branch)
+    return branch;
+  if (process.env.GITHUB_HEAD_REF)
+    return process.env.GITHUB_HEAD_REF;
+  if (process.env.GITHUB_REF_TYPE !== "tag" && process.env.GITHUB_REF_NAME)
+    return process.env.GITHUB_REF_NAME;
+  return git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+}
+function ensureCleanWorkingTree(cwd, ignoredPaths = [], scopedOutputDir) {
+  const ignored = new Set(ignoredPaths.map((path) => resolve(cwd, path)));
+  const unexpected = git(cwd, ["status", "--porcelain", "--untracked-files=all"]).split(`
+`).filter((line) => {
+    if (!line.trim())
+      return false;
+    const path = line.slice(3).trim();
+    return !ignored.has(resolve(cwd, path));
+  });
+  if (scopedOutputDir) {
+    const resolvedOutputDir = resolve(cwd, scopedOutputDir);
+    const relativeOutputDir = relative(cwd, resolvedOutputDir);
+    if (relativeOutputDir && !relativeOutputDir.startsWith(`..${sep}`) && relativeOutputDir !== "..") {
+      const ignoredOutputFiles = git(cwd, ["ls-files", "--others", "--ignored", "--exclude-standard", "--", relativeOutputDir], true).split(`
+`).filter((path) => path.trim() && !ignored.has(resolve(cwd, path.trim())));
+      unexpected.push(...ignoredOutputFiles.map((path) => `?? ${path}`));
+    }
+  }
+  if (unexpected.length > 0) {
+    throw new HooversionError(`Working tree must be clean before release:
+${unexpected.join(`
+`)}`);
+  }
+}
+function getLatestTag(cwd, pattern) {
+  const output = git(cwd, ["describe", "--tags", "--abbrev=0", "--match", pattern], true).trim();
+  return output || undefined;
+}
+function tagExists(cwd, tag) {
+  assertValidGitRef(tag, "tag");
+  return runCommand("git", ["rev-parse", "--verify", "--quiet", "--", `refs/tags/${tag}`], cwd).code === 0;
+}
+function getHeadSha(cwd) {
+  return git(cwd, ["rev-parse", "HEAD"]).trim();
+}
+function getRefSha(cwd, ref) {
+  let commitRef;
+  if (typeof ref !== "string") {
+    throw new HooversionError(`Invalid Git revision: ${JSON.stringify(ref)}`);
+  }
+  if (ref === "HEAD" || ref === "HEAD^" || /^[0-9a-fA-F]{40}$/u.test(ref)) {
+    commitRef = ref;
+  } else if (ref.startsWith("refs/tags/")) {
+    const tag = ref.slice("refs/tags/".length);
+    assertValidGitRef(tag, "tag");
+    commitRef = `${ref}^{commit}`;
+  } else if (ref.startsWith("refs/heads/")) {
+    assertValidGitRef(ref.slice("refs/heads/".length), "branch");
+    commitRef = ref;
+  } else {
+    throw new HooversionError(`Invalid Git revision: ${JSON.stringify(ref)}`);
+  }
+  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", "--end-of-options", commitRef], cwd);
+  return result.code === 0 ? result.stdout.trim() : undefined;
+}
+function getRemoteBranchSha(cwd, branch, auth) {
+  assertValidGitRef(branch, "branch");
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote)
+    return;
+  const output = git(cwd, ["ls-remote", "--", "origin", `refs/heads/${branch}`], true, auth).trim();
+  return output ? output.split(/\s+/, 1)[0] : "";
+}
+function getCommitMessage(cwd, ref = "HEAD") {
+  return git(cwd, ["show", "-s", "--format=%B", ref]).trimEnd();
+}
+function pushRelease(cwd, branch, tags, auth) {
+  assertValidGitRef(branch, "branch");
+  for (const tag of tags)
+    assertValidGitRef(tag, "tag");
+  git(cwd, [
+    "push",
+    "--atomic",
+    "--no-verify",
+    "--",
+    "origin",
+    `HEAD:refs/heads/${branch}`,
+    ...tags.map((tag) => `refs/tags/${tag}`)
+  ], false, auth);
+}
+function getCommits(cwd, fromRef, toRef = "HEAD") {
+  const range = fromRef ? `${fromRef}..${toRef}` : toRef;
+  const revList = git(cwd, ["rev-list", "--reverse", range], true).trim();
+  if (!revList)
+    return [];
+  return revList.split(`
+`).map((hash) => {
+    const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
+    const body = git(cwd, ["show", "-s", "--format=%b", hash]);
+    const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
+`).map((file) => file.trim()).filter(Boolean);
+    return { hash, subject, body, files };
+  });
+}
+function getLastCommit(cwd) {
+  const hash = git(cwd, ["rev-parse", "HEAD"]).trim();
+  const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
+  const body = git(cwd, ["show", "-s", "--format=%b", hash]);
+  const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
+`).map((file) => file.trim()).filter(Boolean);
+  return { hash, subject, body, files };
+}
+function getCommitRange(cwd, fromRef, toRef = "HEAD") {
+  return getCommits(cwd, fromRef, toRef);
+}
+function createReleaseCommit(cwd, message) {
+  git(cwd, ["add", "--all"]);
+  const status = git(cwd, ["status", "--porcelain"]);
+  if (!status.trim())
+    return;
+  git(cwd, ["commit", "-m", message]);
+}
+function createAnnotatedTag(cwd, tag, message) {
+  assertValidGitRef(tag, "tag");
+  git(cwd, ["tag", "-a", tag, "-m", message]);
+}
+function getOriginRepository(cwd) {
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote)
+    return;
+  const sshMatch = /^git@[^:]+:([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
+  if (sshMatch)
+    return sshMatch[1];
+  const httpsMatch = /^https?:\/\/[^/]+\/([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
+  if (httpsMatch)
+    return httpsMatch[1];
+  return;
+}
+
 // src/config.ts
+function assertValidTagFormat(format, packages) {
+  for (const pkg of packages) {
+    const candidate = format.replaceAll("${name}", pkg.name).replaceAll("${version}", "0.0.0");
+    assertValidGitRef(candidate, "tag");
+  }
+}
 var configFiles = [
   "hooversion.config.ts",
   "hooversion.config.mjs",
@@ -674,7 +974,7 @@ async function loadConfig(cwd, explicitPath) {
   return normalizeConfig(cwd, raw);
 }
 function findConfigPath(cwd) {
-  return configFiles.map((name) => join3(cwd, name)).find((path) => existsSync3(path));
+  return configFiles.map((name) => join3(cwd, name)).find((path) => existsSync(path));
 }
 function normalizeConfig(cwd, raw) {
   if (!raw.packages || raw.packages.length === 0) {
@@ -707,11 +1007,18 @@ function normalizeConfig(cwd, raw) {
     graph.set(normalizeGraphName(pkg.name), dependencies.map(normalizeGraphName));
   }
   assertAcyclicPackageGraph(packages, graph);
+  const branches = raw.branches ?? ["main"];
+  const tagFormat = raw.tagFormat ?? "v${version}";
+  const independentTagFormat = raw.independentTagFormat ?? "${name}@v${version}";
+  for (const branch of branches)
+    assertValidGitRef(branch, "branch");
+  assertValidTagFormat(tagFormat, packages);
+  assertValidTagFormat(independentTagFormat, packages);
   return {
     ...raw,
-    branches: raw.branches ?? ["main"],
-    tagFormat: raw.tagFormat ?? "v${version}",
-    independentTagFormat: raw.independentTagFormat ?? "${name}@v${version}",
+    branches,
+    tagFormat,
+    independentTagFormat,
     packages,
     hooks: {
       beforeRelease: raw.hooks?.beforeRelease ?? [],
@@ -729,16 +1036,16 @@ function normalizeConfig(cwd, raw) {
 }
 function detectPackages(cwd) {
   const candidates = [];
-  if (existsSync3(join3(cwd, "package.json"))) {
+  if (existsSync(join3(cwd, "package.json"))) {
     candidates.push({ type: "node", path: ".", name: readJsonName(join3(cwd, "package.json")) });
   }
-  if (existsSync3(join3(cwd, "Cargo.toml"))) {
+  if (existsSync(join3(cwd, "Cargo.toml"))) {
     candidates.push(...detectCargoPackages(cwd));
   }
-  if (existsSync3(join3(cwd, "pyproject.toml"))) {
+  if (existsSync(join3(cwd, "pyproject.toml"))) {
     candidates.push({ type: "python", path: ".", name: readTomlName(join3(cwd, "pyproject.toml"), "project") });
   }
-  if (existsSync3(join3(cwd, "version"))) {
+  if (existsSync(join3(cwd, "version"))) {
     candidates.push({ type: "version-file", path: ".", name: basename(cwd) });
   }
   const seen = new Set;
@@ -777,7 +1084,7 @@ ${packages.map((pkg) => `    {
 };
 `;
   const path = join3(cwd, "hooversion.config.ts");
-  writeFileSync3(path, body);
+  writeFileSync2(path, body);
   return path;
 }
 function normalizePackage(cwd, pkg) {
@@ -837,7 +1144,7 @@ function detectCargoPackages(cwd) {
   const members = readTomlArray(text, "workspace", "members");
   for (const member of members) {
     const manifest = join3(cwd, member, "Cargo.toml");
-    if (existsSync3(manifest)) {
+    if (existsSync(manifest)) {
       packages.push({
         type: "rust",
         path: normalizeRelative(member),
@@ -915,164 +1222,8 @@ function normalizeRelative(path) {
   return normalized === "" ? "." : normalized;
 }
 function relativeToCwd(cwd, path) {
-  return normalizeRelative(relative(cwd, path));
+  return normalizeRelative(relative2(cwd, path));
 }
-// src/git.ts
-import { relative as relative2, resolve, sep } from "path";
-
-// src/process.ts
-import { spawnSync } from "child_process";
-function runCommand(command, args, cwd, env) {
-  const result = spawnSync(command, args, {
-    cwd,
-    encoding: "utf8",
-    env: env ?? process.env
-  });
-  return {
-    code: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? ""
-  };
-}
-function runShell(command, cwd, env) {
-  const result = spawnSync(command, {
-    cwd,
-    encoding: "utf8",
-    env: env ?? process.env,
-    shell: (env ?? process.env).SHELL ?? "/bin/sh"
-  });
-  return {
-    code: result.status ?? 1,
-    stdout: result.stdout ?? "",
-    stderr: result.stderr ?? ""
-  };
-}
-
-// src/git.ts
-function commandEnv(auth) {
-  return auth ? { ...process.env, ...auth } : undefined;
-}
-function git(cwd, args, allowFailure = false, auth) {
-  const result = runCommand("git", args, cwd, commandEnv(auth));
-  if (result.code !== 0 && !allowFailure) {
-    throw new HooversionError(`git ${args.join(" ")} failed:
-${result.stderr || result.stdout}`);
-  }
-  return result.stdout.trimEnd();
-}
-function isGitRepository(cwd) {
-  return runCommand("git", ["rev-parse", "--is-inside-work-tree"], cwd).code === 0;
-}
-function getCurrentBranch(cwd) {
-  const branch = git(cwd, ["branch", "--show-current"]).trim();
-  if (branch)
-    return branch;
-  if (process.env.GITHUB_HEAD_REF)
-    return process.env.GITHUB_HEAD_REF;
-  if (process.env.GITHUB_REF_TYPE !== "tag" && process.env.GITHUB_REF_NAME)
-    return process.env.GITHUB_REF_NAME;
-  return git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
-}
-function ensureCleanWorkingTree(cwd, ignoredPaths = [], scopedOutputDir) {
-  const ignored = new Set(ignoredPaths.map((path) => resolve(cwd, path)));
-  const unexpected = git(cwd, ["status", "--porcelain", "--untracked-files=all"]).split(`
-`).filter((line) => {
-    if (!line.trim())
-      return false;
-    const path = line.slice(3).trim();
-    return !ignored.has(resolve(cwd, path));
-  });
-  if (scopedOutputDir) {
-    const resolvedOutputDir = resolve(cwd, scopedOutputDir);
-    const relativeOutputDir = relative2(cwd, resolvedOutputDir);
-    if (relativeOutputDir && !relativeOutputDir.startsWith(`..${sep}`) && relativeOutputDir !== "..") {
-      const ignoredOutputFiles = git(cwd, ["ls-files", "--others", "--ignored", "--exclude-standard", "--", relativeOutputDir], true).split(`
-`).filter((path) => path.trim() && !ignored.has(resolve(cwd, path.trim())));
-      unexpected.push(...ignoredOutputFiles.map((path) => `?? ${path}`));
-    }
-  }
-  if (unexpected.length > 0) {
-    throw new HooversionError(`Working tree must be clean before release:
-${unexpected.join(`
-`)}`);
-  }
-}
-function getLatestTag(cwd, pattern) {
-  const output = git(cwd, ["describe", "--tags", "--abbrev=0", "--match", pattern], true).trim();
-  return output || undefined;
-}
-function tagExists(cwd, tag) {
-  return runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`], cwd).code === 0;
-}
-function getHeadSha(cwd) {
-  return git(cwd, ["rev-parse", "HEAD"]).trim();
-}
-function getRefSha(cwd, ref) {
-  const commitRef = ref.startsWith("refs/tags/") ? `${ref}^{commit}` : ref;
-  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", commitRef], cwd);
-  return result.code === 0 ? result.stdout.trim() : undefined;
-}
-function getRemoteBranchSha(cwd, branch, auth) {
-  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
-  if (!remote)
-    return;
-  const output = git(cwd, ["ls-remote", "origin", `refs/heads/${branch}`], true, auth).trim();
-  return output ? output.split(/\s+/, 1)[0] : "";
-}
-function getCommitMessage(cwd, ref = "HEAD") {
-  return git(cwd, ["show", "-s", "--format=%B", ref]).trimEnd();
-}
-function pushRelease(cwd, branch, tags, auth) {
-  git(cwd, ["push", "--atomic", "origin", `HEAD:${branch}`, ...tags], false, auth);
-}
-function getCommits(cwd, fromRef, toRef = "HEAD") {
-  const range = fromRef ? `${fromRef}..${toRef}` : toRef;
-  const revList = git(cwd, ["rev-list", "--reverse", range], true).trim();
-  if (!revList)
-    return [];
-  return revList.split(`
-`).map((hash) => {
-    const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
-    const body = git(cwd, ["show", "-s", "--format=%b", hash]);
-    const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
-`).map((file) => file.trim()).filter(Boolean);
-    return { hash, subject, body, files };
-  });
-}
-function getLastCommit(cwd) {
-  const hash = git(cwd, ["rev-parse", "HEAD"]).trim();
-  const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
-  const body = git(cwd, ["show", "-s", "--format=%b", hash]);
-  const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
-`).map((file) => file.trim()).filter(Boolean);
-  return { hash, subject, body, files };
-}
-function getCommitRange(cwd, fromRef, toRef = "HEAD") {
-  return getCommits(cwd, fromRef, toRef);
-}
-function createReleaseCommit(cwd, message) {
-  git(cwd, ["add", "--all"]);
-  const status = git(cwd, ["status", "--porcelain"]);
-  if (!status.trim())
-    return;
-  git(cwd, ["commit", "-m", message]);
-}
-function createAnnotatedTag(cwd, tag, message) {
-  git(cwd, ["tag", "-a", tag, "-m", message]);
-}
-function getOriginRepository(cwd) {
-  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
-  if (!remote)
-    return;
-  const sshMatch = /^git@[^:]+:([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
-  if (sshMatch)
-    return sshMatch[1];
-  const httpsMatch = /^https?:\/\/[^/]+\/([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
-  if (httpsMatch)
-    return httpsMatch[1];
-  return;
-}
-
 // src/semver.ts
 var versionPattern = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
 function parseVersion(version) {
@@ -1328,11 +1479,12 @@ function extractTagVersion(tag) {
 }
 // src/release.ts
 import { mkdirSync as mkdirSync3 } from "fs";
-import { join as join6 } from "path";
+import { join as join5 } from "path";
 
 // src/github.ts
-import { readFileSync as readFileSync4 } from "fs";
-import { basename as basename2, isAbsolute, join as join4 } from "path";
+import { constants as fsConstants3 } from "fs";
+import * as fs from "fs/promises";
+import { basename as basename2, isAbsolute, relative as relative4, resolve as resolve2, sep as sep2, win32 } from "path";
 async function publishGitHubRelease(cwd, config, release, options = {}) {
   if (config.github === false || !config.github.releases)
     return;
@@ -1377,17 +1529,162 @@ async function publishGitHubRelease(cwd, config, release, options = {}) {
 async function uploadMissingAssets(uploadUrlTemplate, apiUrl, token, cwd, assets, existingAssetNames) {
   const missingAssets = new Map;
   for (const asset of assets) {
+    assertSafeReleaseAssetPath(asset);
     const name = basename2(asset);
     if (!existingAssetNames.has(name) && !missingAssets.has(name)) {
-      missingAssets.set(name, isAbsolute(asset) ? asset : join4(cwd, asset));
+      missingAssets.set(name, asset);
     }
   }
   if (missingAssets.size === 0)
     return;
   const uploadUrl = validateGitHubUploadUrl(uploadUrlTemplate, apiUrl);
-  for (const [name, path] of missingAssets) {
-    await uploadAsset(uploadUrl, token, path, name);
+  const preparedAssets = await readMissingReleaseAssets(cwd, missingAssets);
+  try {
+    for (const prepared of preparedAssets.values()) {
+      await assertStableReleaseAssetDescriptor(prepared);
+    }
+    for (const prepared of preparedAssets.values()) {
+      await assertStableReleaseAssetDescriptor(prepared);
+      await uploadAsset(uploadUrl, token, prepared.data, prepared.name);
+    }
+  } finally {
+    await Promise.all(preparedAssets.map(async ({ file }) => file.close()));
   }
+}
+var maxReleaseAssetSizeBytes = 100 * 1024 * 1024;
+async function readMissingReleaseAssets(cwd, missingAssets) {
+  let root;
+  try {
+    root = await fs.realpath(cwd);
+    if (!(await fs.lstat(root)).isDirectory()) {
+      throw new HooversionError(`Release asset root is not a directory: ${cwd}`);
+    }
+  } catch (error) {
+    if (error instanceof HooversionError)
+      throw error;
+    throw new HooversionError(`Could not resolve release asset root: ${cwd}`);
+  }
+  const preparedAssets = [];
+  try {
+    for (const [name, asset] of missingAssets) {
+      preparedAssets.push(await readValidatedReleaseAsset(root, asset, name));
+    }
+    return preparedAssets;
+  } catch (error) {
+    await Promise.all(preparedAssets.map(async ({ file }) => file.close()));
+    throw error;
+  }
+}
+function assertSafeReleaseAssetPath(asset) {
+  if (asset.length === 0 || asset.includes("\x00") || isAbsolute(asset) || win32.isAbsolute(asset) || asset.split(/[\\/]+/u).includes("..")) {
+    throw new HooversionError(`Release asset path must be relative without parent traversal: ${asset}`);
+  }
+}
+function isContainedPath(root, path) {
+  const pathFromRoot = relative4(root, path);
+  return pathFromRoot === "" || pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep2}`) && !isAbsolute(pathFromRoot);
+}
+function resolveReleaseAssetPath(root, asset) {
+  const path = resolve2(root, asset);
+  if (!isContainedPath(root, path)) {
+    throw new HooversionError(`Release asset path escapes the repository: ${asset}`);
+  }
+  return path;
+}
+async function readValidatedReleaseAsset(root, asset, name) {
+  const path = resolveReleaseAssetPath(root, asset);
+  let file;
+  try {
+    const canonicalPath = await fs.realpath(path);
+    if (!isContainedPath(root, canonicalPath)) {
+      throw new HooversionError(`Release asset path escapes the repository: ${asset}`);
+    }
+    if (canonicalPath !== path) {
+      throw new HooversionError(`Release asset path must not traverse a symbolic link: ${asset}`);
+    }
+    const pathStats = await fs.lstat(path);
+    assertRegularReleaseAsset(pathStats, asset);
+    const preOpenMetadata = releaseAssetMetadata(pathStats);
+    const noFollow = fsConstants3.O_NOFOLLOW;
+    if (typeof noFollow !== "number") {
+      throw new HooversionError("Secure release asset uploads require O_NOFOLLOW support.");
+    }
+    file = await fs.open(path, fsConstants3.O_RDONLY | noFollow);
+    const descriptorStats = await file.stat();
+    assertRegularReleaseAsset(descriptorStats, asset);
+    const descriptorMetadata = releaseAssetMetadata(descriptorStats);
+    if (!sameReleaseAssetMetadata(preOpenMetadata, descriptorMetadata)) {
+      throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+    }
+    await assertStableReleaseAssetPath(root, path, asset, descriptorMetadata);
+    const data = await readReleaseAssetDescriptor(file, descriptorMetadata.size, asset);
+    const afterReadMetadata = releaseAssetMetadata(await file.stat());
+    if (!sameReleaseAssetMetadata(descriptorMetadata, afterReadMetadata) || data.byteLength !== descriptorMetadata.size) {
+      throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+    }
+    await assertStableReleaseAssetPath(root, path, asset, afterReadMetadata);
+    return { name, path, root, data, file, metadata: afterReadMetadata };
+  } catch (error) {
+    if (file)
+      await file.close();
+    if (error instanceof HooversionError)
+      throw error;
+    const reason = error instanceof Error ? error.message : "unknown error";
+    throw new HooversionError(`Could not securely read release asset ${asset}: ${reason}`);
+  }
+}
+async function assertStableReleaseAssetDescriptor(asset) {
+  const descriptorMetadata = releaseAssetMetadata(await asset.file.stat());
+  if (!sameReleaseAssetMetadata(asset.metadata, descriptorMetadata)) {
+    throw new HooversionError(`Release asset changed while it was being read: ${asset.name}`);
+  }
+  await assertStableReleaseAssetPath(asset.root, asset.path, asset.name, descriptorMetadata);
+}
+function assertRegularReleaseAsset(stats, asset) {
+  if (!stats.isFile() || stats.isSymbolicLink()) {
+    throw new HooversionError(`Release asset must be a regular file, not a symbolic link: ${asset}`);
+  }
+  if (!Number.isSafeInteger(stats.size) || stats.size < 0 || stats.size > maxReleaseAssetSizeBytes) {
+    throw new HooversionError(`Release asset exceeds the ${maxReleaseAssetSizeBytes} byte upload limit: ${asset}`);
+  }
+}
+function releaseAssetMetadata(stats) {
+  return {
+    dev: stats.dev,
+    ino: stats.ino,
+    size: stats.size,
+    mtimeMs: stats.mtimeMs,
+    ctimeMs: stats.ctimeMs
+  };
+}
+function sameReleaseAssetMetadata(left, right) {
+  return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
+}
+async function assertStableReleaseAssetPath(root, path, asset, expected) {
+  const canonicalPath = await fs.realpath(path);
+  if (!isContainedPath(root, canonicalPath)) {
+    throw new HooversionError(`Release asset path escapes the repository: ${asset}`);
+  }
+  if (canonicalPath !== path) {
+    throw new HooversionError(`Release asset path must not traverse a symbolic link: ${asset}`);
+  }
+  const pathStats = await fs.lstat(path);
+  assertRegularReleaseAsset(pathStats, asset);
+  if (!sameReleaseAssetMetadata(expected, releaseAssetMetadata(pathStats))) {
+    throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+  }
+}
+async function readReleaseAssetDescriptor(file, size, asset) {
+  const data = Buffer.allocUnsafe(size);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const { bytesRead } = await file.read(data, offset, data.byteLength - offset, offset);
+    if (bytesRead === 0) {
+      throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
+    }
+    offset += bytesRead;
+  }
+  return data;
 }
 function releaseAssetNames(assets) {
   if (assets === undefined)
@@ -1431,8 +1728,7 @@ function validateGitHubUploadUrl(uploadUrlTemplate, apiUrl) {
   }
   return parsed.toString();
 }
-async function uploadAsset(uploadUrl, token, path, name) {
-  const data = readFileSync4(path);
+async function uploadAsset(uploadUrl, token, data, name) {
   await githubFetch(`${uploadUrl}?name=${encodeURIComponent(name)}`, token, {
     method: "POST",
     body: data,
@@ -1461,40 +1757,62 @@ async function githubFetch(url, token, init, notFoundIsEmpty = false) {
 }
 
 // src/output.ts
-import { appendFileSync, existsSync as existsSync4, lstatSync, mkdirSync as mkdirSync2, readFileSync as readFileSync5, unlinkSync, writeFileSync as writeFileSync4 } from "fs";
-import { join as join5, relative as relative4, sep as sep2 } from "path";
+import {
+  appendFileSync,
+  closeSync as closeSync3,
+  constants as fsConstants4,
+  fstatSync as fstatSync3,
+  mkdirSync as mkdirSync2,
+  openSync as openSync3,
+  readFileSync as readFileSync4,
+  unlinkSync as unlinkSync2,
+  writeFileSync as writeFileSync3
+} from "fs";
+import { join as join4, relative as relative5, sep as sep3 } from "path";
 function getReleaseOutputPaths(cwd, outputDir = ".hooversion") {
-  const resolvedOutputDir = join5(cwd, outputDir);
-  const outputsPath = join5(resolvedOutputDir, "outputs.json");
-  const paths = new Set([outputsPath, join5(cwd, ".release-version")]);
-  if (existsSync4(outputsPath) && lstatSync(outputsPath).isFile()) {
-    try {
-      const payload = JSON.parse(readFileSync5(outputsPath, "utf8"));
-      for (const release of payload.releases ?? []) {
-        if (typeof release.tag !== "string")
-          continue;
-        const notePath = join5(resolvedOutputDir, `${sanitizeFileName(release.tag)}-notes.md`);
-        const noteRelativePath = relative4(resolvedOutputDir, notePath);
-        if (noteRelativePath && noteRelativePath !== ".." && !noteRelativePath.startsWith(`..${sep2}`)) {
-          paths.add(notePath);
-        }
+  const resolvedOutputDir = join4(cwd, outputDir);
+  const outputsPath = join4(resolvedOutputDir, "outputs.json");
+  const paths = new Set([outputsPath, join4(cwd, ".release-version")]);
+  let fd;
+  try {
+    fd = openSync3(outputsPath, fsConstants4.O_RDONLY | fsConstants4.O_NOFOLLOW | fsConstants4.O_NONBLOCK);
+    if (!fstatSync3(fd).isFile())
+      return [...paths];
+    const payload = JSON.parse(readFileSync4(fd, "utf8"));
+    for (const release of payload.releases ?? []) {
+      if (typeof release.tag !== "string")
+        continue;
+      const notePath = join4(resolvedOutputDir, `${sanitizeFileName(release.tag)}-notes.md`);
+      const noteRelativePath = relative5(resolvedOutputDir, notePath);
+      if (noteRelativePath && noteRelativePath !== ".." && !noteRelativePath.startsWith(`..${sep3}`)) {
+        paths.add(notePath);
       }
-    } catch {}
+    }
+  } catch {} finally {
+    if (fd !== undefined) {
+      try {
+        closeSync3(fd);
+      } catch {}
+    }
   }
   return [...paths];
 }
 function clearReleaseOutputs(cwd, outputDir = ".hooversion") {
   for (const outputPath of getReleaseOutputPaths(cwd, outputDir)) {
-    if (existsSync4(outputPath) && lstatSync(outputPath).isFile())
-      unlinkSync(outputPath);
+    try {
+      unlinkSync2(outputPath);
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
   }
 }
 function writeReleaseOutputs(cwd, config, plan) {
   clearReleaseOutputs(cwd, config.outputDir);
-  const outputDir = join5(cwd, config.outputDir);
+  const outputDir = join4(cwd, config.outputDir);
   mkdirSync2(outputDir, { recursive: true });
   for (const release of plan.releases) {
-    writeFileSync4(join5(outputDir, `${sanitizeFileName(release.tag)}-notes.md`), `${release.notes}
+    writeFileSync3(join4(outputDir, `${sanitizeFileName(release.tag)}-notes.md`), `${release.notes}
 `);
   }
   const payload = {
@@ -1507,15 +1825,18 @@ function writeReleaseOutputs(cwd, config, plan) {
       notesPath: `${config.outputDir}/${sanitizeFileName(release.tag)}-notes.md`
     }))
   };
-  writeFileSync4(join5(outputDir, "outputs.json"), `${JSON.stringify(payload, null, 2)}
+  writeFileSync3(join4(outputDir, "outputs.json"), `${JSON.stringify(payload, null, 2)}
 `);
   if (plan.releases.length === 1) {
-    writeFileSync4(join5(cwd, ".release-version"), `${plan.releases[0].nextVersion}
+    writeFileSync3(join4(cwd, ".release-version"), `${plan.releases[0].nextVersion}
 `);
   } else {
-    const versionPath = join5(cwd, ".release-version");
-    if (existsSync4(versionPath) && lstatSync(versionPath).isFile())
-      unlinkSync(versionPath);
+    try {
+      unlinkSync2(join4(cwd, ".release-version"));
+    } catch (error) {
+      if (error.code !== "ENOENT")
+        throw error;
+    }
   }
   if (process.env.GITHUB_OUTPUT) {
     const lines = [`published=${payload.published}`, `releases_json=${JSON.stringify(payload.releases)}`];
@@ -1569,7 +1890,7 @@ async function executeRelease(cwd, config, plan, options = {}) {
   if (shouldPush) {
     pushRelease(cwd, effectivePlan.branch, effectivePlan.releases.map((release) => release.tag), options.gitAuth);
   }
-  mkdirSync3(join6(cwd, config.outputDir), { recursive: true });
+  mkdirSync3(join5(cwd, config.outputDir), { recursive: true });
   if (options.github ?? true) {
     for (const release of effectivePlan.releases) {
       await publishGitHubRelease(cwd, config, release, { token: options.githubToken });
@@ -1779,6 +2100,7 @@ export {
   changelogPathForPackage,
   bumpVersion,
   breakingChangeDescription,
+  assertValidGitRef,
   assertHooversion,
   HooversionError
 };

@@ -1,4 +1,14 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  openSync,
+  readFileSync,
+  writeSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { HooversionError } from "./errors";
 import type { NormalizedPackageConfig, PackageType } from "./types";
@@ -70,8 +80,12 @@ export function updateLocalDependencyVersions(
   }
 
   const workspaceManifest = join(cwd, "Cargo.toml");
-  if (rustReleasedVersions.size > 0 && existsSync(workspaceManifest)) {
-    updateRustWorkspaceDependencies(workspaceManifest, rustReleasedVersions);
+  if (rustReleasedVersions.size > 0) {
+    try {
+      updateRustWorkspaceDependencies(workspaceManifest, rustReleasedVersions);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
   if (rustReleasedVersions.size > 0) updateCargoLock(cwd, rustReleasedVersions);
 }
@@ -483,49 +497,72 @@ function updateRustDependencyTables(
 
 function updateCargoLock(cwd: string, releasedVersions: Map<string, string>): void {
   const path = join(cwd, "Cargo.lock");
-  if (!existsSync(path)) return;
-  const lines = readFileSync(path, "utf8").split(/\r?\n/);
-  const starts = lines.flatMap((line, index) => (line.trim() === "[[package]]" ? [index] : []));
-  let changed = false;
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) throw new HooversionError(`${path} must be a regular file`);
+    const lines = readFileSync(fd, "utf8").split(/\r?\n/);
+    const starts = lines.flatMap((line, index) => (line.trim() === "[[package]]" ? [index] : []));
+    let changed = false;
 
-  for (let block = 0; block < starts.length; block += 1) {
-    const start = starts[block];
-    const end = starts[block + 1] ?? lines.length;
-    const nameLine = lines.slice(start, end).find((line) => /^\s*name\s*=/.test(line));
-    const name = nameLine ? readTomlString(nameLine, "name") : undefined;
-    const target = name ? findReleasedName(name, releasedVersions) : undefined;
-    const hasSource = lines.slice(start, end).some((line) => /^\s*source\s*=/.test(line));
-    if (target && !hasSource) {
-      const versionIndex = lines.findIndex((line, index) => index >= start && index < end && /^\s*version\s*=/.test(line));
+    for (let block = 0; block < starts.length; block += 1) {
+      const start = starts[block];
+      const end = starts[block + 1] ?? lines.length;
+      const nameLine = lines.slice(start, end).find((line) => /^\s*name\s*=/.test(line));
+      const name = nameLine ? readTomlString(nameLine, "name") : undefined;
+      const target = name ? findReleasedName(name, releasedVersions) : undefined;
+      const hasSource = lines.slice(start, end).some((line) => /^\s*source\s*=/.test(line));
+      if (target && !hasSource) {
+        const versionIndex = lines.findIndex((line, index) => index >= start && index < end && /^\s*version\s*=/.test(line));
 
-      if (versionIndex < 0) throw new HooversionError(`${path} package ${name} has no version field`);
-      const version = releasedVersions.get(target)!;
-      const updatedVersion = lines[versionIndex].replace(/=\s*["'][^"']+["']/, `= "${version}"`);
-      if (updatedVersion !== lines[versionIndex]) {
-        lines[versionIndex] = updatedVersion;
-        changed = true;
+        if (versionIndex < 0) throw new HooversionError(`${path} package ${name} has no version field`);
+        const version = releasedVersions.get(target)!;
+        const updatedVersion = lines[versionIndex].replace(/=\s*["'][^"']+["']/, `= "${version}"`);
+        if (updatedVersion !== lines[versionIndex]) {
+          lines[versionIndex] = updatedVersion;
+          changed = true;
+        }
       }
-    }
 
-    let inDependencies = false;
-    for (let index = start; index < end; index += 1) {
-      if (/^\s*dependencies\s*=\s*\[/.test(lines[index])) {
-        inDependencies = true;
+      let inDependencies = false;
+      for (let index = start; index < end; index += 1) {
+        if (/^\s*dependencies\s*=\s*\[/.test(lines[index])) {
+          inDependencies = true;
+          if (/\]/.test(lines[index])) inDependencies = false;
+          continue;
+        }
+        if (!inDependencies || hasSource) continue;
+        lines[index] = lines[index].replace(/(["'])([^"']+) \d[^"']*\1/g, (full, quote: string, dependencyName: string) => {
+          const dependencyTarget = findReleasedName(dependencyName, releasedVersions);
+          if (!dependencyTarget || /\s\(/.test(full)) return full;
+          changed = true;
+          return `${quote}${dependencyName} ${releasedVersions.get(dependencyTarget)!}${quote}`;
+        });
         if (/\]/.test(lines[index])) inDependencies = false;
-        continue;
       }
-      if (!inDependencies || hasSource) continue;
-      lines[index] = lines[index].replace(/(["'])([^"']+) \d[^"']*\1/g, (full, quote: string, dependencyName: string) => {
-        const dependencyTarget = findReleasedName(dependencyName, releasedVersions);
-        if (!dependencyTarget || /\s\(/.test(full)) return full;
-        changed = true;
-        return `${quote}${dependencyName} ${releasedVersions.get(dependencyTarget)!}${quote}`;
-      });
-      if (/\]/.test(lines[index])) inDependencies = false;
     }
-  }
 
-  if (changed) writeFileSync(path, lines.join("\n"));
+    if (changed) {
+      ftruncateSync(fd, 0);
+      writeFileDescriptor(fd, lines.join("\n"));
+      fsyncSync(fd);
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function writeFileDescriptor(fd: number, content: string): void {
+  const data = Buffer.from(content);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = writeSync(fd, data, offset, data.byteLength - offset, offset);
+    if (written <= 0) throw new HooversionError("Failed to write Cargo.lock");
+    offset += written;
+  }
 }
 
 export function changelogPathForPackage(pkg: NormalizedPackageConfig): string {

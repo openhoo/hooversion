@@ -8,6 +8,17 @@ import { createReleasePlan } from "./plan";
 import { executeRelease } from "./release";
 import type { GitNetworkAuth } from "./git";
 import { runCommand, runShell } from "./process";
+const GIT_ASKPASS_FILENAME = ".git-askpass";
+const GIT_TOKEN_ENV = "VERSIONHOO_GIT_TOKEN";
+const GIT_ASKPASS_SCRIPT =
+  '#!/bin/sh\ncase "$1" in\n  *[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]*) printf "%s\\n" "x-access-token" ;;\n  *) printf "%s\\n" "$VERSIONHOO_GIT_TOKEN" ;;\nesac\n';
+
+interface GitAuthArtifacts {
+  env: GitNetworkAuth;
+  cleanup: () => void;
+}
+
+
 export interface VersionhooReleaseJob {
   repositoryFullName: string;
   cloneUrl: string;
@@ -45,98 +56,101 @@ export async function runVersionhooRelease(job: VersionhooReleaseJob): Promise<V
   mkdirSync(parent, { recursive: true });
   const workDir = mkdtempSync(join(parent, "release-"));
   const repoDir = join(workDir, "repo");
+  const repositoryHome = mkdtempSync(join(workDir, ".home-"));
+  try {
+    return await withRepositoryEnvironment(job, async () => {
+      try {
+        const cloneUrl = validateCloneUrl(job.cloneUrl, job.repositoryFullName, job.trustedCloneHosts);
+        const gitAuth = createGitAuthArtifacts(workDir, job.token);
+        try {
+          checked(
+            "git",
+            ["clone", "--branch", job.branch, "--no-single-branch", cloneUrl, repoDir],
+            workDir,
+            job.token,
+            gitAuth.env,
+          );
+          checked("git", ["config", "user.name", job.gitAuthorName ?? "versionhoo[bot]"], repoDir, job.token);
+          checked(
+            "git",
+            ["config", "user.email", job.gitAuthorEmail ?? "versionhoo[bot]@users.noreply.github.com"],
+            repoDir,
+            job.token,
+          );
 
-  return withRepositoryEnvironment(job, async () => {
-    const gitAuth = createGitAuthArtifacts(workDir, job.token);
-    try {
-      const cloneUrl = validateCloneUrl(job.cloneUrl, job.repositoryFullName, job.trustedCloneHosts);
-      checked(
-        "git",
-        ["clone", "--branch", job.branch, "--no-single-branch", cloneUrl, repoDir],
-        workDir,
-        job.token,
-        gitAuth.env,
-      );
-      checked("git", ["config", "user.name", job.gitAuthorName ?? "versionhoo[bot]"], repoDir, job.token);
-      checked(
-        "git",
-        ["config", "user.email", job.gitAuthorEmail ?? "versionhoo[bot]@users.noreply.github.com"],
-        repoDir,
-        job.token,
-      );
+          const branchHead = runCommand("git", ["rev-parse", "HEAD"], repoDir).stdout.trim();
+          if (branchHead !== job.headSha) {
+            return {
+              repositoryFullName: job.repositoryFullName,
+              branch: job.branch,
+              headSha: job.headSha,
+              workDir,
+              outcome: "stale",
+              published: false,
+              message: `Skipped stale workflow run for ${job.repositoryFullName}@${job.branch}: branch is ${branchHead}, workflow passed on ${job.headSha}.`,
+              releases: [],
+            };
+          }
 
-      const branchHead = runCommand("git", ["rev-parse", "HEAD"], repoDir).stdout.trim();
-      if (branchHead !== job.headSha) {
-        return {
-          repositoryFullName: job.repositoryFullName,
-          branch: job.branch,
-          headSha: job.headSha,
-          workDir,
-          outcome: "stale",
-          published: false,
-          message: `Skipped stale workflow run for ${job.repositoryFullName}@${job.branch}: branch is ${branchHead}, workflow passed on ${job.headSha}.`,
-          releases: [],
-        };
+          installProjectDependencies(repoDir, job.installCommand, job.token);
+
+          const config = await loadConfig(repoDir, job.configPath);
+          const trustedApiUrl = validateGitHubApiUrl(job.apiUrl ?? "https://api.github.com", job.trustedApiUrls);
+          if (config.github !== false) {
+            config.github.repository = validateRepositoryFullName(job.repositoryFullName);
+            config.github.apiUrl = trustedApiUrl;
+          }
+          const plan = createReleasePlan(repoDir, config);
+          const execution = await executeRelease(repoDir, config, plan, {
+            push: true,
+            github: true,
+            githubToken: job.token,
+            gitAuth: gitAuth.env,
+          });
+
+          return {
+            repositoryFullName: job.repositoryFullName,
+            branch: job.branch,
+            headSha: job.headSha,
+            workDir,
+            outcome: execution.published ? "published" : "no_release",
+            published: execution.published,
+            releases: execution.plan.releases.map((release) => ({
+              name: release.package.name,
+              version: release.nextVersion,
+              tag: release.tag,
+            })),
+          };
+        } finally {
+          gitAuth.cleanup();
+        }
+      } finally {
+        if (!job.keepWorkDir) {
+          rmSync(workDir, { recursive: true, force: true });
+        }
       }
-
-      installProjectDependencies(repoDir, job.installCommand, job.token);
-
-      const config = await loadConfig(repoDir, job.configPath);
-      const trustedApiUrl = validateGitHubApiUrl(job.apiUrl ?? "https://api.github.com", job.trustedApiUrls);
-      if (config.github !== false) {
-        config.github.repository = validateRepositoryFullName(job.repositoryFullName);
-        config.github.apiUrl = trustedApiUrl;
-      }
-      const plan = createReleasePlan(repoDir, config);
-      const execution = await executeRelease(repoDir, config, plan, {
-        push: true,
-        github: true,
-        githubToken: job.token,
-        gitAuth: gitAuth.env,
-      });
-
-      return {
-        repositoryFullName: job.repositoryFullName,
-        branch: job.branch,
-        headSha: job.headSha,
-        workDir,
-        outcome: execution.published ? "published" : "no_release",
-        published: execution.published,
-        releases: execution.plan.releases.map((release) => ({
-          name: release.package.name,
-          version: release.nextVersion,
-          tag: release.tag,
-        })),
-      };
-    } finally {
-      gitAuth.cleanup();
-      if (!job.keepWorkDir) {
-        rmSync(workDir, { recursive: true, force: true });
-      }
-    }
-  });
+    }, repositoryHome);
+  } finally {
+    rmSync(repositoryHome, { recursive: true, force: true });
+  }
 }
-function createGitAuthArtifacts(workDir: string, token: string): { env: GitNetworkAuth; cleanup: () => void } {
-  const tokenPath = join(workDir, ".git-token");
-  const askpassPath = join(workDir, ".git-askpass");
+function createGitAuthArtifacts(workDir: string, token: string): GitAuthArtifacts {
+  const askpassPath = join(workDir, GIT_ASKPASS_FILENAME);
+  let created = false;
   const cleanup = (): void => {
-    rmSync(tokenPath, { force: true });
+    if (!created) return;
     rmSync(askpassPath, { force: true });
+    created = false;
   };
   try {
-    writeFileSync(tokenPath, `${token}\n`, { encoding: "utf8", mode: 0o600 });
-    chmodSync(tokenPath, 0o600);
-    writeFileSync(
-      askpassPath,
-      '#!/bin/sh\ncase "$1" in\n  *[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]*) printf "%s\\n" "x-access-token" ;;\n  *) cat "$VERSIONHOO_GIT_TOKEN_FILE" ;;\nesac\n',
-      { encoding: "utf8", mode: 0o700 },
-    );
+    writeFileSync(askpassPath, GIT_ASKPASS_SCRIPT, { encoding: "utf8", flag: "wx", mode: 0o700 });
+    created = true;
     chmodSync(askpassPath, 0o700);
     return {
       env: {
         GIT_ASKPASS: askpassPath,
         GIT_TERMINAL_PROMPT: "0",
-        VERSIONHOO_GIT_TOKEN_FILE: tokenPath,
+        [GIT_TOKEN_ENV]: token,
       },
       cleanup,
     };
@@ -208,7 +222,11 @@ export function validateCloneUrl(
 
 let repositoryEnvironmentTail = Promise.resolve();
 
-async function withRepositoryEnvironment<T>(job: VersionhooReleaseJob, operation: () => Promise<T>): Promise<T> {
+async function withRepositoryEnvironment<T>(
+  job: VersionhooReleaseJob,
+  operation: () => Promise<T>,
+  repositoryHome: string,
+): Promise<T> {
   const previous = repositoryEnvironmentTail;
   let release!: () => void;
   repositoryEnvironmentTail = new Promise<void>((resolve) => {
@@ -219,7 +237,7 @@ async function withRepositoryEnvironment<T>(job: VersionhooReleaseJob, operation
 
   const allowed: Record<string, string> = {
     PATH: original.PATH ?? "",
-    HOME: original.HOME ?? tmpdir(),
+    HOME: repositoryHome,
     SHELL: original.SHELL ?? "/bin/sh",
     LANG: original.LANG ?? "C.UTF-8",
     GIT_CONFIG_NOSYSTEM: "1",

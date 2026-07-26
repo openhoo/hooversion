@@ -45,6 +45,38 @@ describe("configuration package graph validation", () => {
       ],
     })).toThrow(/cycle detected/);
   });
+
+  it("rejects option-like, leading-dash, and control-character refs", () => {
+    const cwd = tempDirectory();
+    writeJson(cwd, "package.json", "app");
+    for (const branch of ["--upload-pack=evil", "-release", "release\nbranch"]) {
+      expect(() =>
+        normalizeConfig(cwd, {
+          branches: [branch],
+          packages: [{ name: "app", path: ".", type: "node", manifest: "package.json" }],
+        }),
+      ).toThrow(/Invalid Git branch/);
+    }
+
+    expect(() =>
+      normalizeConfig(cwd, {
+        tagFormat: "--upload-pack=${version}",
+        packages: [{ name: "app", path: ".", type: "node", manifest: "package.json" }],
+      }),
+    ).toThrow(/Invalid Git tag/);
+  });
+
+  it("accepts main branches and scoped release tag formats", () => {
+    const cwd = tempDirectory();
+    writeJson(cwd, "package.json", "app");
+    const config = normalizeConfig(cwd, {
+      branches: ["main"],
+      tagFormat: "release/${version}",
+      packages: [{ name: "app", path: ".", type: "node", manifest: "package.json" }],
+    });
+    expect(config.branches).toEqual(["main"]);
+    expect(config.tagFormat).toBe("release/${version}");
+  });
 });
 
 function tempDirectory(): string {

@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { clearReleaseOutputs, writeReleaseOutputs } from "../src/output";
+import { clearReleaseOutputs, getReleaseOutputPaths, writeReleaseOutputs } from "../src/output";
 import type { NormalizedConfig, ReleasePlan } from "../src/types";
 
 function config(outputDir = ".hooversion"): NormalizedConfig {
@@ -44,6 +44,59 @@ describe("release output lifecycle", () => {
     expect(readFileSync(join(outputDir, "user-notes.md"), "utf8")).toBe("keep\n");
   });
 
+  it("treats missing managed files as already clean", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-output-missing-"));
+
+    expect(() => clearReleaseOutputs(cwd)).not.toThrow();
+    expect(() => clearReleaseOutputs(cwd)).not.toThrow();
+  });
+
+  it("ignores malformed stale output when inferring note paths", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-output-malformed-"));
+    const outputDir = join(cwd, ".hooversion");
+    mkdirSync(outputDir);
+    writeFileSync(join(outputDir, "outputs.json"), "{not-json\n");
+    writeFileSync(join(outputDir, "v1.2.3-notes.md"), "keep\n");
+
+    clearReleaseOutputs(cwd);
+
+    expect(existsSync(join(outputDir, "outputs.json"))).toBe(false);
+    expect(readFileSync(join(outputDir, "v1.2.3-notes.md"), "utf8")).toBe("keep\n");
+  });
+
+  it("does not follow a symlinked stale output payload", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-output-symlink-"));
+    const outputDir = join(cwd, ".hooversion");
+    const outsideDir = mkdtempSync(join(tmpdir(), "hooversion-output-target-"));
+    const payloadPath = join(outsideDir, "outputs.json");
+    const notePath = join(outsideDir, "v1.2.3-notes.md");
+    mkdirSync(outputDir);
+    writeFileSync(payloadPath, JSON.stringify({ releases: [{ tag: "v1.2.3" }] }));
+    writeFileSync(notePath, "outside\n");
+    symlinkSync(payloadPath, join(outputDir, "outputs.json"));
+
+    expect(getReleaseOutputPaths(cwd)).toEqual([
+      join(outputDir, "outputs.json"),
+      join(cwd, ".release-version"),
+    ]);
+
+    clearReleaseOutputs(cwd);
+
+    expect(() => lstatSync(join(outputDir, "outputs.json"))).toThrow();
+    expect(readFileSync(payloadPath, "utf8")).toContain("v1.2.3");
+    expect(readFileSync(notePath, "utf8")).toBe("outside\n");
+  });
+
+  it("rejects a directory at a managed output path", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-output-directory-"));
+    const outputDir = join(cwd, ".hooversion");
+    mkdirSync(outputDir);
+    mkdirSync(join(outputDir, "outputs.json"));
+
+    expect(() => clearReleaseOutputs(cwd)).toThrow();
+    expect(lstatSync(join(outputDir, "outputs.json")).isDirectory()).toBe(true);
+  });
+
   it("removes stale single-release fields before a no-release publication", () => {
     const cwd = mkdtempSync(join(tmpdir(), "hooversion-output-no-release-"));
     writeFileSync(join(cwd, ".release-version"), "1.0.1\n");
@@ -58,6 +111,18 @@ describe("release output lifecycle", () => {
       published: false,
       releases: [],
     });
+  });
+
+  it("removes a symlinked release version without following its target", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-output-version-symlink-"));
+    const targetPath = join(cwd, "version-target");
+    writeFileSync(targetPath, "keep\n");
+    symlinkSync(targetPath, join(cwd, ".release-version"));
+
+    writeReleaseOutputs(cwd, config(), multiPlan());
+
+    expect(() => lstatSync(join(cwd, ".release-version"))).toThrow();
+    expect(readFileSync(targetPath, "utf8")).toBe("keep\n");
   });
 
   it("removes a stale single-release version for a multi-release publication", () => {

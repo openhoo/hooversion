@@ -131,8 +131,9 @@ describe("Versionhoo GitHub App webhook handling", () => {
     expect(await response.json()).toEqual({ error: "webhook payload too large" });
   });
 
-  it("rejects malformed repository and clone metadata before enqueueing", async () => {
+  it("rejects malformed or missing repository metadata before enqueueing runner work", async () => {
     let queued = 0;
+    let runnerCalls = 0;
     const queue = {
       enqueue() {
         queued += 1;
@@ -140,18 +141,39 @@ describe("Versionhoo GitHub App webhook handling", () => {
     };
     const malformedRepositoryPayload = workflowRun();
     malformedRepositoryPayload.repository.id = 0;
+    const sourcePayload = workflowRun();
+    const missingRepositoryIdPayload = {
+      ...sourcePayload,
+      repository: {
+        full_name: sourcePayload.repository.full_name,
+        clone_url: sourcePayload.repository.clone_url,
+        default_branch: sourcePayload.repository.default_branch,
+      },
+    };
     const malformedClonePayload = workflowRun();
     malformedClonePayload.repository.clone_url = "https://evil.test/openhoo/app.git";
-    const handler = createVersionhooWebhookHandler(config(), fakeRunner, queue as never);
+    const handler = createVersionhooWebhookHandler(
+      config(),
+      async () => {
+        runnerCalls += 1;
+        return fakeRunner();
+      },
+      queue as never,
+    );
 
     const repositoryResponse = await handler(
       signedWorkflowRequest(JSON.stringify(malformedRepositoryPayload), "bad-repository"),
     );
+    const missingRepositoryIdResponse = await handler(
+      signedWorkflowRequest(JSON.stringify(missingRepositoryIdPayload), "missing-repository-id"),
+    );
     const cloneResponse = await handler(signedWorkflowRequest(JSON.stringify(malformedClonePayload), "bad-clone"));
 
     expect(repositoryResponse.status).toBe(400);
+    expect(missingRepositoryIdResponse.status).toBe(400);
     expect(cloneResponse.status).toBe(400);
     expect(queued).toBe(0);
+    expect(runnerCalls).toBe(0);
   });
 
   it("coalesces concurrent duplicate deliveries while work is in flight", async () => {

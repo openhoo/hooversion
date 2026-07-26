@@ -4,12 +4,47 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { normalizeConfig } from "../src/config";
+import { createAnnotatedTag, getRemoteBranchSha, pushRelease } from "../src/git";
 import { createReleasePlan } from "../src/plan";
 import { executeRelease } from "../src/release";
 type FetchInput = Parameters<typeof fetch>[0];
 type FetchInit = Parameters<typeof fetch>[1];
 
 describe("release execution", () => {
+  it("rejects malicious branches and tags before invoking Git", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-ref-safety-"));
+    for (const branch of ["--upload-pack=evil", "-release", "release\nbranch"]) {
+      expect(() => getRemoteBranchSha(cwd, branch)).toThrow(/Invalid Git branch/);
+      expect(() => pushRelease(cwd, branch, ["v1.0.1"])).toThrow(/Invalid Git branch/);
+    }
+    for (const tag of ["--upload-pack=evil", "-release", "release\nv1.0.1"]) {
+      expect(() => pushRelease(cwd, "main", [tag])).toThrow(/Invalid Git tag/);
+      expect(() => createAnnotatedTag(cwd, tag, "release")).toThrow(/Invalid Git tag/);
+    }
+  });
+
+  it("skips repository pre-push hooks during authenticated release pushes", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "hooversion-hook-safety-"));
+    const remote = mkdtempSync(join(tmpdir(), "hooversion-hook-safety-remote-"));
+    git(remote, "init", "--bare");
+    git(cwd, "init", "-b", "main");
+    git(cwd, "config", "user.email", "test@example.com");
+    git(cwd, "config", "user.name", "Hooversion Test");
+    writeFileSync(join(cwd, "package.json"), JSON.stringify({ name: "app", version: "1.0.0" }));
+    git(cwd, "add", "--all");
+    git(cwd, "commit", "-m", "initial import");
+    git(cwd, "remote", "add", "origin", remote);
+    git(cwd, "tag", "-a", "release/v1.2.3", "-m", "release/v1.2.3");
+    const marker = join(cwd, "hook-observed-token");
+    writeFileSync(
+      join(cwd, ".git", "hooks", "pre-push"),
+      `#!/bin/sh\nprintf '%s' "$VERSIONHOO_GIT_TOKEN" > "${marker}"\n`,
+      { mode: 0o755 },
+    );
+
+    pushRelease(cwd, "main", ["release/v1.2.3"], { VERSIONHOO_GIT_TOKEN: "secret-token" });
+    expect(existsSync(marker)).toBe(false);
+  });
   it("updates files, commits, tags, and writes outputs without GitHub or push", async () => {
     const cwd = mkdtempSync(join(tmpdir(), "hooversion-release-"));
     git(cwd, "init", "-b", "main");
@@ -124,12 +159,17 @@ describe("release execution", () => {
       push: false,
     });
     const plan = createReleasePlan(cwd, config);
-    await executeRelease(cwd, config, plan, { push: false, github: false });
+    const firstResult = await executeRelease(cwd, config, plan, { push: false, github: false });
+    expect(firstResult.published).toBe(true);
     const releaseHead = git(cwd, "rev-parse", "HEAD");
     const commitCount = git(cwd, "rev-list", "--count", "HEAD");
 
     const rerunPlan = createReleasePlan(cwd, config);
-    await executeRelease(cwd, config, rerunPlan, { push: false, github: false });
+    expect(rerunPlan.releases).toHaveLength(0);
+    const rerunResult = await executeRelease(cwd, config, rerunPlan, { push: false, github: false });
+    expect(rerunResult.published).toBe(true);
+    expect(rerunResult.plan.sourceSha).toBe(plan.sourceSha);
+    expect(rerunResult.plan.releases).toHaveLength(1);
 
     expect(git(cwd, "rev-parse", "HEAD")).toBe(releaseHead);
     expect(git(cwd, "rev-list", "--count", "HEAD")).toBe(commitCount);

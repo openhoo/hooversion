@@ -1,4 +1,11 @@
 import type { RawCommit } from "./types";
+export type GitRefKind = "branch" | "tag";
+/**
+ * Validate a short branch or tag name before it is interpolated into a Git
+ * command. This mirrors the security-relevant subset of check-ref-format and
+ * additionally rejects option-like names.
+ */
+export declare function assertValidGitRef(value: string, kind: GitRefKind): void;
 export type GitNetworkAuth = Readonly<Record<string, string>>;
 export declare function git(cwd: string, args: string[], allowFailure?: boolean, auth?: GitNetworkAuth): string;
 export declare function isGitRepository(cwd: string): boolean;

@@ -1,6 +1,17 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  constants as fsConstants,
+  fstatSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
-import { mkdirSync } from "node:fs";
+import { HooversionError } from "./errors";
 import { breakingChangeDescription } from "./commit";
 import type { PackageRelease, ParsedCommit } from "./types";
 
@@ -35,14 +46,67 @@ export function generateReleaseNotes(release: Omit<PackageRelease, "notes">): st
 export function updateChangelog(cwd: string, release: PackageRelease): void {
   const path = join(cwd, release.changelogPath);
   mkdirSync(dirname(path), { recursive: true });
-  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+
+  let existing = "";
+  let sourceFd: number | undefined;
+  try {
+    sourceFd = openSync(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    if (!fstatSync(sourceFd).isFile()) throw new HooversionError(`${path} must be a regular file`);
+    existing = readFileSync(sourceFd, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  } finally {
+    if (sourceFd !== undefined) closeSync(sourceFd);
+  }
+
   const title = `# ${release.package.name} Changelog`;
   const normalizedExisting = existing.trim() ? existing : `${title}\n`;
   const [firstLine, ...rest] = normalizedExisting.split(/\r?\n/);
   const header = firstLine.startsWith("# ") ? firstLine : title;
   const body = firstLine.startsWith("# ") ? rest.join("\n").replace(/^\n+/, "") : normalizedExisting;
   const next = `${header}\n\n${release.notes}\n\n${body.trimEnd()}\n`;
-  writeFileSync(path, next);
+  const tempPath = `${path}.hooversion-${process.pid}-${Math.random().toString(16).slice(2)}.tmp`;
+  let tempFd: number | undefined;
+  let tempOwned = false;
+  try {
+    tempFd = openSync(
+      tempPath,
+      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+      0o600,
+    );
+    tempOwned = true;
+    writeChangelogFile(tempFd, next);
+    fsyncSync(tempFd);
+    closeSync(tempFd);
+    tempFd = undefined;
+    renameSync(tempPath, path);
+    tempOwned = false;
+  } finally {
+    if (tempFd !== undefined) {
+      try {
+        closeSync(tempFd);
+      } catch {
+        // Preserve the original write error while still attempting cleanup.
+      }
+    }
+    if (tempOwned) {
+      try {
+        unlinkSync(tempPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+}
+
+function writeChangelogFile(fd: number, content: string): void {
+  const data = Buffer.from(content);
+  let offset = 0;
+  while (offset < data.byteLength) {
+    const written = writeSync(fd, data, offset, data.byteLength - offset, offset);
+    if (written <= 0) throw new HooversionError("Failed to write changelog");
+    offset += written;
+  }
 }
 
 function groupCommits(commits: ParsedCommit[]): [string, ParsedCommit[]][] {
