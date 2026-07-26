@@ -12,6 +12,7 @@ interface CommandCall {
 
 const commandCalls: CommandCall[] = [];
 const askpassSnapshots: Array<{ content: string; mode: number }> = [];
+const tokenSnapshots: Array<{ content: string; mode: number; path: string }> = [];
 const shellCalls: CommandCall[] = [];
 const releaseOptions: Array<Record<string, unknown>> = [];
 let resumedRelease = false;
@@ -32,6 +33,13 @@ mock.module("../src/process", () => ({
       askpassSnapshots.push({
         content: readFileSync(env.GIT_ASKPASS, "utf8"),
         mode: statSync(env.GIT_ASKPASS).mode & 0o777,
+      });
+    }
+    if (args.includes("clone") && typeof env?.VERSIONHOO_GIT_TOKEN_FILE === "string") {
+      tokenSnapshots.push({
+        content: readFileSync(env.VERSIONHOO_GIT_TOKEN_FILE, "utf8"),
+        mode: statSync(env.VERSIONHOO_GIT_TOKEN_FILE).mode & 0o777,
+        path: env.VERSIONHOO_GIT_TOKEN_FILE,
       });
     }
     if (args.includes("clone")) {
@@ -97,7 +105,7 @@ describe("Versionhoo app Git credential plumbing", () => {
     commandCalls.length = 0;
     pushRelease("/repo", "main", ["v1.2.3"], {
       GIT_ASKPASS: "/tmp/askpass",
-      VERSIONHOO_GIT_TOKEN: "push-token",
+      VERSIONHOO_GIT_TOKEN_FILE: "/tmp/token",
     });
     const push = commandCalls.find((call) => call.args[0] === "push");
     expect(push?.args).toEqual([
@@ -111,12 +119,14 @@ describe("Versionhoo app Git credential plumbing", () => {
     ]);
     expect(push?.args.join(" ")).not.toContain("push-token");
     expect(push?.env?.GIT_ASKPASS).toBe("/tmp/askpass");
-    expect(push?.env?.VERSIONHOO_GIT_TOKEN).toBe("push-token");
+    expect(push?.env?.VERSIONHOO_GIT_TOKEN_FILE).toBe("/tmp/token");
+    expect(push?.env?.VERSIONHOO_GIT_TOKEN).toBeUndefined();
   });
   it("keeps credentials out of argv and ordinary child environments", async () => {
     commandCalls.length = 0;
     shellCalls.length = 0;
     askpassSnapshots.length = 0;
+    tokenSnapshots.length = 0;
     releaseOptions.length = 0;
     const parent = mkdtempSync(join(tmpdir(), "versionhoo-app-test-"));
     const token = "super-secret-token";
@@ -136,11 +146,15 @@ describe("Versionhoo app Git credential plumbing", () => {
       expect(clone).toBeDefined();
       expect(clone?.args.join(" ")).not.toContain(token);
       expect(clone?.args.at(-2)).toBe("https://github.com/openhoo/app.git");
-      expect(clone?.env?.VERSIONHOO_GIT_TOKEN).toBe(token);
+      expect(clone?.env?.VERSIONHOO_GIT_TOKEN).toBeUndefined();
+      expect(clone?.env?.VERSIONHOO_GIT_TOKEN_FILE).toBe(tokenSnapshots[0]?.path);
       expect(clone?.env?.GIT_CONFIG_NOSYSTEM).toBe("1");
       expect(askpassSnapshots).toHaveLength(1);
       expect(askpassSnapshots[0]?.mode).toBe(0o700);
       expect(askpassSnapshots[0]?.content).not.toContain(token);
+      expect(tokenSnapshots).toHaveLength(1);
+      expect(tokenSnapshots[0]?.content).toBe(`${token}\n`);
+      expect(tokenSnapshots[0]?.mode).toBe(0o600);
       expect(clone?.env?.GIT_ASKPASS).toBeDefined();
       expect(commandCalls.filter((call) => !call.args.includes("clone")).every((call) => call.env === undefined)).toBe(true);
       expect(shellCalls.every((call) => call.env === undefined)).toBe(true);
@@ -148,14 +162,20 @@ describe("Versionhoo app Git credential plumbing", () => {
       expect(auth && typeof auth === "object" ? Object.keys(auth).sort() : []).toEqual([
         "GIT_ASKPASS",
         "GIT_TERMINAL_PROMPT",
-        "VERSIONHOO_GIT_TOKEN",
+        "VERSIONHOO_GIT_TOKEN_FILE",
       ]);
-      const authToken =
-        auth && typeof auth === "object" && "VERSIONHOO_GIT_TOKEN" in auth ? auth.VERSIONHOO_GIT_TOKEN : undefined;
-      expect(authToken).toBe(token);
+      const authTokenPath =
+        auth && typeof auth === "object" && "VERSIONHOO_GIT_TOKEN_FILE" in auth
+          ? auth.VERSIONHOO_GIT_TOKEN_FILE
+          : undefined;
+      expect(authTokenPath).toBe(tokenSnapshots[0]?.path);
       expect(process.env.VERSIONHOO_GIT_TOKEN).toBeUndefined();
+      expect(process.env.VERSIONHOO_GIT_TOKEN_FILE).toBeUndefined();
       expect(process.env.GIT_ASKPASS).toBeUndefined();
       const workDir = result.workDir;
+      if (typeof authTokenPath !== "string") throw new Error("missing token file path");
+      expect(authTokenPath.startsWith(join(workDir, "repo"))).toBe(false);
+      expect(existsSync(authTokenPath)).toBe(false);
       expect(existsSync(join(workDir, ".git-askpass"))).toBe(false);
       expect(readFileSync(join(workDir, "repo", ".git", "config"), "utf8")).not.toContain(token);
       expect(filesUnder(workDir).every((path) => !readFileSync(path, "utf8").includes(token))).toBe(true);
