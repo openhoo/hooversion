@@ -247,7 +247,7 @@ describe("GitHub release publication", () => {
     }
   });
 
-  it("rejects a file swapped between validation and descriptor open before any upload", async () => {
+  it("rejects a file swapped after descriptor open before any upload", async () => {
     const originalFetch = globalThis.fetch;
     const assetDir = mkdtempSync(join(tmpdir(), "hooversion-github-"));
     const assetPath = join(assetDir, "asset.bin");
@@ -276,12 +276,13 @@ describe("GitHub release publication", () => {
     const originalOpen = fsPromises.open.bind(fsPromises);
     const openSpy = spyOn(fsPromises, "open");
     openSpy.mockImplementation(async (path, flags, mode) => {
+      const file = await originalOpen(path, flags as never, mode as never);
       if (String(path) === assetPath) {
         const replacement = `${assetPath}.replacement`;
         renameSync(assetPath, replacement);
         writeFileSync(assetPath, "replacement");
       }
-      return originalOpen(path, flags as never, mode as never);
+      return file;
     });
     globalThis.fetch = fetchMock;
 

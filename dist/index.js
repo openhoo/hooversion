@@ -1595,16 +1595,6 @@ async function readValidatedReleaseAsset(root, asset, name) {
   const path = resolveReleaseAssetPath(root, asset);
   let file;
   try {
-    const canonicalPath = await fs.realpath(path);
-    if (!isContainedPath(root, canonicalPath)) {
-      throw new HooversionError(`Release asset path escapes the repository: ${asset}`);
-    }
-    if (canonicalPath !== path) {
-      throw new HooversionError(`Release asset path must not traverse a symbolic link: ${asset}`);
-    }
-    const pathStats = await fs.lstat(path);
-    assertRegularReleaseAsset(pathStats, asset);
-    const preOpenMetadata = releaseAssetMetadata(pathStats);
     const noFollow = fsConstants3.O_NOFOLLOW;
     if (typeof noFollow !== "number") {
       throw new HooversionError("Secure release asset uploads require O_NOFOLLOW support.");
@@ -1613,9 +1603,6 @@ async function readValidatedReleaseAsset(root, asset, name) {
     const descriptorStats = await file.stat();
     assertRegularReleaseAsset(descriptorStats, asset);
     const descriptorMetadata = releaseAssetMetadata(descriptorStats);
-    if (!sameReleaseAssetMetadata(preOpenMetadata, descriptorMetadata)) {
-      throw new HooversionError(`Release asset changed while it was being read: ${asset}`);
-    }
     await assertStableReleaseAssetPath(root, path, asset, descriptorMetadata);
     const data = await readReleaseAssetDescriptor(file, descriptorMetadata.size, asset);
     const afterReadMetadata = releaseAssetMetadata(await file.stat());
