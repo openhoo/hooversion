@@ -1,0 +1,17 @@
+{
+  "name": "Versionhoo",
+  "url": "https://versionhoo.example.com",
+  "hook_attributes": {
+    "url": "https://versionhoo.example.com/webhooks/github"
+  },
+  "redirect_url": "https://versionhoo.example.com/health",
+  "public": false,
+  "default_permissions": {
+    "actions": "read",
+    "checks": "write",
+    "contents": "write",
+    "metadata": "read",
+    "pull_requests": "write"
+  },
+  "default_events": ["workflow_run"]
+}

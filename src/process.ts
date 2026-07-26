@@ -1,11 +1,11 @@
 import { spawnSync } from "node:child_process";
 import type { CommandResult } from "./types";
 
-export function runCommand(command: string, args: string[], cwd: string): CommandResult {
+export function runCommand(command: string, args: string[], cwd: string, env?: NodeJS.ProcessEnv): CommandResult {
   const result = spawnSync(command, args, {
     cwd,
     encoding: "utf8",
-    env: process.env,
+    env: env ?? process.env,
   });
 
   return {
@@ -15,12 +15,12 @@ export function runCommand(command: string, args: string[], cwd: string): Comman
   };
 }
 
-export function runShell(command: string, cwd: string): CommandResult {
+export function runShell(command: string, cwd: string, env?: NodeJS.ProcessEnv): CommandResult {
   const result = spawnSync(command, {
     cwd,
     encoding: "utf8",
-    env: process.env,
-    shell: process.env.SHELL ?? "/bin/sh",
+    env: env ?? process.env,
+    shell: (env ?? process.env).SHELL ?? "/bin/sh",
   });
 
   return {

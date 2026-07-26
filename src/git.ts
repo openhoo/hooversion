@@ -1,9 +1,16 @@
+import { relative, resolve, sep } from "node:path";
 import { HooversionError } from "./errors";
 import { runCommand } from "./process";
 import type { RawCommit } from "./types";
 
-export function git(cwd: string, args: string[], allowFailure = false): string {
-  const result = runCommand("git", args, cwd);
+export type GitNetworkAuth = Readonly<Record<string, string>>;
+
+function commandEnv(auth?: GitNetworkAuth): NodeJS.ProcessEnv | undefined {
+  return auth ? { ...process.env, ...auth } : undefined;
+}
+
+export function git(cwd: string, args: string[], allowFailure = false, auth?: GitNetworkAuth): string {
+  const result = runCommand("git", args, cwd, commandEnv(auth));
   if (result.code !== 0 && !allowFailure) {
     throw new HooversionError(`git ${args.join(" ")} failed:\n${result.stderr || result.stdout}`);
   }
@@ -22,10 +29,37 @@ export function getCurrentBranch(cwd: string): string {
   return git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
 }
 
-export function ensureCleanWorkingTree(cwd: string): void {
-  const status = git(cwd, ["status", "--porcelain"]);
-  if (status.trim()) {
-    throw new HooversionError(`Working tree must be clean before release:\n${status}`);
+export function ensureCleanWorkingTree(
+  cwd: string,
+  ignoredPaths: readonly string[] = [],
+  scopedOutputDir?: string,
+): void {
+  const ignored = new Set(ignoredPaths.map((path) => resolve(cwd, path)));
+  const unexpected = git(cwd, ["status", "--porcelain", "--untracked-files=all"])
+    .split("\n")
+    .filter((line) => {
+      if (!line.trim()) return false;
+      const path = line.slice(3).trim();
+      return !ignored.has(resolve(cwd, path));
+    });
+
+  if (scopedOutputDir) {
+    const resolvedOutputDir = resolve(cwd, scopedOutputDir);
+    const relativeOutputDir = relative(cwd, resolvedOutputDir);
+    if (relativeOutputDir && !relativeOutputDir.startsWith(`..${sep}`) && relativeOutputDir !== "..") {
+      const ignoredOutputFiles = git(
+        cwd,
+        ["ls-files", "--others", "--ignored", "--exclude-standard", "--", relativeOutputDir],
+        true,
+      )
+        .split("\n")
+        .filter((path) => path.trim() && !ignored.has(resolve(cwd, path.trim())));
+      unexpected.push(...ignoredOutputFiles.map((path) => `?? ${path}`));
+    }
+  }
+
+  if (unexpected.length > 0) {
+    throw new HooversionError(`Working tree must be clean before release:\n${unexpected.join("\n")}`);
   }
 }
 
@@ -37,6 +71,31 @@ export function getLatestTag(cwd: string, pattern: string): string | undefined {
 export function tagExists(cwd: string, tag: string): boolean {
   return runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`], cwd).code === 0;
 }
+export function getHeadSha(cwd: string): string {
+  return git(cwd, ["rev-parse", "HEAD"]).trim();
+}
+
+export function getRefSha(cwd: string, ref: string): string | undefined {
+  const commitRef = ref.startsWith("refs/tags/") ? `${ref}^{commit}` : ref;
+  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", commitRef], cwd);
+  return result.code === 0 ? result.stdout.trim() : undefined;
+}
+
+export function getRemoteBranchSha(cwd: string, branch: string, auth?: GitNetworkAuth): string | undefined {
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote) return undefined;
+  const output = git(cwd, ["ls-remote", "origin", `refs/heads/${branch}`], true, auth).trim();
+  return output ? output.split(/\s+/, 1)[0] : "";
+}
+
+export function getCommitMessage(cwd: string, ref = "HEAD"): string {
+  return git(cwd, ["show", "-s", "--format=%B", ref]).trimEnd();
+}
+
+export function pushRelease(cwd: string, branch: string, tags: string[], auth?: GitNetworkAuth): void {
+  git(cwd, ["push", "--atomic", "origin", `HEAD:${branch}`, ...tags], false, auth);
+}
+
 
 export function getCommits(cwd: string, fromRef?: string, toRef = "HEAD"): RawCommit[] {
   const range = fromRef ? `${fromRef}..${toRef}` : toRef;
@@ -80,12 +139,6 @@ export function createAnnotatedTag(cwd: string, tag: string, message: string): v
   git(cwd, ["tag", "-a", tag, "-m", message]);
 }
 
-export function pushRelease(cwd: string, branch: string, tags: string[]): void {
-  git(cwd, ["push", "origin", `HEAD:${branch}`]);
-  if (tags.length > 0) {
-    git(cwd, ["push", "origin", ...tags]);
-  }
-}
 
 export function getOriginRepository(cwd: string): string | undefined {
   const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();

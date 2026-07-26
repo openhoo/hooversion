@@ -1,0 +1,1784 @@
+// @bun
+// src/commit.ts
+var conventionalHeaderPattern = /^([a-z][a-z0-9-]*)(?:\(([^()\r\n]+)\))?(!)?: (.+)$/;
+var breakingFooterLinePattern = /^BREAKING[ -]CHANGE:\s*\S.*$/;
+var ignoredSubjectPatterns = [
+  /^Merge /,
+  /^Revert "/,
+  /^revert: /i,
+  /^chore\(release\)!?: /
+];
+var defaultReleaseRules = {
+  feat: "minor",
+  fix: "patch",
+  perf: "patch"
+};
+function isIgnoredSubject(subject) {
+  return ignoredSubjectPatterns.some((pattern) => pattern.test(subject));
+}
+function parseCommit(raw, policy = {}) {
+  const ignored = isIgnoredSubject(raw.subject);
+  const match = conventionalHeaderPattern.exec(raw.subject);
+  if (!match) {
+    return {
+      ...raw,
+      type: "",
+      description: raw.subject,
+      breaking: false,
+      ignored
+    };
+  }
+  const [, type, scope, bang, description] = match;
+  const releaseRules = { ...defaultReleaseRules, ...policy.releaseTypes };
+  const breaking = Boolean(breakingChangeDescription(raw.body)) || Boolean(bang);
+  return {
+    ...raw,
+    type,
+    scope,
+    description,
+    breaking,
+    releaseType: breaking ? "major" : releaseRules[type],
+    ignored
+  };
+}
+function lintCommit(raw, policy = {}) {
+  if (isIgnoredSubject(raw.subject))
+    return [];
+  const issues = [];
+  const match = conventionalHeaderPattern.exec(raw.subject);
+  if (!match) {
+    issues.push({
+      hash: raw.hash,
+      subject: raw.subject,
+      message: "header must match '<type>(optional-scope)!: description'"
+    });
+    return issues;
+  }
+  const [, type, , , description] = match;
+  if (policy.allowedTypes && !policy.allowedTypes.includes(type)) {
+    issues.push({ hash: raw.hash, subject: raw.subject, message: `type '${type}' is not allowed` });
+  }
+  if (!type) {
+    issues.push({ hash: raw.hash, subject: raw.subject, message: "type is required" });
+  }
+  if (!description.trim()) {
+    issues.push({ hash: raw.hash, subject: raw.subject, message: "description is required" });
+  }
+  if (raw.subject.length > 100) {
+    issues.push({
+      hash: raw.hash,
+      subject: raw.subject,
+      message: "header must not exceed 100 characters"
+    });
+  }
+  return issues;
+}
+function parseCommits(rawCommits, policy = {}) {
+  return rawCommits.map((raw) => parseCommit(raw, policy));
+}
+function breakingChangeDescription(body) {
+  const lines = body.split(/\r?\n/);
+  for (let index = 0;index < lines.length; index += 1) {
+    const match = breakingFooterLinePattern.exec(lines[index].trim());
+    if (!match)
+      continue;
+    if (index === 0 && lines.length === 1 || lines[index - 1]?.trim() === "") {
+      return lines[index].trim().replace(/^BREAKING[ -]CHANGE:\s*/, "").trim();
+    }
+  }
+  return;
+}
+
+// src/changelog.ts
+import { existsSync, readFileSync, writeFileSync } from "fs";
+import { dirname, join } from "path";
+import { mkdirSync } from "fs";
+var groupTitles = {
+  major: "Breaking Changes",
+  feat: "Features",
+  fix: "Bug Fixes",
+  perf: "Performance"
+};
+function generateReleaseNotes(release) {
+  const date = new Date().toISOString().slice(0, 10);
+  const lines = [`## ${release.nextVersion} (${date})`, ""];
+  const groups = groupCommits(release.commits);
+  for (const [title, commits] of groups) {
+    lines.push(`### ${title}`, "");
+    for (const commit of commits) {
+      const scope = commit.scope ? `**${commit.scope}:** ` : "";
+      lines.push(`- ${scope}${commit.description} (${commit.hash.slice(0, 7)})`);
+      if (commit.breaking && commit.body) {
+        const breaking = breakingChangeDescription(commit.body);
+        if (breaking)
+          lines.push(`  - BREAKING: ${breaking}`);
+      }
+    }
+    lines.push("");
+  }
+  return lines.join(`
+`).trimEnd();
+}
+function updateChangelog(cwd, release) {
+  const path = join(cwd, release.changelogPath);
+  mkdirSync(dirname(path), { recursive: true });
+  const existing = existsSync(path) ? readFileSync(path, "utf8") : "";
+  const title = `# ${release.package.name} Changelog`;
+  const normalizedExisting = existing.trim() ? existing : `${title}
+`;
+  const [firstLine, ...rest] = normalizedExisting.split(/\r?\n/);
+  const header = firstLine.startsWith("# ") ? firstLine : title;
+  const body = firstLine.startsWith("# ") ? rest.join(`
+`).replace(/^\n+/, "") : normalizedExisting;
+  const next = `${header}
+
+${release.notes}
+
+${body.trimEnd()}
+`;
+  writeFileSync(path, next);
+}
+function groupCommits(commits) {
+  const buckets = new Map;
+  for (const commit of commits) {
+    if (commit.breaking) {
+      pushBucket(buckets, groupTitles.major, commit);
+    } else if (commit.type in groupTitles) {
+      pushBucket(buckets, groupTitles[commit.type], commit);
+    } else {
+      pushBucket(buckets, "Other Changes", commit);
+    }
+  }
+  const orderedTitles = [...Object.values(groupTitles), "Other Changes"];
+  return orderedTitles.map((title) => [title, buckets.get(title) ?? []]).filter(([, values]) => values.length > 0);
+}
+function pushBucket(map, key, commit) {
+  const bucket = map.get(key) ?? [];
+  bucket.push(commit);
+  map.set(key, bucket);
+}
+// src/config.ts
+import { existsSync as existsSync3, readFileSync as readFileSync3, writeFileSync as writeFileSync3 } from "fs";
+import { basename, join as join3, normalize, relative } from "path";
+import { pathToFileURL } from "url";
+
+// src/errors.ts
+class HooversionError extends Error {
+  code;
+  constructor(message, code = 1) {
+    super(message);
+    this.code = code;
+    this.name = "HooversionError";
+  }
+}
+function assertHooversion(condition, message) {
+  if (!condition) {
+    throw new HooversionError(message);
+  }
+}
+
+// src/manifest.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "fs";
+import { dirname as dirname2, join as join2 } from "path";
+function defaultManifestPath(type, packagePath) {
+  if (type === "node")
+    return join2(packagePath, "package.json");
+  if (type === "rust")
+    return join2(packagePath, "Cargo.toml");
+  if (type === "version-file")
+    return join2(packagePath, "version");
+  return join2(packagePath, "pyproject.toml");
+}
+function readManifest(cwd, pkg) {
+  const path = join2(cwd, pkg.manifest);
+  if (pkg.type === "node")
+    return readPackageJson(path);
+  if (pkg.type === "rust")
+    return readTomlPackage(path, "package");
+  if (pkg.type === "version-file")
+    return readVersionFile(path, pkg.name);
+  return readTomlPackage(path, "project");
+}
+function updateManifestVersion(cwd, pkg, version) {
+  const path = join2(cwd, pkg.manifest);
+  if (pkg.type === "node") {
+    const json = JSON.parse(readFileSync2(path, "utf8"));
+    json.version = version;
+    writeFileSync2(path, `${JSON.stringify(json, null, 2)}
+`);
+    return;
+  }
+  if (pkg.type === "version-file") {
+    writeFileSync2(path, `${version}
+`);
+    return;
+  }
+  const section = pkg.type === "rust" ? "package" : "project";
+  updateTomlSectionVersion(path, section, version);
+}
+function updateLocalDependencyVersions(cwd, packages, releasedVersions) {
+  const packageNames = new Map(packages.map((pkg) => [normalizePackageName(pkg.name), pkg.name]));
+  const rustReleasedVersions = new Map(Array.from(releasedVersions).filter(([name]) => packages.some((pkg) => pkg.type === "rust" && normalizePackageName(pkg.name) === normalizePackageName(name))));
+  for (const pkg of packages) {
+    const localVersions = new Map;
+    for (const dependency of pkg.dependencies) {
+      const actualName = packageNames.get(normalizePackageName(dependency));
+      const version = actualName ? releasedVersions.get(actualName) ?? releasedVersions.get(dependency) : undefined;
+      if (actualName && version)
+        localVersions.set(actualName, version);
+    }
+    if (localVersions.size === 0)
+      continue;
+    const path = join2(cwd, pkg.manifest);
+    if (pkg.type === "node") {
+      updateNodeLocalDependencies(path, pkg, localVersions);
+    } else if (pkg.type === "python") {
+      updatePythonLocalDependencies(path, pkg, localVersions);
+    } else if (pkg.type === "rust") {
+      updateRustLocalDependencies(path, pkg, localVersions);
+    }
+  }
+  const workspaceManifest = join2(cwd, "Cargo.toml");
+  if (rustReleasedVersions.size > 0 && existsSync2(workspaceManifest)) {
+    updateRustWorkspaceDependencies(workspaceManifest, rustReleasedVersions);
+  }
+  if (rustReleasedVersions.size > 0)
+    updateCargoLock(cwd, rustReleasedVersions);
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizePackageName(name) {
+  return name.trim().toLowerCase();
+}
+function findReleasedName(name, releasedVersions) {
+  const normalized = normalizePackageName(name);
+  return Array.from(releasedVersions.keys()).find((candidate) => normalizePackageName(candidate) === normalized);
+}
+function assertAllDependenciesFound(path, owner, releasedVersions, found) {
+  for (const target of releasedVersions.keys()) {
+    if (!found.has(target)) {
+      throw new HooversionError(`${path} package ${owner.name} declares local dependency ${target}, but it was not found`);
+    }
+  }
+}
+function rewriteNodeRequirement(current, version, path, name) {
+  if (current.startsWith("workspace:"))
+    return current;
+  if (/^(?:file|git|https?):/.test(current)) {
+    throw new HooversionError(`${path} dependency ${name} has unsupported specifier ${current}`);
+  }
+  const prefix = current.match(/^[~^]/)?.[0] ?? "";
+  return `${prefix}${version}`;
+}
+function isPythonDependencySection(section) {
+  return section === "project" || section === "project.optional-dependencies" || section.startsWith("project.optional-dependencies.") || section === "tool.poetry.dependencies" || section.startsWith("tool.poetry.group.") && section.endsWith(".dependencies");
+}
+function rewritePythonRequirementsLine(line, releasedVersions, found, path) {
+  let changed = false;
+  const output = line.replace(/(["'])([^"']*)\1/g, (full, quote, requirement) => {
+    const nameMatch = /^\s*([A-Za-z0-9][A-Za-z0-9._-]*)/.exec(requirement);
+    if (!nameMatch)
+      return full;
+    const target = findReleasedName(nameMatch[1], releasedVersions);
+    if (!target)
+      return full;
+    found.add(target);
+    const next = rewritePythonRequirement(requirement, releasedVersions.get(target), path, nameMatch[1]);
+    if (next === requirement)
+      return full;
+    changed = true;
+    return `${quote}${next}${quote}`;
+  });
+  return { line: output, changed };
+}
+function rewritePythonRequirement(requirement, version, path, name) {
+  const suffix = requirement.slice(name.length);
+  if (suffix.trimStart().startsWith("@")) {
+    throw new HooversionError(`${path} dependency ${name} has unsupported direct URL syntax`);
+  }
+  return `${name}${rewritePythonConstraint(suffix, version, path, name)}`;
+}
+function rewritePythonConstraint(current, version, path, name) {
+  if (current.includes("@")) {
+    throw new HooversionError(`${path} dependency ${name} has unsupported direct URL syntax`);
+  }
+  const match = /([<>=!~]{1,3})\s*([0-9][^,\s;]*)/.exec(current);
+  if (match)
+    return current.replace(match[2], version);
+  const marker = current.search(/\s*;/);
+  if (marker >= 0)
+    return `${current.slice(0, marker)}==${version}${current.slice(marker)}`;
+  return `${current}==${version}`;
+}
+function isRustDependencySection(section, workspaceOnly) {
+  if (workspaceOnly)
+    return section === "workspace.dependencies";
+  return ["dependencies", "dev-dependencies", "build-dependencies"].includes(section) || /^target\..+\.(dependencies|dev-dependencies|build-dependencies)$/.test(section);
+}
+function findRustDottedDependency(section, releasedVersions, workspaceOnly) {
+  const match = (workspaceOnly ? /^workspace\.dependencies\.((?:"[^"]+"|[A-Za-z0-9_-]+))$/ : /^(?:(?:dependencies|dev-dependencies|build-dependencies)|(?:target\..+\.(?:dependencies|dev-dependencies|build-dependencies)))\.((?:"[^"]+"|[A-Za-z0-9_-]+))$/).exec(section);
+  if (!match)
+    return;
+  const name = match[1].replace(/^"|"$/g, "");
+  return findReleasedName(name, releasedVersions);
+}
+function finishRustDottedDependency(path, dependency, found) {
+  if (!dependency.workspace && !dependency.versionUpdated) {
+    throw new HooversionError(`${path} dependency ${dependency.target} has no supported version field`);
+  }
+  found.add(dependency.target);
+}
+function braceDelta(value) {
+  return (value.match(/\{/g)?.length ?? 0) - (value.match(/\}/g)?.length ?? 0);
+}
+function readPackageJson(path) {
+  const json = JSON.parse(readFileSync2(path, "utf8"));
+  if (!json.name || !json.version) {
+    throw new HooversionError(`${path} must contain name and version`);
+  }
+  return { name: json.name, version: json.version };
+}
+function readTomlPackage(path, sectionName) {
+  const text = readFileSync2(path, "utf8");
+  const section = getTomlSection(text, sectionName);
+  const name = readTomlString(section, "name");
+  const version = readTomlString(section, "version");
+  if (!name || !version) {
+    throw new HooversionError(`${path} [${sectionName}] must contain name and version`);
+  }
+  return { name, version };
+}
+function readVersionFile(path, name) {
+  const version = readFileSync2(path, "utf8").trim();
+  if (!version) {
+    throw new HooversionError(`${path} must contain a version`);
+  }
+  return { name, version };
+}
+function getTomlSection(text, sectionName) {
+  const lines = text.split(/\r?\n/);
+  let inSection = false;
+  const sectionLines = [];
+  for (const line of lines) {
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (heading) {
+      if (inSection)
+        break;
+      inSection = heading[1] === sectionName;
+      continue;
+    }
+    if (inSection)
+      sectionLines.push(line);
+  }
+  return sectionLines.join(`
+`);
+}
+function readTomlString(section, key) {
+  const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=\\s*["']([^"']+)["']\\s*$`, "m");
+  return pattern.exec(section)?.[1];
+}
+function updateTomlSectionVersion(path, sectionName, version) {
+  const text = readFileSync2(path, "utf8");
+  const lines = text.split(/\r?\n/);
+  let inSection = false;
+  let updated = false;
+  const output = lines.map((line) => {
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (heading) {
+      inSection = heading[1] === sectionName;
+      return line;
+    }
+    if (inSection && /^\s*version\s*=/.test(line)) {
+      updated = true;
+      return line.replace(/=\s*["'][^"']+["']/, `= "${version}"`);
+    }
+    return line;
+  });
+  if (!updated) {
+    throw new HooversionError(`${path} [${sectionName}] does not contain a version field`);
+  }
+  writeFileSync2(path, output.join(`
+`));
+}
+function updateNodeLocalDependencies(path, owner, releasedVersions) {
+  const json = JSON.parse(readFileSync2(path, "utf8"));
+  const sections = ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"];
+  const found = new Set;
+  let changed = false;
+  for (const section of sections) {
+    const value = json[section];
+    if (value === undefined)
+      continue;
+    if (!isRecord(value))
+      throw new HooversionError(`${path} ${section} must be an object`);
+    for (const [name, current] of Object.entries(value)) {
+      const target = findReleasedName(name, releasedVersions);
+      if (!target)
+        continue;
+      found.add(target);
+      if (typeof current !== "string") {
+        throw new HooversionError(`${path} package ${owner.name} has unsupported dependency ${name}`);
+      }
+      const next = rewriteNodeRequirement(current, releasedVersions.get(target), path, name);
+      if (next !== current) {
+        value[name] = next;
+        changed = true;
+      }
+    }
+  }
+  assertAllDependenciesFound(path, owner, releasedVersions, found);
+  if (changed)
+    writeFileSync2(path, `${JSON.stringify(json, null, 2)}
+`);
+}
+function updatePythonLocalDependencies(path, owner, releasedVersions) {
+  const lines = readFileSync2(path, "utf8").split(/\r?\n/);
+  const found = new Set;
+  let changed = false;
+  let section = "";
+  let inArray = false;
+  for (let index = 0;index < lines.length; index += 1) {
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(lines[index]);
+    if (heading) {
+      section = heading[1];
+      inArray = false;
+      continue;
+    }
+    const relevant = isPythonDependencySection(section);
+    if (!relevant)
+      continue;
+    if (inArray) {
+      const result = rewritePythonRequirementsLine(lines[index], releasedVersions, found, path);
+      lines[index] = result.line;
+      changed ||= result.changed;
+      if (/\]/.test(lines[index]))
+        inArray = false;
+      continue;
+    }
+    const assignment = /^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*)$/.exec(lines[index]);
+    if (!assignment)
+      continue;
+    const key = assignment[1];
+    const value = assignment[2];
+    if (value.startsWith("[") && (key === "dependencies" || section === "project.optional-dependencies" || section.startsWith("project.optional-dependencies."))) {
+      const result = rewritePythonRequirementsLine(lines[index], releasedVersions, found, path);
+      lines[index] = result.line;
+      changed ||= result.changed;
+      if (!/\]/.test(value))
+        inArray = true;
+      continue;
+    }
+    if (section.startsWith("tool.poetry") && findReleasedName(key, releasedVersions)) {
+      if (!/^["']/.test(value)) {
+        throw new HooversionError(`${path} package ${owner.name} has unsupported dependency ${key}`);
+      }
+      const quote = value[0];
+      const end = value.indexOf(quote, 1);
+      if (end < 0)
+        throw new HooversionError(`${path} has malformed dependency ${key}`);
+      const target = findReleasedName(key, releasedVersions);
+      const next = rewritePythonConstraint(value.slice(1, end), releasedVersions.get(target), path, key);
+      found.add(target);
+      if (next !== value.slice(1, end)) {
+        lines[index] = `${lines[index].slice(0, lines[index].indexOf(value) + 1)}${next}${value.slice(end)}`;
+        changed = true;
+      }
+    } else if (key === "dependencies" && value.startsWith("{")) {
+      if (Array.from(releasedVersions.keys()).some((name) => value.includes(name))) {
+        throw new HooversionError(`${path} has unsupported inline dependency table`);
+      }
+    }
+  }
+  assertAllDependenciesFound(path, owner, releasedVersions, found);
+  if (changed)
+    writeFileSync2(path, lines.join(`
+`));
+}
+function updateRustLocalDependencies(path, owner, releasedVersions) {
+  updateRustDependencyTables(path, owner, releasedVersions, false);
+}
+function updateRustWorkspaceDependencies(path, releasedVersions) {
+  updateRustDependencyTables(path, undefined, releasedVersions, true);
+}
+function updateRustDependencyTables(path, owner, releasedVersions, workspaceOnly) {
+  const lines = readFileSync2(path, "utf8").split(/\r?\n/);
+  const found = new Set;
+  let section = "";
+  let active;
+  let dotted;
+  let changed = false;
+  for (let index = 0;index < lines.length; index += 1) {
+    const line = lines[index];
+    if (active) {
+      if (/workspace\s*=\s*true/.test(line))
+        active.workspace = true;
+      if (!active.workspace && /^\s*version\s*=/.test(line)) {
+        lines[index] = line.replace(/=\s*["'][^"']+["']/, `= "${releasedVersions.get(active.target)}"`);
+        active.versionUpdated = true;
+        changed = true;
+      }
+      active.depth += braceDelta(line);
+      if (active.depth <= 0) {
+        if (!active.workspace && !active.versionUpdated) {
+          throw new HooversionError(`${path} dependency ${active.target} has no supported version field`);
+        }
+        found.add(active.target);
+        active = undefined;
+      }
+      continue;
+    }
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (heading) {
+      if (dotted)
+        finishRustDottedDependency(path, dotted, found);
+      section = heading[1];
+      const target2 = findRustDottedDependency(section, releasedVersions, workspaceOnly);
+      dotted = target2 ? { target: target2, workspace: false, versionUpdated: false } : undefined;
+      continue;
+    }
+    if (dotted) {
+      if (/workspace\s*=\s*true/.test(line))
+        dotted.workspace = true;
+      if (!dotted.workspace && /^\s*version\s*=/.test(line)) {
+        lines[index] = line.replace(/=\s*["'][^"']+["']/, `= "${releasedVersions.get(dotted.target)}"`);
+        dotted.versionUpdated = true;
+        changed = true;
+      }
+      continue;
+    }
+    if (!isRustDependencySection(section, workspaceOnly))
+      continue;
+    const entry = /^\s*(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*=\s*(.*)$/.exec(line);
+    if (!entry)
+      continue;
+    const name = entry[1] ?? entry[2];
+    const target = findReleasedName(name, releasedVersions);
+    if (!target)
+      continue;
+    const value = entry[3].trim();
+    if (value.startsWith("{")) {
+      const workspace = /workspace\s*=\s*true/.test(value);
+      const versionMatch = /version\s*=\s*["'][^"']+["']/.test(value);
+      const depth = braceDelta(value);
+      if (depth > 0) {
+        active = { target, depth, workspace, versionUpdated: false };
+      } else if (!workspace && versionMatch) {
+        lines[index] = line.replace(/(version\s*=\s*)["'][^"']+["']/, `$1"${releasedVersions.get(target)}"`);
+        found.add(target);
+        changed = true;
+      } else if (workspace) {
+        found.add(target);
+      } else {
+        throw new HooversionError(`${path} dependency ${name} has unsupported table syntax`);
+      }
+      continue;
+    }
+    if (/^["']/.test(value)) {
+      const quote = value[0];
+      const end = value.indexOf(quote, 1);
+      if (end < 0)
+        throw new HooversionError(`${path} has malformed dependency ${name}`);
+      lines[index] = `${line.slice(0, line.indexOf(value) + 1)}${releasedVersions.get(target)}${value.slice(end)}`;
+      found.add(target);
+      changed = true;
+      continue;
+    }
+    throw new HooversionError(`${path} dependency ${name} has unsupported value`);
+  }
+  if (dotted)
+    finishRustDottedDependency(path, dotted, found);
+  if (!workspaceOnly && owner)
+    assertAllDependenciesFound(path, owner, releasedVersions, found);
+  if (changed)
+    writeFileSync2(path, lines.join(`
+`));
+}
+function updateCargoLock(cwd, releasedVersions) {
+  const path = join2(cwd, "Cargo.lock");
+  if (!existsSync2(path))
+    return;
+  const lines = readFileSync2(path, "utf8").split(/\r?\n/);
+  const starts = lines.flatMap((line, index) => line.trim() === "[[package]]" ? [index] : []);
+  let changed = false;
+  for (let block = 0;block < starts.length; block += 1) {
+    const start = starts[block];
+    const end = starts[block + 1] ?? lines.length;
+    const nameLine = lines.slice(start, end).find((line) => /^\s*name\s*=/.test(line));
+    const name = nameLine ? readTomlString(nameLine, "name") : undefined;
+    const target = name ? findReleasedName(name, releasedVersions) : undefined;
+    const hasSource = lines.slice(start, end).some((line) => /^\s*source\s*=/.test(line));
+    if (target && !hasSource) {
+      const versionIndex = lines.findIndex((line, index) => index >= start && index < end && /^\s*version\s*=/.test(line));
+      if (versionIndex < 0)
+        throw new HooversionError(`${path} package ${name} has no version field`);
+      const version = releasedVersions.get(target);
+      const updatedVersion = lines[versionIndex].replace(/=\s*["'][^"']+["']/, `= "${version}"`);
+      if (updatedVersion !== lines[versionIndex]) {
+        lines[versionIndex] = updatedVersion;
+        changed = true;
+      }
+    }
+    let inDependencies = false;
+    for (let index = start;index < end; index += 1) {
+      if (/^\s*dependencies\s*=\s*\[/.test(lines[index])) {
+        inDependencies = true;
+        if (/\]/.test(lines[index]))
+          inDependencies = false;
+        continue;
+      }
+      if (!inDependencies || hasSource)
+        continue;
+      lines[index] = lines[index].replace(/(["'])([^"']+) \d[^"']*\1/g, (full, quote, dependencyName) => {
+        const dependencyTarget = findReleasedName(dependencyName, releasedVersions);
+        if (!dependencyTarget || /\s\(/.test(full))
+          return full;
+        changed = true;
+        return `${quote}${dependencyName} ${releasedVersions.get(dependencyTarget)}${quote}`;
+      });
+      if (/\]/.test(lines[index]))
+        inDependencies = false;
+    }
+  }
+  if (changed)
+    writeFileSync2(path, lines.join(`
+`));
+}
+function changelogPathForPackage(pkg) {
+  return pkg.changelog || join2(dirname2(pkg.manifest), "CHANGELOG.md");
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// src/config.ts
+var configFiles = [
+  "hooversion.config.ts",
+  "hooversion.config.mjs",
+  "hooversion.config.js",
+  "hooversion.config.cjs",
+  "hooversion.config.json"
+];
+async function loadConfig(cwd, explicitPath) {
+  const configPath = explicitPath ? join3(cwd, explicitPath) : findConfigPath(cwd);
+  if (!configPath) {
+    throw new HooversionError("No hooversion config found. Run `hooversion init` first.");
+  }
+  let raw;
+  if (configPath.endsWith(".json")) {
+    raw = JSON.parse(readFileSync3(configPath, "utf8"));
+  } else {
+    const module = await import(`${pathToFileURL(configPath).href}?t=${Date.now()}`);
+    raw = module.default ?? module.config ?? module;
+  }
+  return normalizeConfig(cwd, raw);
+}
+function findConfigPath(cwd) {
+  return configFiles.map((name) => join3(cwd, name)).find((path) => existsSync3(path));
+}
+function normalizeConfig(cwd, raw) {
+  if (!raw.packages || raw.packages.length === 0) {
+    throw new HooversionError("Config must define at least one package.");
+  }
+  const packages = raw.packages.map((pkg) => normalizePackage(cwd, pkg));
+  const packageNames = new Map;
+  for (const pkg of packages) {
+    const normalizedName = normalizeGraphName(pkg.name);
+    const duplicate = packageNames.get(normalizedName);
+    if (duplicate) {
+      throw new HooversionError(`Duplicate package name after normalization: ${duplicate.name} and ${pkg.name}`);
+    }
+    packageNames.set(normalizedName, pkg);
+  }
+  const graph = new Map;
+  for (const pkg of packages) {
+    const dependencies = [];
+    for (const dependency of pkg.dependencies) {
+      const target = packageNames.get(normalizeGraphName(dependency));
+      if (!target) {
+        throw new HooversionError(`Package ${pkg.name} depends on unknown package ${dependency}`);
+      }
+      if (target === pkg) {
+        throw new HooversionError(`Package ${pkg.name} cannot depend on itself`);
+      }
+      dependencies.push(target.name);
+    }
+    pkg.dependencies = dependencies;
+    graph.set(normalizeGraphName(pkg.name), dependencies.map(normalizeGraphName));
+  }
+  assertAcyclicPackageGraph(packages, graph);
+  return {
+    ...raw,
+    branches: raw.branches ?? ["main"],
+    tagFormat: raw.tagFormat ?? "v${version}",
+    independentTagFormat: raw.independentTagFormat ?? "${name}@v${version}",
+    packages,
+    hooks: {
+      beforeRelease: raw.hooks?.beforeRelease ?? [],
+      afterVersion: raw.hooks?.afterVersion ?? [],
+      afterRelease: raw.hooks?.afterRelease ?? []
+    },
+    github: raw.github === false ? false : {
+      releases: raw.github?.releases ?? true,
+      repository: raw.github?.repository ?? "",
+      apiUrl: raw.github?.apiUrl ?? "https://api.github.com"
+    },
+    outputDir: raw.outputDir ?? ".hooversion",
+    push: raw.push ?? true
+  };
+}
+function detectPackages(cwd) {
+  const candidates = [];
+  if (existsSync3(join3(cwd, "package.json"))) {
+    candidates.push({ type: "node", path: ".", name: readJsonName(join3(cwd, "package.json")) });
+  }
+  if (existsSync3(join3(cwd, "Cargo.toml"))) {
+    candidates.push(...detectCargoPackages(cwd));
+  }
+  if (existsSync3(join3(cwd, "pyproject.toml"))) {
+    candidates.push({ type: "python", path: ".", name: readTomlName(join3(cwd, "pyproject.toml"), "project") });
+  }
+  if (existsSync3(join3(cwd, "version"))) {
+    candidates.push({ type: "version-file", path: ".", name: basename(cwd) });
+  }
+  const seen = new Set;
+  return candidates.filter((pkg) => {
+    const key = `${pkg.type}:${normalize(pkg.path)}`;
+    if (seen.has(key))
+      return false;
+    seen.add(key);
+    return true;
+  }).map((pkg) => normalizePackage(cwd, pkg));
+}
+function writeDefaultConfig(cwd, packages = detectPackages(cwd)) {
+  if (packages.length === 0) {
+    throw new HooversionError("Could not detect package.json, Cargo.toml, pyproject.toml, or version.");
+  }
+  const body = `export default {
+  branches: ["main"],
+  packages: [
+${packages.map((pkg) => `    {
+      name: ${JSON.stringify(pkg.name)},
+      path: ${JSON.stringify(pkg.path)},
+      type: ${JSON.stringify(pkg.type)},
+      manifest: ${JSON.stringify(pkg.manifest)},
+      changelog: ${JSON.stringify(pkg.changelog)},
+      scopes: ${JSON.stringify(pkg.scopes)},
+      dependencies: ${JSON.stringify(pkg.dependencies)},
+    },`).join(`
+`)}
+  ],
+  hooks: {
+    afterVersion: [],
+  },
+  github: {
+    releases: true,
+  },
+};
+`;
+  const path = join3(cwd, "hooversion.config.ts");
+  writeFileSync3(path, body);
+  return path;
+}
+function normalizePackage(cwd, pkg) {
+  const packagePath = normalizeRelative(pkg.path || ".");
+  const manifest = normalizeRelative(pkg.manifest ?? defaultManifestPath(pkg.type, packagePath));
+  const manifestPackage = { ...pkg, path: packagePath, manifest };
+  const info = readManifest(cwd, {
+    ...manifestPackage,
+    changelog: pkg.changelog ?? defaultChangelog(packagePath),
+    scopes: pkg.scopes ?? [],
+    dependencies: pkg.dependencies ?? [],
+    assets: pkg.assets ?? []
+  });
+  const name = (pkg.name || info.name).trim();
+  return {
+    ...pkg,
+    name,
+    path: packagePath,
+    type: pkg.type,
+    manifest,
+    changelog: normalizeRelative(pkg.changelog ?? defaultChangelog(packagePath)),
+    scopes: [...new Set([name, ...pkg.scopes ?? []])],
+    dependencies: (pkg.dependencies ?? []).map((dependency) => dependency.trim()),
+    assets: pkg.assets ?? []
+  };
+}
+function normalizeGraphName(name) {
+  return name.trim().toLowerCase();
+}
+function assertAcyclicPackageGraph(packages, graph) {
+  const state = new Map;
+  const stack = [];
+  const visit = (name) => {
+    if (state.get(name) === "visited")
+      return;
+    if (state.get(name) === "visiting") {
+      const cycleStart = stack.indexOf(name);
+      throw new HooversionError(`Package dependency cycle detected: ${[...stack.slice(cycleStart), name].join(" -> ")}`);
+    }
+    state.set(name, "visiting");
+    stack.push(name);
+    for (const dependency of graph.get(name) ?? [])
+      visit(dependency);
+    stack.pop();
+    state.set(name, "visited");
+  };
+  for (const pkg of packages)
+    visit(normalizeGraphName(pkg.name));
+}
+function detectCargoPackages(cwd) {
+  const root = join3(cwd, "Cargo.toml");
+  const text = readFileSync3(root, "utf8");
+  const packages = [];
+  if (/\[package\]/.test(text)) {
+    packages.push({ type: "rust", path: ".", name: readTomlName(root, "package") });
+  }
+  const members = readTomlArray(text, "workspace", "members");
+  for (const member of members) {
+    const manifest = join3(cwd, member, "Cargo.toml");
+    if (existsSync3(manifest)) {
+      packages.push({
+        type: "rust",
+        path: normalizeRelative(member),
+        name: readTomlName(manifest, "package")
+      });
+    }
+  }
+  return packages;
+}
+function defaultChangelog(packagePath) {
+  return packagePath === "." ? "CHANGELOG.md" : join3(packagePath, "CHANGELOG.md");
+}
+function readJsonName(path) {
+  const json = JSON.parse(readFileSync3(path, "utf8"));
+  if (!json.name)
+    throw new HooversionError(`${path} must contain a name`);
+  return json.name;
+}
+function readTomlName(path, sectionName) {
+  const section = readTomlSection(readFileSync3(path, "utf8"), sectionName);
+  const name = readTomlString2(section, "name");
+  if (!name)
+    throw new HooversionError(`${path} [${sectionName}] must contain a name`);
+  return name;
+}
+function readTomlSection(text, sectionName) {
+  const lines = text.split(/\r?\n/);
+  let inSection = false;
+  const section = [];
+  for (const line of lines) {
+    const heading = /^\s*\[([^\]]+)\]\s*$/.exec(line);
+    if (heading) {
+      if (inSection)
+        break;
+      inSection = heading[1] === sectionName;
+      continue;
+    }
+    if (inSection)
+      section.push(line);
+  }
+  return section.join(`
+`);
+}
+function readTomlString2(section, key) {
+  const match = new RegExp(`^\\s*${key}\\s*=\\s*["']([^"']+)["']`, "m").exec(section);
+  return match?.[1];
+}
+function readTomlArray(text, sectionName, key) {
+  const section = readTomlSection(text, sectionName);
+  const oneLine = new RegExp(`^\\s*${key}\\s*=\\s*\\[([^\\]]*)\\]`, "m").exec(section);
+  if (oneLine) {
+    return Array.from(oneLine[1].matchAll(/["']([^"']+)["']/g)).map((match) => match[1]);
+  }
+  const lines = section.split(/\r?\n/);
+  const result = [];
+  let inArray = false;
+  for (const line of lines) {
+    if (!inArray && new RegExp(`^\\s*${key}\\s*=\\s*\\[`).test(line)) {
+      inArray = true;
+    }
+    if (inArray) {
+      for (const match of line.matchAll(/["']([^"']+)["']/g))
+        result.push(match[1]);
+      if (/\]/.test(line))
+        break;
+    }
+  }
+  return result;
+}
+function normalizeRelative(path) {
+  const normalized = normalize(path);
+  if (normalized.startsWith("..")) {
+    throw new HooversionError(`Path must stay inside the repository: ${path}`);
+  }
+  return normalized === "" ? "." : normalized;
+}
+function relativeToCwd(cwd, path) {
+  return normalizeRelative(relative(cwd, path));
+}
+// src/git.ts
+import { relative as relative2, resolve, sep } from "path";
+
+// src/process.ts
+import { spawnSync } from "child_process";
+function runCommand(command, args, cwd, env) {
+  const result = spawnSync(command, args, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? ""
+  };
+}
+function runShell(command, cwd, env) {
+  const result = spawnSync(command, {
+    cwd,
+    encoding: "utf8",
+    env: env ?? process.env,
+    shell: (env ?? process.env).SHELL ?? "/bin/sh"
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? "",
+    stderr: result.stderr ?? ""
+  };
+}
+
+// src/git.ts
+function commandEnv(auth) {
+  return auth ? { ...process.env, ...auth } : undefined;
+}
+function git(cwd, args, allowFailure = false, auth) {
+  const result = runCommand("git", args, cwd, commandEnv(auth));
+  if (result.code !== 0 && !allowFailure) {
+    throw new HooversionError(`git ${args.join(" ")} failed:
+${result.stderr || result.stdout}`);
+  }
+  return result.stdout.trimEnd();
+}
+function isGitRepository(cwd) {
+  return runCommand("git", ["rev-parse", "--is-inside-work-tree"], cwd).code === 0;
+}
+function getCurrentBranch(cwd) {
+  const branch = git(cwd, ["branch", "--show-current"]).trim();
+  if (branch)
+    return branch;
+  if (process.env.GITHUB_HEAD_REF)
+    return process.env.GITHUB_HEAD_REF;
+  if (process.env.GITHUB_REF_TYPE !== "tag" && process.env.GITHUB_REF_NAME)
+    return process.env.GITHUB_REF_NAME;
+  return git(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).trim();
+}
+function ensureCleanWorkingTree(cwd, ignoredPaths = [], scopedOutputDir) {
+  const ignored = new Set(ignoredPaths.map((path) => resolve(cwd, path)));
+  const unexpected = git(cwd, ["status", "--porcelain", "--untracked-files=all"]).split(`
+`).filter((line) => {
+    if (!line.trim())
+      return false;
+    const path = line.slice(3).trim();
+    return !ignored.has(resolve(cwd, path));
+  });
+  if (scopedOutputDir) {
+    const resolvedOutputDir = resolve(cwd, scopedOutputDir);
+    const relativeOutputDir = relative2(cwd, resolvedOutputDir);
+    if (relativeOutputDir && !relativeOutputDir.startsWith(`..${sep}`) && relativeOutputDir !== "..") {
+      const ignoredOutputFiles = git(cwd, ["ls-files", "--others", "--ignored", "--exclude-standard", "--", relativeOutputDir], true).split(`
+`).filter((path) => path.trim() && !ignored.has(resolve(cwd, path.trim())));
+      unexpected.push(...ignoredOutputFiles.map((path) => `?? ${path}`));
+    }
+  }
+  if (unexpected.length > 0) {
+    throw new HooversionError(`Working tree must be clean before release:
+${unexpected.join(`
+`)}`);
+  }
+}
+function getLatestTag(cwd, pattern) {
+  const output = git(cwd, ["describe", "--tags", "--abbrev=0", "--match", pattern], true).trim();
+  return output || undefined;
+}
+function tagExists(cwd, tag) {
+  return runCommand("git", ["rev-parse", "--verify", "--quiet", `refs/tags/${tag}`], cwd).code === 0;
+}
+function getHeadSha(cwd) {
+  return git(cwd, ["rev-parse", "HEAD"]).trim();
+}
+function getRefSha(cwd, ref) {
+  const commitRef = ref.startsWith("refs/tags/") ? `${ref}^{commit}` : ref;
+  const result = runCommand("git", ["rev-parse", "--verify", "--quiet", commitRef], cwd);
+  return result.code === 0 ? result.stdout.trim() : undefined;
+}
+function getRemoteBranchSha(cwd, branch, auth) {
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote)
+    return;
+  const output = git(cwd, ["ls-remote", "origin", `refs/heads/${branch}`], true, auth).trim();
+  return output ? output.split(/\s+/, 1)[0] : "";
+}
+function getCommitMessage(cwd, ref = "HEAD") {
+  return git(cwd, ["show", "-s", "--format=%B", ref]).trimEnd();
+}
+function pushRelease(cwd, branch, tags, auth) {
+  git(cwd, ["push", "--atomic", "origin", `HEAD:${branch}`, ...tags], false, auth);
+}
+function getCommits(cwd, fromRef, toRef = "HEAD") {
+  const range = fromRef ? `${fromRef}..${toRef}` : toRef;
+  const revList = git(cwd, ["rev-list", "--reverse", range], true).trim();
+  if (!revList)
+    return [];
+  return revList.split(`
+`).map((hash) => {
+    const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
+    const body = git(cwd, ["show", "-s", "--format=%b", hash]);
+    const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
+`).map((file) => file.trim()).filter(Boolean);
+    return { hash, subject, body, files };
+  });
+}
+function getLastCommit(cwd) {
+  const hash = git(cwd, ["rev-parse", "HEAD"]).trim();
+  const subject = git(cwd, ["show", "-s", "--format=%s", hash]);
+  const body = git(cwd, ["show", "-s", "--format=%b", hash]);
+  const files = git(cwd, ["diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash], true).split(`
+`).map((file) => file.trim()).filter(Boolean);
+  return { hash, subject, body, files };
+}
+function getCommitRange(cwd, fromRef, toRef = "HEAD") {
+  return getCommits(cwd, fromRef, toRef);
+}
+function createReleaseCommit(cwd, message) {
+  git(cwd, ["add", "--all"]);
+  const status = git(cwd, ["status", "--porcelain"]);
+  if (!status.trim())
+    return;
+  git(cwd, ["commit", "-m", message]);
+}
+function createAnnotatedTag(cwd, tag, message) {
+  git(cwd, ["tag", "-a", tag, "-m", message]);
+}
+function getOriginRepository(cwd) {
+  const remote = git(cwd, ["config", "--get", "remote.origin.url"], true).trim();
+  if (!remote)
+    return;
+  const sshMatch = /^git@[^:]+:([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
+  if (sshMatch)
+    return sshMatch[1];
+  const httpsMatch = /^https?:\/\/[^/]+\/([^/]+\/[^/.]+)(?:\.git)?$/.exec(remote);
+  if (httpsMatch)
+    return httpsMatch[1];
+  return;
+}
+
+// src/semver.ts
+var versionPattern = /^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
+function parseVersion(version) {
+  const match = versionPattern.exec(version.trim());
+  if (!match) {
+    throw new HooversionError(`Invalid semantic version: ${version}`);
+  }
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3])
+  };
+}
+function bumpVersion(version, releaseType) {
+  const parts = parseVersion(version);
+  if (releaseType === "major") {
+    return `${parts.major + 1}.0.0`;
+  }
+  if (releaseType === "minor") {
+    return `${parts.major}.${parts.minor + 1}.0`;
+  }
+  return `${parts.major}.${parts.minor}.${parts.patch + 1}`;
+}
+function highestReleaseType(types) {
+  let result;
+  for (const type of types) {
+    if (!type)
+      continue;
+    if (type === "major")
+      return "major";
+    if (type === "minor")
+      result = result === "major" ? result : "minor";
+    if (type === "patch" && !result)
+      result = "patch";
+  }
+  return result;
+}
+function minReleaseType(current, minimum) {
+  return highestReleaseType([current, minimum]) ?? minimum;
+}
+
+// src/routing.ts
+import { relative as relative3 } from "path";
+function directAffectedPackages(commit, packages) {
+  const affected = new Set;
+  const scoped = scopeTargets(commit.scope, packages);
+  if (scoped.size > 0) {
+    for (const name of scoped)
+      affected.add(name);
+  }
+  for (const file of commit.files) {
+    for (const pkg of packages) {
+      if (fileBelongsToPackage(file, pkg, packages))
+        affected.add(pkg.name);
+    }
+  }
+  return affected;
+}
+function propagateDependencies(affected, packages) {
+  const result = new Set(affected);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pkg of packages) {
+      if (result.has(pkg.name))
+        continue;
+      if (pkg.dependencies.some((dependency) => result.has(dependency))) {
+        result.add(pkg.name);
+        changed = true;
+      }
+    }
+  }
+  return result;
+}
+function scopeTargets(scope, packages) {
+  const result = new Set;
+  if (!scope)
+    return result;
+  const parts = scope.split(",").map((part) => part.trim()).filter(Boolean);
+  for (const part of parts) {
+    for (const pkg of packages) {
+      if (pkg.scopes.includes(part) || pkg.name === part) {
+        result.add(pkg.name);
+      }
+    }
+  }
+  return result;
+}
+function fileBelongsToPackage(file, pkg, packages) {
+  if (pkg.path === ".") {
+    return !packages.some((other) => other.path !== "." && isInside(file, other.path));
+  }
+  return isInside(file, pkg.path);
+}
+function isInside(file, packagePath) {
+  const rel = relative3(packagePath, file);
+  return rel === "" || !rel.startsWith("..") && rel !== ".";
+}
+
+// src/plan.ts
+function renderTag(format, pkg, version) {
+  return format.replaceAll("${name}", pkg.name).replaceAll("${version}", version);
+}
+function tagPatternForPackage(config, pkg) {
+  const format = config.packages.length === 1 ? config.tagFormat : config.independentTagFormat;
+  return format.replaceAll("${name}", pkg.name).replaceAll("${version}", "[0-9]*");
+}
+function tagForPackage(config, pkg, version) {
+  return renderTag(config.packages.length === 1 ? config.tagFormat : config.independentTagFormat, pkg, version);
+}
+function createReleasePlan(cwd, config) {
+  const branch = getCurrentBranch(cwd);
+  const sourceSha = git(cwd, ["rev-parse", "HEAD"]).trim();
+  const independent = config.packages.length > 1;
+  return independent ? createIndependentPlan(cwd, config, branch, sourceSha) : createSinglePackagePlan(cwd, config, branch, sourceSha);
+}
+function createSinglePackagePlan(cwd, config, branch, sourceSha) {
+  const pkg = config.packages[0];
+  const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
+  const commits = parseCommits(getCommits(cwd, latestTag, sourceSha)).filter((commit) => !commit.ignored);
+  const releaseType = highestReleaseType(commits.map((commit) => commit.releaseType));
+  const releases = releaseType ? [buildRelease(cwd, config, pkg, commits, releaseType, latestTag, false)] : [];
+  return { cwd, branch, sourceSha, independent: false, releases, unmatchedCommits: [] };
+}
+function createIndependentPlan(cwd, config, branch, sourceSha) {
+  const latestTags = new Map;
+  const candidateCommits = new Map;
+  for (const pkg of config.packages) {
+    const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
+    latestTags.set(pkg.name, latestTag);
+    const commits = parseCommits(getCommits(cwd, latestTag, sourceSha)).filter((commit) => !commit.ignored);
+    for (const commit of commits) {
+      candidateCommits.set(commit.hash, commit);
+    }
+  }
+  const directAffectedByCommit = new Map;
+  const releaseTypes = new Map;
+  const releaseCommits = new Map;
+  for (const commit of candidateCommits.values()) {
+    const direct = directAffectedPackages(commit, config.packages);
+    directAffectedByCommit.set(commit.hash, direct);
+    if (!commit.releaseType)
+      continue;
+    for (const packageName of direct) {
+      releaseTypes.set(packageName, highestReleaseType([releaseTypes.get(packageName), commit.releaseType]));
+      const commits = releaseCommits.get(packageName) ?? [];
+      commits.push(commit);
+      releaseCommits.set(packageName, commits);
+    }
+  }
+  const unmatchedCommits = Array.from(candidateCommits.values()).filter((commit) => commit.releaseType && (directAffectedByCommit.get(commit.hash)?.size ?? 0) === 0);
+  if (unmatchedCommits.length > 0) {
+    return { cwd, branch, sourceSha, independent: true, releases: [], unmatchedCommits };
+  }
+  const dependencyTriggered = new Set;
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const pkg of config.packages) {
+      if (releaseTypes.has(pkg.name))
+        continue;
+      if (!pkg.dependencies.some((dependency) => releaseTypes.has(dependency)))
+        continue;
+      releaseTypes.set(pkg.name, "patch");
+      dependencyTriggered.add(pkg.name);
+      changed = true;
+    }
+  }
+  const releases = [];
+  for (const pkg of config.packages) {
+    const releaseType = releaseTypes.get(pkg.name);
+    if (!releaseType)
+      continue;
+    releases.push(buildRelease(cwd, config, pkg, uniqueCommits(releaseCommits.get(pkg.name) ?? []), releaseType, latestTags.get(pkg.name), dependencyTriggered.has(pkg.name)));
+  }
+  return { cwd, branch, sourceSha, independent: true, releases, unmatchedCommits: [] };
+}
+function buildRelease(cwd, config, pkg, commits, releaseType, latestTag, dependencyTriggered) {
+  const currentVersion = readManifest(cwd, pkg).version;
+  const nextVersion = bumpVersion(currentVersion, releaseType);
+  const tag = tagForPackage(config, pkg, nextVersion);
+  const releaseWithoutNotes = {
+    package: pkg,
+    currentVersion,
+    nextVersion,
+    releaseType,
+    tag,
+    latestTag,
+    commits,
+    notes: "",
+    changelogPath: pkg.changelog,
+    dependencyTriggered
+  };
+  const notes = generateReleaseNotes(releaseWithoutNotes);
+  return { ...releaseWithoutNotes, notes };
+}
+function uniqueCommits(commits) {
+  const seen = new Set;
+  return commits.filter((commit) => {
+    if (seen.has(commit.hash))
+      return false;
+    seen.add(commit.hash);
+    return true;
+  });
+}
+
+// src/doctor.ts
+function runDoctor(cwd, config) {
+  const result = { errors: [], warnings: [], info: [] };
+  if (config.branches.length === 0 || config.branches.some((branch2) => !branch2.trim())) {
+    result.errors.push("Config must define at least one non-empty release branch.");
+  }
+  if (config.packages.length === 0) {
+    result.errors.push("Config must define at least one package.");
+  }
+  if (result.errors.length > 0)
+    return result;
+  if (!isGitRepository(cwd)) {
+    result.errors.push("Current directory is not a git repository.");
+    return result;
+  }
+  if (!git(cwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], true).trim()) {
+    result.errors.push("Repository has no resolvable HEAD commit.");
+    return result;
+  }
+  const branch = getCurrentBranch(cwd);
+  if (!config.branches.includes(branch)) {
+    result.warnings.push(`Current branch '${branch}' is not a configured release branch.`);
+  } else {
+    result.info.push(`Release branch: ${branch}`);
+  }
+  for (const pkg of config.packages) {
+    const manifest = readManifest(cwd, pkg);
+    result.info.push(`${pkg.name}: manifest version ${manifest.version}`);
+    const latestTag = getLatestTag(cwd, tagPatternForPackage(config, pkg));
+    if (!latestTag) {
+      result.warnings.push(`${pkg.name}: no release tag found; first release will use full reachable history.`);
+      continue;
+    }
+    const tagVersion = extractTagVersion(latestTag);
+    result.info.push(`${pkg.name}: latest tag ${latestTag}`);
+    if (tagVersion && tagVersion !== manifest.version) {
+      result.warnings.push(`${pkg.name}: manifest version ${manifest.version} differs from latest tag version ${tagVersion}.`);
+    }
+  }
+  if (config.github !== false && config.github.releases && !process.env.GITHUB_TOKEN && !process.env.GH_TOKEN) {
+    result.warnings.push("GITHUB_TOKEN or GH_TOKEN is not set; `release` cannot create GitHub releases.");
+  }
+  return result;
+}
+function extractTagVersion(tag) {
+  return /(?:^|@)v(\d+\.\d+\.\d+(?:[-+][^\s]+)?)$/.exec(tag)?.[1];
+}
+// src/release.ts
+import { mkdirSync as mkdirSync3 } from "fs";
+import { join as join6 } from "path";
+
+// src/github.ts
+import { readFileSync as readFileSync4 } from "fs";
+import { basename as basename2, isAbsolute, join as join4 } from "path";
+async function publishGitHubRelease(cwd, config, release, options = {}) {
+  if (config.github === false || !config.github.releases)
+    return;
+  const token = options.token || process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+  if (!token) {
+    throw new HooversionError("GITHUB_TOKEN or GH_TOKEN is required to create GitHub releases.");
+  }
+  const repository = config.github.repository || getOriginRepository(cwd);
+  if (!repository) {
+    throw new HooversionError("Could not determine GitHub repository. Set github.repository in hooversion config.");
+  }
+  const apiUrl = config.github.apiUrl.replace(/\/$/, "");
+  const releaseName = `${release.package.name} ${release.nextVersion}`;
+  const existing = await githubFetch(`${apiUrl}/repos/${repository}/releases/tags/${encodeURIComponent(release.tag)}`, token, { method: "GET" }, true);
+  let response;
+  let existingAssetNames = new Set;
+  if (existing) {
+    const matches = existing.tag_name === release.tag && existing.name === releaseName && existing.body === release.notes && existing.draft === false && existing.prerelease === false;
+    if (!matches) {
+      throw new HooversionError(`GitHub release already exists for tag ${release.tag} with different metadata.`);
+    }
+    response = existing;
+    existingAssetNames = releaseAssetNames(existing.assets);
+  } else {
+    response = await githubFetch(`${apiUrl}/repos/${repository}/releases`, token, {
+      method: "POST",
+      body: JSON.stringify({
+        tag_name: release.tag,
+        name: releaseName,
+        body: release.notes,
+        draft: false,
+        prerelease: false
+      }),
+      headers: {
+        "content-type": "application/json"
+      }
+    });
+  }
+  await uploadMissingAssets(response.upload_url, apiUrl, token, cwd, release.package.assets, existingAssetNames);
+  return response.html_url;
+}
+async function uploadMissingAssets(uploadUrlTemplate, apiUrl, token, cwd, assets, existingAssetNames) {
+  const missingAssets = new Map;
+  for (const asset of assets) {
+    const name = basename2(asset);
+    if (!existingAssetNames.has(name) && !missingAssets.has(name)) {
+      missingAssets.set(name, isAbsolute(asset) ? asset : join4(cwd, asset));
+    }
+  }
+  if (missingAssets.size === 0)
+    return;
+  const uploadUrl = validateGitHubUploadUrl(uploadUrlTemplate, apiUrl);
+  for (const [name, path] of missingAssets) {
+    await uploadAsset(uploadUrl, token, path, name);
+  }
+}
+function releaseAssetNames(assets) {
+  if (assets === undefined)
+    return new Set;
+  if (!Array.isArray(assets)) {
+    throw new HooversionError("GitHub release response has invalid assets.");
+  }
+  const assetNames = new Set;
+  for (const asset of assets) {
+    if (typeof asset !== "object" || asset === null || !("name" in asset) || typeof asset.name !== "string") {
+      throw new HooversionError("GitHub release response has invalid assets.");
+    }
+    assetNames.add(basename2(asset.name));
+  }
+  return assetNames;
+}
+function validateGitHubUploadUrl(uploadUrlTemplate, apiUrl) {
+  if (typeof uploadUrlTemplate !== "string") {
+    throw new HooversionError("Invalid GitHub release upload URL.");
+  }
+  const uploadUrl = uploadUrlTemplate.replace(/\{\?[^}]*\}$/, "");
+  if (uploadUrl.includes("{") || uploadUrl.includes("}")) {
+    throw new HooversionError(`Invalid GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  let parsed;
+  try {
+    parsed = new URL(uploadUrl);
+  } catch {
+    throw new HooversionError(`Invalid GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  const authority = uploadUrl.slice(uploadUrl.indexOf("//") + 2).split(/[/?#]/, 1)[0] ?? "";
+  const host = authority.slice(authority.lastIndexOf("@") + 1);
+  const hasExplicitPort = host.startsWith("[") ? host.includes("]:") : host.includes(":");
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash || hasExplicitPort) {
+    throw new HooversionError(`Invalid GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  const apiOrigin = new URL(apiUrl).origin;
+  const trusted = parsed.origin === apiOrigin || apiOrigin === "https://api.github.com" && parsed.origin === "https://uploads.github.com";
+  if (!trusted) {
+    throw new HooversionError(`Untrusted GitHub release upload URL: ${uploadUrlTemplate}`);
+  }
+  return parsed.toString();
+}
+async function uploadAsset(uploadUrl, token, path, name) {
+  const data = readFileSync4(path);
+  await githubFetch(`${uploadUrl}?name=${encodeURIComponent(name)}`, token, {
+    method: "POST",
+    body: data,
+    headers: {
+      "content-type": "application/octet-stream"
+    }
+  });
+}
+async function githubFetch(url, token, init, notFoundIsEmpty = false) {
+  const response = await fetch(url, {
+    ...init,
+    headers: {
+      accept: "application/vnd.github+json",
+      authorization: `Bearer ${token}`,
+      "x-github-api-version": "2022-11-28",
+      ...init.headers ?? {}
+    }
+  });
+  if (response.status === 404 && notFoundIsEmpty)
+    return;
+  if (!response.ok) {
+    const body = await response.text();
+    throw new HooversionError(`GitHub API request failed (${response.status} ${response.statusText}): ${body}`);
+  }
+  return await response.json();
+}
+
+// src/output.ts
+import { appendFileSync, existsSync as existsSync4, lstatSync, mkdirSync as mkdirSync2, readFileSync as readFileSync5, unlinkSync, writeFileSync as writeFileSync4 } from "fs";
+import { join as join5, relative as relative4, sep as sep2 } from "path";
+function getReleaseOutputPaths(cwd, outputDir = ".hooversion") {
+  const resolvedOutputDir = join5(cwd, outputDir);
+  const outputsPath = join5(resolvedOutputDir, "outputs.json");
+  const paths = new Set([outputsPath, join5(cwd, ".release-version")]);
+  if (existsSync4(outputsPath) && lstatSync(outputsPath).isFile()) {
+    try {
+      const payload = JSON.parse(readFileSync5(outputsPath, "utf8"));
+      for (const release of payload.releases ?? []) {
+        if (typeof release.tag !== "string")
+          continue;
+        const notePath = join5(resolvedOutputDir, `${sanitizeFileName(release.tag)}-notes.md`);
+        const noteRelativePath = relative4(resolvedOutputDir, notePath);
+        if (noteRelativePath && noteRelativePath !== ".." && !noteRelativePath.startsWith(`..${sep2}`)) {
+          paths.add(notePath);
+        }
+      }
+    } catch {}
+  }
+  return [...paths];
+}
+function clearReleaseOutputs(cwd, outputDir = ".hooversion") {
+  for (const outputPath of getReleaseOutputPaths(cwd, outputDir)) {
+    if (existsSync4(outputPath) && lstatSync(outputPath).isFile())
+      unlinkSync(outputPath);
+  }
+}
+function writeReleaseOutputs(cwd, config, plan) {
+  clearReleaseOutputs(cwd, config.outputDir);
+  const outputDir = join5(cwd, config.outputDir);
+  mkdirSync2(outputDir, { recursive: true });
+  for (const release of plan.releases) {
+    writeFileSync4(join5(outputDir, `${sanitizeFileName(release.tag)}-notes.md`), `${release.notes}
+`);
+  }
+  const payload = {
+    published: plan.releases.length > 0,
+    releases: plan.releases.map((release) => ({
+      name: release.package.name,
+      version: release.nextVersion,
+      tag: release.tag,
+      type: release.releaseType,
+      notesPath: `${config.outputDir}/${sanitizeFileName(release.tag)}-notes.md`
+    }))
+  };
+  writeFileSync4(join5(outputDir, "outputs.json"), `${JSON.stringify(payload, null, 2)}
+`);
+  if (plan.releases.length === 1) {
+    writeFileSync4(join5(cwd, ".release-version"), `${plan.releases[0].nextVersion}
+`);
+  } else {
+    const versionPath = join5(cwd, ".release-version");
+    if (existsSync4(versionPath) && lstatSync(versionPath).isFile())
+      unlinkSync(versionPath);
+  }
+  if (process.env.GITHUB_OUTPUT) {
+    const lines = [`published=${payload.published}`, `releases_json=${JSON.stringify(payload.releases)}`];
+    if (plan.releases.length === 1) {
+      lines.push(`version=${plan.releases[0].nextVersion}`, `tag=${plan.releases[0].tag}`);
+    }
+    appendFileSync(process.env.GITHUB_OUTPUT, `${lines.join(`
+`)}
+`);
+  }
+}
+function sanitizeFileName(value) {
+  return value.replace(/[^a-zA-Z0-9._@-]/g, "-");
+}
+
+// src/release.ts
+async function executeRelease(cwd, config, plan, options = {}) {
+  const effectivePlan = deriveResumablePlan(cwd, config, plan) ?? plan;
+  const resumable = isResumableRelease(cwd, effectivePlan);
+  if (resumable) {
+    verifyResumableRemote(cwd, effectivePlan, options.gitAuth);
+  } else {
+    verifySource(cwd, effectivePlan, options.gitAuth);
+  }
+  validatePlan(cwd, config, effectivePlan, resumable);
+  if (options.dryRun)
+    return { plan: effectivePlan, published: false };
+  ensureCleanWorkingTree(cwd, getReleaseOutputPaths(cwd, config.outputDir), config.outputDir);
+  clearReleaseOutputs(cwd, config.outputDir);
+  if (effectivePlan.releases.length === 0) {
+    writeReleaseOutputs(cwd, config, effectivePlan);
+    return { plan: effectivePlan, published: false };
+  }
+  if (!resumable) {
+    runHooks(cwd, config.hooks.beforeRelease);
+    const releasedVersions = new Map(effectivePlan.releases.map((release) => [release.package.name, release.nextVersion]));
+    for (const release of effectivePlan.releases) {
+      updateManifestVersion(cwd, release.package, release.nextVersion);
+    }
+    updateLocalDependencyVersions(cwd, config.packages, releasedVersions);
+    for (const release of effectivePlan.releases) {
+      updateChangelog(cwd, release);
+    }
+    runHooks(cwd, config.hooks.afterVersion);
+    createReleaseCommit(cwd, releaseCommitMessage(effectivePlan));
+    for (const release of effectivePlan.releases) {
+      createAnnotatedTag(cwd, release.tag, `${release.package.name} ${release.nextVersion}`);
+    }
+  }
+  const shouldPush = options.push ?? config.push;
+  if (shouldPush) {
+    pushRelease(cwd, effectivePlan.branch, effectivePlan.releases.map((release) => release.tag), options.gitAuth);
+  }
+  mkdirSync3(join6(cwd, config.outputDir), { recursive: true });
+  if (options.github ?? true) {
+    for (const release of effectivePlan.releases) {
+      await publishGitHubRelease(cwd, config, release, { token: options.githubToken });
+    }
+  }
+  writeReleaseOutputs(cwd, config, effectivePlan);
+  runHooks(cwd, config.hooks.afterRelease);
+  return { plan: effectivePlan, published: true };
+}
+function validatePlan(cwd, config, plan, resumable = isResumableRelease(cwd, plan)) {
+  if (!config.branches.includes(plan.branch)) {
+    throw new HooversionError(`Current branch '${plan.branch}' is not a release branch. Allowed branches: ${config.branches.join(", ")}`);
+  }
+  if (plan.unmatchedCommits.length > 0) {
+    const details = plan.unmatchedCommits.map((commit) => `${commit.hash.slice(0, 7)} ${commit.subject}`).join(`
+`);
+    throw new HooversionError(`Release-worthy commits could not be assigned to a package:
+${details}`);
+  }
+  for (const release of plan.releases) {
+    if (resumable)
+      continue;
+    if (tagExists(cwd, release.tag)) {
+      throw new HooversionError(`Tag already exists: ${release.tag}`);
+    }
+  }
+}
+function releaseCommitMessage(plan) {
+  if (plan.releases.length === 1) {
+    const release = plan.releases[0];
+    return `chore(release): ${release.package.name} ${release.nextVersion}
+
+${release.notes}`;
+  }
+  const summary = plan.releases.map((release) => `${release.package.name}@${release.nextVersion}`).join(", ");
+  const notes = plan.releases.map((release) => `# ${release.package.name} ${release.nextVersion}
+
+${release.notes}`).join(`
+
+`);
+  return `chore(release): ${summary}
+
+${notes}`;
+}
+function runHooks(cwd, hooks) {
+  for (const hook of hooks) {
+    const result = runShell(hook, cwd);
+    if (result.code !== 0) {
+      throw new HooversionError(`Hook failed: ${hook}
+${result.stderr || result.stdout}`);
+    }
+  }
+}
+function deriveResumablePlan(cwd, config, plan) {
+  if (plan.releases.length > 0)
+    return;
+  const head = getHeadSha(cwd);
+  const sourceSha = getRefSha(cwd, "HEAD^");
+  if (!sourceSha)
+    return;
+  const taggedPackages = config.packages.map((pkg) => {
+    const nextVersion = readManifest(cwd, pkg).version;
+    const tag = tagForPackage(config, pkg, nextVersion);
+    return getRefSha(cwd, `refs/tags/${tag}`) === head ? { pkg, nextVersion, tag } : undefined;
+  }).filter((release) => Boolean(release));
+  if (taggedPackages.length === 0)
+    return;
+  const message = getCommitMessage(cwd);
+  const separator = message.indexOf(`
+`);
+  const subject = separator < 0 ? message : message.slice(0, separator);
+  const body = separator < 0 ? "" : message.slice(separator).trim();
+  const expectedSubject = taggedPackages.length === 1 ? `chore(release): ${taggedPackages[0].pkg.name} ${taggedPackages[0].nextVersion}` : `chore(release): ${taggedPackages.map(({ pkg, nextVersion }) => `${pkg.name}@${nextVersion}`).join(", ")}`;
+  if (subject !== expectedSubject)
+    return;
+  const transitions = taggedPackages.map(({ pkg, nextVersion }) => inferReleaseTransition(cwd, config, pkg, nextVersion));
+  if (transitions.some((transition) => !transition))
+    return;
+  const releases = taggedPackages.map(({ pkg, nextVersion, tag }, index) => {
+    const transition = transitions[index];
+    const marker = `# ${pkg.name} ${nextVersion}
+
+`;
+    const markerStart = body.indexOf(marker);
+    const notes = taggedPackages.length === 1 ? body : markerStart < 0 ? "" : body.slice(markerStart + marker.length).split(/\n\n# /, 1)[0];
+    return {
+      package: pkg,
+      currentVersion: transition.currentVersion,
+      nextVersion,
+      releaseType: transition.releaseType,
+      tag,
+      commits: [],
+      notes,
+      changelogPath: pkg.changelog,
+      dependencyTriggered: false
+    };
+  });
+  const reconstructed = {
+    ...plan,
+    sourceSha,
+    releases,
+    unmatchedCommits: []
+  };
+  return getCommitMessage(cwd) === releaseCommitMessage(reconstructed) ? reconstructed : undefined;
+}
+function inferReleaseTransition(cwd, config, pkg, nextVersion) {
+  const parts = parseVersion(nextVersion);
+  const candidates = [
+    ["major", `${parts.major - 1}.0.0`],
+    ["minor", `${parts.major}.${parts.minor - 1}.0`],
+    ["patch", `${parts.major}.${parts.minor}.${parts.patch - 1}`]
+  ];
+  for (const [releaseType, currentVersion] of candidates) {
+    if (parts.major < 1 && releaseType === "major")
+      continue;
+    if (parts.minor < 1 && releaseType === "minor")
+      continue;
+    if (parts.patch < 1 && releaseType === "patch")
+      continue;
+    const tag = tagForPackage(config, pkg, currentVersion);
+    if (getRefSha(cwd, `refs/tags/${tag}`))
+      return { currentVersion, releaseType };
+  }
+  return;
+}
+function isResumableRelease(cwd, plan) {
+  if (plan.releases.length === 0)
+    return false;
+  const head = getHeadSha(cwd);
+  if (head === plan.sourceSha)
+    return false;
+  if (getRefSha(cwd, "HEAD^") !== plan.sourceSha)
+    return false;
+  if (getCommitMessage(cwd) !== releaseCommitMessage(plan))
+    return false;
+  return plan.releases.every((release) => getRefSha(cwd, `refs/tags/${release.tag}`) === head);
+}
+function verifySource(cwd, plan, gitAuth) {
+  const head = getHeadSha(cwd);
+  if (head !== plan.sourceSha) {
+    throw new HooversionError(`Release source changed locally: expected ${plan.sourceSha}, found ${head}.`);
+  }
+  const remote = getRemoteBranchSha(cwd, plan.branch, gitAuth);
+  if (remote !== undefined && remote !== plan.sourceSha) {
+    throw new HooversionError(`Release source changed remotely: expected ${plan.sourceSha}, found ${remote || "missing"}.`);
+  }
+}
+function verifyResumableRemote(cwd, plan, gitAuth) {
+  const head = getHeadSha(cwd);
+  const remote = getRemoteBranchSha(cwd, plan.branch, gitAuth);
+  if (remote !== undefined && remote !== head && remote !== plan.sourceSha) {
+    throw new HooversionError(`Release resume found remote drift: expected ${head}, found ${remote || "missing"}.`);
+  }
+}
+
+// src/index.ts
+function lintCommits(rawCommits, policy = {}) {
+  return rawCommits.flatMap((raw) => lintCommit(raw, policy));
+}
+export {
+  writeDefaultConfig,
+  validatePlan,
+  updateManifestVersion,
+  updateLocalDependencyVersions,
+  updateChangelog,
+  tagPatternForPackage,
+  tagForPackage,
+  tagExists,
+  runDoctor,
+  renderTag,
+  relativeToCwd,
+  readManifest,
+  pushRelease,
+  propagateDependencies,
+  parseVersion,
+  parseCommits,
+  parseCommit,
+  normalizeConfig,
+  minReleaseType,
+  loadConfig,
+  lintCommits,
+  lintCommit,
+  isIgnoredSubject,
+  isGitRepository,
+  highestReleaseType,
+  git,
+  getRemoteBranchSha,
+  getRefSha,
+  getOriginRepository,
+  getLatestTag,
+  getLastCommit,
+  getHeadSha,
+  getCurrentBranch,
+  getCommits,
+  getCommitRange,
+  getCommitMessage,
+  generateReleaseNotes,
+  findConfigPath,
+  executeRelease,
+  ensureCleanWorkingTree,
+  directAffectedPackages,
+  detectPackages,
+  defaultManifestPath,
+  createReleasePlan,
+  createReleaseCommit,
+  createAnnotatedTag,
+  changelogPathForPackage,
+  bumpVersion,
+  breakingChangeDescription,
+  assertHooversion,
+  HooversionError
+};

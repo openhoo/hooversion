@@ -1,4 +1,4 @@
-import { getCurrentBranch, getLatestTag, isGitRepository } from "./git";
+import { getCurrentBranch, getLatestTag, git, isGitRepository } from "./git";
 import { readManifest } from "./manifest";
 import { tagPatternForPackage } from "./plan";
 import type { NormalizedConfig } from "./types";
@@ -12,8 +12,21 @@ export interface DoctorResult {
 export function runDoctor(cwd: string, config: NormalizedConfig): DoctorResult {
   const result: DoctorResult = { errors: [], warnings: [], info: [] };
 
+  if (config.branches.length === 0 || config.branches.some((branch) => !branch.trim())) {
+    result.errors.push("Config must define at least one non-empty release branch.");
+  }
+  if (config.packages.length === 0) {
+    result.errors.push("Config must define at least one package.");
+  }
+  if (result.errors.length > 0) return result;
+
   if (!isGitRepository(cwd)) {
     result.errors.push("Current directory is not a git repository.");
+    return result;
+  }
+
+  if (!git(cwd, ["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], true).trim()) {
+    result.errors.push("Repository has no resolvable HEAD commit.");
     return result;
   }
 

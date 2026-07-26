@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { breakingChangeDescription } from "./commit";
 import type { PackageRelease, ParsedCommit } from "./types";
 
 const groupTitles: Record<string, string> = {
@@ -21,7 +22,7 @@ export function generateReleaseNotes(release: Omit<PackageRelease, "notes">): st
       const scope = commit.scope ? `**${commit.scope}:** ` : "";
       lines.push(`- ${scope}${commit.description} (${commit.hash.slice(0, 7)})`);
       if (commit.breaking && commit.body) {
-        const breaking = extractBreakingChange(commit.body);
+        const breaking = breakingChangeDescription(commit.body);
         if (breaking) lines.push(`  - BREAKING: ${breaking}`);
       }
     }
@@ -56,16 +57,14 @@ function groupCommits(commits: ParsedCommit[]): [string, ParsedCommit[]][] {
     }
   }
 
-  return Array.from(buckets.entries()).filter(([, values]) => values.length > 0);
+  const orderedTitles = [...Object.values(groupTitles), "Other Changes"];
+  return orderedTitles
+    .map((title) => [title, buckets.get(title) ?? []] as [string, ParsedCommit[]])
+    .filter(([, values]) => values.length > 0);
 }
 
 function pushBucket(map: Map<string, ParsedCommit[]>, key: string, commit: ParsedCommit): void {
   const bucket = map.get(key) ?? [];
   bucket.push(commit);
   map.set(key, bucket);
-}
-
-function extractBreakingChange(body: string): string | undefined {
-  const match = /(?:^|\n)BREAKING[ -]CHANGE:\s*([^\n]+)/.exec(body);
-  return match?.[1]?.trim();
 }

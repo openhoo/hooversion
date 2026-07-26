@@ -1,7 +1,8 @@
-import type { CommitLintIssue, ParsedCommit, RawCommit, ReleaseType } from "./types";
+import type { CommitLintIssue, CommitPolicy, ParsedCommit, RawCommit, ReleaseType } from "./types";
 
 const conventionalHeaderPattern = /^([a-z][a-z0-9-]*)(?:\(([^()\r\n]+)\))?(!)?: (.+)$/;
-const breakingFooterPattern = /(?:^|\n)BREAKING[ -]CHANGE: /;
+
+const breakingFooterLinePattern = /^BREAKING[ -]CHANGE:\s*\S.*$/;
 
 const ignoredSubjectPatterns = [
   /^Merge /,
@@ -10,7 +11,7 @@ const ignoredSubjectPatterns = [
   /^chore\(release\)!?: /,
 ];
 
-const releaseRules: Record<string, ReleaseType | undefined> = {
+const defaultReleaseRules: Readonly<Record<string, ReleaseType | undefined>> = {
   feat: "minor",
   fix: "patch",
   perf: "patch",
@@ -20,7 +21,7 @@ export function isIgnoredSubject(subject: string): boolean {
   return ignoredSubjectPatterns.some((pattern) => pattern.test(subject));
 }
 
-export function parseCommit(raw: RawCommit): ParsedCommit {
+export function parseCommit(raw: RawCommit, policy: CommitPolicy = {}): ParsedCommit {
   const ignored = isIgnoredSubject(raw.subject);
   const match = conventionalHeaderPattern.exec(raw.subject);
 
@@ -35,7 +36,8 @@ export function parseCommit(raw: RawCommit): ParsedCommit {
   }
 
   const [, type, scope, bang, description] = match;
-  const breaking = Boolean(bang) || breakingFooterPattern.test(raw.body);
+  const releaseRules = { ...defaultReleaseRules, ...policy.releaseTypes };
+  const breaking = Boolean(breakingChangeDescription(raw.body)) || Boolean(bang);
   return {
     ...raw,
     type,
@@ -47,7 +49,7 @@ export function parseCommit(raw: RawCommit): ParsedCommit {
   };
 }
 
-export function lintCommit(raw: RawCommit): CommitLintIssue[] {
+export function lintCommit(raw: RawCommit, policy: CommitPolicy = {}): CommitLintIssue[] {
   if (isIgnoredSubject(raw.subject)) return [];
 
   const issues: CommitLintIssue[] = [];
@@ -62,6 +64,9 @@ export function lintCommit(raw: RawCommit): CommitLintIssue[] {
   }
 
   const [, type, , , description] = match;
+  if (policy.allowedTypes && !policy.allowedTypes.includes(type)) {
+    issues.push({ hash: raw.hash, subject: raw.subject, message: `type '${type}' is not allowed` });
+  }
   if (!type) {
     issues.push({ hash: raw.hash, subject: raw.subject, message: "type is required" });
   }
@@ -79,6 +84,18 @@ export function lintCommit(raw: RawCommit): CommitLintIssue[] {
   return issues;
 }
 
-export function parseCommits(rawCommits: RawCommit[]): ParsedCommit[] {
-  return rawCommits.map(parseCommit);
+export function parseCommits(rawCommits: RawCommit[], policy: CommitPolicy = {}): ParsedCommit[] {
+  return rawCommits.map((raw) => parseCommit(raw, policy));
+}
+
+export function breakingChangeDescription(body: string): string | undefined {
+  const lines = body.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = breakingFooterLinePattern.exec(lines[index].trim());
+    if (!match) continue;
+    if ((index === 0 && lines.length === 1) || lines[index - 1]?.trim() === "") {
+      return lines[index].trim().replace(/^BREAKING[ -]CHANGE:\s*/, "").trim();
+    }
+  }
+  return undefined;
 }
