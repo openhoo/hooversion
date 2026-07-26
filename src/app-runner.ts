@@ -9,9 +9,10 @@ import { executeRelease } from "./release";
 import type { GitNetworkAuth } from "./git";
 import { runCommand, runShell } from "./process";
 const GIT_ASKPASS_FILENAME = ".git-askpass";
-const GIT_TOKEN_ENV = "VERSIONHOO_GIT_TOKEN";
+const GIT_TOKEN_FILENAME = ".git-token";
+const GIT_TOKEN_FILE_ENV = "VERSIONHOO_GIT_TOKEN_FILE";
 const GIT_ASKPASS_SCRIPT =
-  '#!/bin/sh\ncase "$1" in\n  *[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]*) printf "%s\\n" "x-access-token" ;;\n  *) printf "%s\\n" "$VERSIONHOO_GIT_TOKEN" ;;\nesac\n';
+  '#!/bin/sh\ncase "$1" in\n  *[Uu][Ss][Ee][Rr][Nn][Aa][Mm][Ee]*) printf "%s\\n" "x-access-token" ;;\n  *) cat "$VERSIONHOO_GIT_TOKEN_FILE" ;;\nesac\n';
 
 interface GitAuthArtifacts {
   env: GitNetworkAuth;
@@ -61,7 +62,7 @@ export async function runVersionhooRelease(job: VersionhooReleaseJob): Promise<V
     return await withRepositoryEnvironment(job, async () => {
       try {
         const cloneUrl = validateCloneUrl(job.cloneUrl, job.repositoryFullName, job.trustedCloneHosts);
-        const gitAuth = createGitAuthArtifacts(workDir, job.token);
+        const gitAuth = createGitAuthArtifacts(repositoryHome, job.token);
         try {
           checked(
             "git",
@@ -134,23 +135,33 @@ export async function runVersionhooRelease(job: VersionhooReleaseJob): Promise<V
     rmSync(repositoryHome, { recursive: true, force: true });
   }
 }
-function createGitAuthArtifacts(workDir: string, token: string): GitAuthArtifacts {
-  const askpassPath = join(workDir, GIT_ASKPASS_FILENAME);
-  let created = false;
+function createGitAuthArtifacts(authDir: string, token: string): GitAuthArtifacts {
+  const tokenPath = join(authDir, GIT_TOKEN_FILENAME);
+  const askpassPath = join(authDir, GIT_ASKPASS_FILENAME);
+  let tokenCreated = false;
+  let askpassCreated = false;
   const cleanup = (): void => {
-    if (!created) return;
-    rmSync(askpassPath, { force: true });
-    created = false;
+    if (askpassCreated) {
+      rmSync(askpassPath, { force: true });
+      askpassCreated = false;
+    }
+    if (tokenCreated) {
+      rmSync(tokenPath, { force: true });
+      tokenCreated = false;
+    }
   };
   try {
+    writeFileSync(tokenPath, `${token}\n`, { encoding: "utf8", flag: "wx", mode: 0o600 });
+    tokenCreated = true;
+    chmodSync(tokenPath, 0o600);
     writeFileSync(askpassPath, GIT_ASKPASS_SCRIPT, { encoding: "utf8", flag: "wx", mode: 0o700 });
-    created = true;
+    askpassCreated = true;
     chmodSync(askpassPath, 0o700);
     return {
       env: {
         GIT_ASKPASS: askpassPath,
         GIT_TERMINAL_PROMPT: "0",
-        [GIT_TOKEN_ENV]: token,
+        [GIT_TOKEN_FILE_ENV]: tokenPath,
       },
       cleanup,
     };
