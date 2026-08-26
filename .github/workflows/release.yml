@@ -14,13 +14,91 @@ on:
         description: 'Existing release tag to rebuild and re-upload assets for (e.g. v1.0.1)'
         required: true
         type: string
+
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  release:
-    name: Release
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && !contains(github.event.workflow_run.head_commit.message, 'chore(release):')
+  prepare:
+    name: Prepare release PR
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      !contains(github.event.workflow_run.head_commit.message, 'chore(release):')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Configure release git author
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Prepares manifests, changelog, release commit and annotated tags
+      # locally (--no-push) without touching GitHub (--no-github). Emits
+      # published/version/tag into GITHUB_OUTPUT; no-op when nothing is due.
+      - name: Cut release commit and tags
+        id: rel
+        run: go run ./cmd/hooversion release --no-push --no-github
+
+      - name: Push release branch and tags
+        id: push
+        if: steps.rel.outputs.published == 'true'
+        run: |
+          set -euo pipefail
+          tag="${{ steps.rel.outputs.tag }}"
+          branch="release/${tag}"
+          git push origin "HEAD:refs/heads/${branch}" "refs/tags/${tag}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+
+      - name: Open and merge release PR
+        if: steps.push.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_BRANCH: ${{ steps.push.outputs.branch }}
+          RELEASE_VERSION: ${{ steps.rel.outputs.version }}
+          RELEASE_TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base main --head "${RELEASE_BRANCH}" \
+            --title "chore(release): hooversion ${RELEASE_VERSION}" \
+            --body "Automated release PR for \`${RELEASE_TAG}\`. Merging publishes the GitHub Release."
+          # Required status checks gate the merge; retry until they settle.
+          ok=
+          for i in $(seq 1 60); do
+            if gh pr merge --rebase \
+                 --subject "chore(release): hooversion ${RELEASE_VERSION}"; then
+              ok=1
+              break
+            fi
+            sleep 20
+          done
+          [ -n "$ok" ] || { echo "release PR did not become mergeable in time" >&2; exit 1; }
+
+  publish:
+    name: Publish release
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      contains(github.event.workflow_run.head_commit.message, 'chore(release):')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -42,6 +120,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      # Resumes the SHA-bound plan from the verified release commit/tag,
+      # pushes the tag atomically, and creates the GitHub Release.
       - name: Release
         id: release
         env:
@@ -55,6 +135,7 @@ jobs:
           echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
+        if: steps.release.outputs.published == 'true'
         env:
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}
         run: |
