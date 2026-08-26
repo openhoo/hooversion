@@ -1,5 +1,17 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.1 (2026-08-26)
+
+### Bug Fixes
+
+- **release:** rebuild assets for published tags on demand (#13) (460a0bf)
+- **release:** route release commits through pull requests (#14) (a81d8d1)
+
+### Other Changes
+
+- portable asset reads and release workflow version order (#12) (eb06918)
+- sync action refs and readme pins to v1.0.0 (d45d72e)
+
 ## 1.0.0 (2026-08-26)
 
 ### Breaking Changes
