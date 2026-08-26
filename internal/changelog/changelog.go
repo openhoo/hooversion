@@ -4,17 +4,19 @@ package changelog
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
 	"unicode"
 
 	"github.com/openhoo/hooversion/internal/commit"
 	hverrors "github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -111,13 +113,11 @@ func Update(path, notes, pkgName string) error {
 	}
 
 	existing := ""
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		if err != syscall.ENOENT {
-			return fmt.Errorf("open %s: %w", path, err)
-		}
-	} else {
-		file := os.NewFile(uintptr(fd), path)
+	file, err := safefs.OpenReadNoFollow(path)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("open %s: %w", path, err)
+	}
+	if err == nil {
 		info, statErr := file.Stat()
 		if statErr == nil && !info.Mode().IsRegular() {
 			file.Close()
@@ -177,43 +177,28 @@ func writeTemp(path, content string) (string, error) {
 			return "", fmt.Errorf("generate changelog temp name: %w", err)
 		}
 		candidate := fmt.Sprintf("%s.hooversion-%d-%s.tmp", path, os.Getpid(), hex.EncodeToString(suffix))
-		fd, err := syscall.Open(candidate, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, 0o600)
+		f, err := safefs.CreateExclusive(candidate, 0o600)
 		if err == nil {
 			tempPath = candidate
-			if writeErr := writeFile(fd, []byte(content)); writeErr != nil {
-				syscall.Close(fd)
-				return tempPath, writeErr
+			if _, writeErr := f.Write([]byte(content)); writeErr != nil {
+				f.Close()
+				return tempPath, hverrors.New("Failed to write changelog")
 			}
-			if syncErr := syscall.Fsync(fd); syncErr != nil {
-				syscall.Close(fd)
+			if syncErr := f.Sync(); syncErr != nil {
+				f.Close()
 				return tempPath, fmt.Errorf("fsync %s: %w", candidate, syncErr)
 			}
-			if closeErr := syscall.Close(fd); closeErr != nil {
+			if closeErr := f.Close(); closeErr != nil {
 				return tempPath, fmt.Errorf("close %s: %w", candidate, closeErr)
 			}
-			if renameErr := syscall.Rename(candidate, path); renameErr != nil {
+			if renameErr := os.Rename(candidate, path); renameErr != nil {
 				return tempPath, fmt.Errorf("rename %s: %w", candidate, renameErr)
 			}
 			return "", nil
 		}
-		if err != syscall.EEXIST {
+		if !errors.Is(err, fs.ErrExist) {
 			return "", fmt.Errorf("create %s: %w", candidate, err)
 		}
 	}
 	return tempPath, hverrors.New("Could not create temporary changelog file next to %s", path)
-}
-
-func writeFile(fd int, data []byte) error {
-	offset := 0
-	for offset < len(data) {
-		written, err := syscall.Write(fd, data[offset:])
-		if err != nil {
-			return hverrors.New("Failed to write changelog")
-		}
-		if written <= 0 {
-			return hverrors.New("Failed to write changelog")
-		}
-		offset += written
-	}
-	return nil
 }

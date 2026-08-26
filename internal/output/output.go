@@ -9,8 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -68,11 +68,10 @@ func (s Store) Paths() ManagedPaths {
 // readStalePayload parses outputs.json without following a symlink planted at
 // the path; any failure means the stale output cannot identify note paths.
 func readStalePayload(path string) (stalePayload, bool) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	file, err := safefs.OpenReadNoFollow(path)
 	if err != nil {
 		return stalePayload{}, false
 	}
-	file := os.NewFile(uintptr(fd), path)
 	defer file.Close()
 
 	var payload stalePayload

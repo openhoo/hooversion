@@ -16,10 +16,10 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"syscall"
 	"unicode"
 
 	hverrors "github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -862,7 +862,7 @@ func replaceLockDependencyEntry(line string, released map[string]string, changed
 
 func updateCargoLock(cwd string, released map[string]string) error {
 	path := filepath.Join(cwd, "Cargo.lock")
-	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	f, err := safefs.OpenReadWriteNoFollow(path)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil
