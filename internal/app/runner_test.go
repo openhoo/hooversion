@@ -366,6 +366,8 @@ func TestEndToEndPublishedRelease(t *testing.T) {
 	repoDir := filepath.Join(dir, "repo")
 	runGit(t, dir, "clone", "-q", bare, repoDir)
 	runGit(t, repoDir, "checkout", "-q", "-b", "main")
+	runGit(t, repoDir, "config", "user.email", "test@example.com")
+	runGit(t, repoDir, "config", "user.name", "Hooversion Test")
 	writeFile(t, filepath.Join(repoDir, "hooversion.yaml"),
 		"packages:\n  - name: mypkg\n    type: node\n")
 	writeFile(t, filepath.Join(repoDir, "package.json"),

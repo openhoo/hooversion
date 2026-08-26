@@ -202,7 +202,7 @@ func TestAtomicPushFailureLeavesRemoteAtSourceSha(t *testing.T) {
 	}
 
 	// Conflicting v1.0.1 tag on the remote makes the atomic push fail.
-	if _, err := gitRaw(remote, "--git-dir", remote, "tag", "-a", "v1.0.1", "-m", "conflicting tag", sourceSha); err != nil {
+	if _, err := gitRaw(remote, "--git-dir", remote, "-c", "user.name=Hooversion Test", "-c", "user.email=test@example.com", "tag", "-a", "v1.0.1", "-m", "conflicting tag", sourceSha); err != nil {
 		t.Fatal(err)
 	}
 
