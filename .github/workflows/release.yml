@@ -77,21 +77,23 @@ jobs:
           RELEASE_TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
-          gh pr create \
+          # Detached-HEAD checkout: gh cannot infer the PR, so thread the
+          # explicit URL from create into merge.
+          pr_url=$(gh pr create \
             --base main --head "${RELEASE_BRANCH}" \
             --title "chore(release): hooversion ${RELEASE_VERSION}" \
-            --body "Automated release PR for \`${RELEASE_TAG}\`. Merging publishes the GitHub Release."
+            --body "Automated release PR for \`${RELEASE_TAG}\`. Merging publishes the GitHub Release.")
           # Required status checks gate the merge; retry until they settle.
           ok=
           for i in $(seq 1 60); do
-            if gh pr merge --rebase \
+            if gh pr merge "$pr_url" --rebase \
                  --subject "chore(release): hooversion ${RELEASE_VERSION}"; then
               ok=1
               break
             fi
             sleep 20
           done
-          [ -n "$ok" ] || { echo "release PR did not become mergeable in time" >&2; exit 1; }
+          [ -n "$ok" ] || { echo "release PR did not become mergeable in time: $pr_url" >&2; exit 1; }
 
   publish:
     name: Publish release
