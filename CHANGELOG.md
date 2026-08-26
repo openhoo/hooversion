@@ -1,5 +1,25 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.0 (2026-08-26)
+
+### Breaking Changes
+
+- rewrite Hooversion in Go (#11) (eab25f7)
+  - BREAKING: hooversion.config.{ts,mjs,js,cjs} must migrate
+
+### Features
+
+- harden release automation (#7) (6ede301)
+
+### Bug Fixes
+
+- **app:** isolate runner token (#8) (a53f902)
+
+### Other Changes
+
+- run commit lint on hosted runner (#9) (d3959a4)
+- use hosted runners exclusively (#10) (6513f0d)
+
 ## Unreleased
 
 ### Go rewrite
