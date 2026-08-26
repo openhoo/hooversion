@@ -32,21 +32,22 @@ release commits and tags. Humans can remain pull-request gated.
 
 ## Runtime
 
-Build and start the app with Bun:
+Build and start the app:
 
 ```sh
-bun install --frozen-lockfile
-bun run build
+go build -o bin/versionhoo-app ./cmd/versionhoo-app
 VERSIONHOO_APP_ID=12345 \
 VERSIONHOO_PRIVATE_KEY_PATH=/run/secrets/versionhoo-app.pem \
 VERSIONHOO_WEBHOOK_SECRET=... \
 VERSIONHOO_ALLOWED_REPOS=openhoo/hooversion,openhoo/mouserhoo \
-./dist/app.js
+./bin/versionhoo-app
 ```
 
-The package also exposes a binary:
+Alternatively install it with Go or download a prebuilt binary from GitHub
+Releases:
 
 ```sh
+go install github.com/openhoo/hooversion/cmd/versionhoo-app@latest
 versionhoo-app
 ```
 

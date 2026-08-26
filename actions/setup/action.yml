@@ -1,40 +1,67 @@
 name: Setup Hooversion
-description: Install Bun and add a Hooversion CLI wrapper to PATH.
+description: Download a Hooversion release binary and add it to PATH.
 inputs:
   version:
-    description: Hooversion package version to run.
+    description: Hooversion release version to install.
     required: false
-    default: "0.2.0"
-  bun-version:
-    description: Bun version to install.
-    required: false
-    default: "1.3.14"
+    default: "0.3.0"
 outputs:
   version:
-    description: Hooversion package version configured by this action.
-    value: ${{ steps.wrapper.outputs.version }}
+    description: Hooversion version configured by this action.
+    value: ${{ steps.binaries.outputs.version }}
 runs:
   using: composite
   steps:
-    - name: Set up Bun
-      uses: oven-sh/setup-bun@v2
-      with:
-        bun-version: ${{ inputs.bun-version }}
+    - name: Resolve platform
+      id: platform
+      shell: bash
+      env:
+        RUNNER_OS_VALUE: ${{ runner.os }}
+        RUNNER_ARCH_VALUE: ${{ runner.arch }}
+      run: |
+        set -euo pipefail
+        case "$RUNNER_OS_VALUE" in
+          Linux) os=linux ;;
+          macOS) os=darwin ;;
+          Windows) os=windows ;;
+          *)
+            echo "::error::Hooversion does not publish binaries for runner.os '${RUNNER_OS_VALUE}'."
+            exit 1
+            ;;
+        esac
+        case "$RUNNER_ARCH_VALUE" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *)
+            echo "::error::Hooversion does not publish binaries for runner.arch '${RUNNER_ARCH_VALUE}'."
+            exit 1
+            ;;
+        esac
+        echo "os=$os" >> "$GITHUB_OUTPUT"
+        echo "arch=$arch" >> "$GITHUB_OUTPUT"
 
-    - name: Add Hooversion wrapper
-      id: wrapper
+    - name: Download and install Hooversion
+      id: binaries
       shell: bash
       env:
         HOOVERSION_VERSION: ${{ inputs.version }}
+        HOOVERSION_OS: ${{ steps.platform.outputs.os }}
+        HOOVERSION_ARCH: ${{ steps.platform.outputs.arch }}
       run: |
         set -euo pipefail
+        version="${HOOVERSION_VERSION}"
+        name="hooversion_${version}_${HOOVERSION_OS}_${HOOVERSION_ARCH}.tar.gz"
+        url="https://github.com/openhoo/hooversion/releases/download/v${version}/${name}"
         bin_dir="${RUNNER_TEMP}/hooversion-bin"
         mkdir -p "$bin_dir"
-        cat > "$bin_dir/hooversion" <<EOF
-        #!/usr/bin/env bash
-        set -euo pipefail
-        exec bunx --bun "@openhoo/hooversion@${HOOVERSION_VERSION}" "\$@"
-        EOF
-        chmod +x "$bin_dir/hooversion"
+        archive="${RUNNER_TEMP}/${name}"
+        echo "Downloading ${url}"
+        if ! curl -fSL --retry 3 --connect-timeout 30 -o "$archive" "$url"; then
+          echo "::error::Failed to download Hooversion asset ${name}; is release v${version} published with the expected binaries?"
+          exit 1
+        fi
+        tar -xzf "$archive" -C "$bin_dir"
+        rm -f "$archive"
+        chmod +x "${bin_dir}"/hooversion*
         echo "$bin_dir" >> "$GITHUB_PATH"
-        echo "version=${HOOVERSION_VERSION}" >> "$GITHUB_OUTPUT"
+        echo "version=${version}" >> "$GITHUB_OUTPUT"

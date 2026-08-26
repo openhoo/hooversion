@@ -1,5 +1,8 @@
-node_modules
-.hooversion
+/hooversion
+/versionhoo-app
+/dist/
+node_modules/
+.hooversion/
 .release-version
 coverage
 *.log

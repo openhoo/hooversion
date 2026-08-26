@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Go rewrite
+
+- Rewrite Hooversion as a single static binary with zero runtime dependencies; commit linting, planning, release execution, doctor diagnostics, and the Versionhoo app ship as native executables.
+- Replace TypeScript configuration modules with declarative YAML configuration and add `hooversion migrate` to convert legacy `hooversion.config.{ts,mjs,js,cjs}` files (assisted when bun is available, manual mapping otherwise).
+- Keep release, resume, and drift guarantees identical: SHA-bound plans, local and remote drift rejection, resumable publication from verified release state, atomic tag pushes, idempotent GitHub Releases, and managed outputs.
+- Distribute the CLI via `go install` and GitHub release tarballs; discontinue the npm distribution and the `@openhoo/hooversion` JS API — commit-policy parity now lives behind `hooversion lint`.
+- Replace the Bun app server with the native `versionhoo-app` binary behind the same webhook contract and runner isolation.
+
 ### Source and release safety
 
 - Bind release plans to the reviewed source SHA, reject local or remote drift, and atomically push the release commit with its tags.

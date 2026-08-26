@@ -1,19 +1,27 @@
-FROM oven/bun:1.3.14-alpine AS build
+ARG VERSION=dev
 
-WORKDIR /app
-COPY package.json bun.lock tsconfig.json ./
-COPY src ./src
-RUN bun install --frozen-lockfile
-RUN bun run build
+FROM golang:1.25-alpine AS build
 
-FROM oven/bun:1.3.14-alpine
+ARG VERSION=dev
+WORKDIR /src
 
-WORKDIR /app
-RUN apk add --no-cache git openssh-client
-COPY --from=build /app/dist ./dist
+COPY go.mod go.sum ./
+COPY cmd ./cmd
+COPY internal ./internal
 
-ENV VERSIONHOO_HOST=0.0.0.0
-ENV VERSIONHOO_PORT=3000
+RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/hooversion ./cmd/hooversion \
+ && go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/versionhoo-app ./cmd/versionhoo-app
+
+FROM alpine:3.22
+
+RUN apk add --no-cache git openssh-client ca-certificates
+
+COPY --from=build /out/hooversion /usr/local/bin/hooversion
+COPY --from=build /out/versionhoo-app /usr/local/bin/versionhoo-app
+
+ENV VERSIONHOO_HOST=0.0.0.0 \
+    VERSIONHOO_PORT=3000
+
 EXPOSE 3000
 
-CMD ["./dist/app.js"]
+CMD ["versionhoo-app"]
