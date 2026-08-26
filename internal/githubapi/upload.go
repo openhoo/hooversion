@@ -14,9 +14,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
-	"syscall"
 
 	hverr "github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/safefs"
 )
 
 const maxReleaseAssetSizeBytes = 100 * 1024 * 1024
@@ -142,22 +142,10 @@ type releaseAssetMetadataT struct {
 // mtime/ctime use second+nanosecond pairs for exact comparison like
 // mtimeMs/ctimeMs equality in src/github.ts. ok is false on platforms that do
 // not expose inode metadata through os.FileInfo.
-func releaseAssetMetadata(fi os.FileInfo) (meta releaseAssetMetadataT, ok bool) {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return releaseAssetMetadataT{}, false
-	}
-	return releaseAssetMetadataT{
-		dev:       st.Dev,
-		ino:       st.Ino,
-		size:      fi.Size(),
-		mtimeSec:  st.Mtim.Sec,
-		mtimeNsec: st.Mtim.Nsec,
-		ctimeSec:  st.Ctim.Sec,
-		ctimeNsec: st.Ctim.Nsec,
-	}, true
-}
-
+// assetMetadata is a platform seam implemented in asset_metadata_*.go; ok is
+// false when the platform cannot expose identity metadata, which callers
+// treat as a hard error. Opens go through internal/safefs for uniform
+// O_NOFOLLOW semantics.
 func sameReleaseAssetMetadata(left, right releaseAssetMetadataT) bool {
 	return left.dev == right.dev &&
 		left.ino == right.ino &&
@@ -208,7 +196,7 @@ func assertStableReleaseAssetPath(root, path, asset string, expected releaseAsse
 	if err := assertRegularReleaseAsset(fi, asset); err != nil {
 		return err
 	}
-	meta, ok := releaseAssetMetadata(fi)
+	meta, ok := assetMetadata(fi)
 	if !ok {
 		return wrapInsecureRead(asset, errUnsupportedStatMetadata)
 	}
@@ -257,7 +245,7 @@ func readValidatedReleaseAsset(asset string) ([]byte, error) {
 		return nil, err
 	}
 
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	f, err := safefs.OpenReadNoFollow(path)
 	if err != nil {
 		return nil, wrapInsecureRead(asset, err)
 	}
@@ -270,7 +258,7 @@ func readValidatedReleaseAsset(asset string) ([]byte, error) {
 	if err := assertRegularReleaseAsset(descFi, asset); err != nil {
 		return nil, err
 	}
-	descMeta, ok := releaseAssetMetadata(descFi)
+	descMeta, ok := assetMetadata(descFi)
 	if !ok {
 		return nil, wrapInsecureRead(asset, errUnsupportedStatMetadata)
 	}
@@ -290,7 +278,7 @@ func readValidatedReleaseAsset(asset string) ([]byte, error) {
 	if err != nil {
 		return nil, wrapInsecureRead(asset, err)
 	}
-	afterMeta, ok := releaseAssetMetadata(afterFi)
+	afterMeta, ok := assetMetadata(afterFi)
 	if !ok {
 		return nil, wrapInsecureRead(asset, errUnsupportedStatMetadata)
 	}
@@ -305,7 +293,7 @@ func readValidatedReleaseAsset(asset string) ([]byte, error) {
 	if err != nil {
 		return nil, wrapInsecureRead(asset, err)
 	}
-	finalMeta, ok := releaseAssetMetadata(finalFi)
+	finalMeta, ok := assetMetadata(finalFi)
 	if !ok || !sameReleaseAssetMetadata(afterMeta, finalMeta) {
 		return nil, changedWhileReading(asset)
 	}
