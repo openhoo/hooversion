@@ -1,0 +1,11 @@
+branches:
+  - main
+packages:
+  - name: hooversion
+    path: .
+    type: version-file
+    manifest: VERSION
+hooks:
+  afterVersion: []
+github:
+  releases: true

@@ -19,21 +19,18 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          bun-version: 1.3.14
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+          go-version: stable
 
       - name: Validate latest commit
         if: github.event_name != 'pull_request'
-        run: bun run src/cli.ts lint --last
+        run: go run ./cmd/hooversion lint --last
 
       - name: Validate PR commits
         if: github.event_name == 'pull_request'
-        run: bun run src/cli.ts lint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}"
+        run: go run ./cmd/hooversion lint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}"
 
   build:
     name: Test and build
@@ -43,13 +40,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
-      - name: Set up Bun
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Set up Go
+        uses: actions/setup-go@v6
         with:
-          bun-version: 1.3.14
-
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
+          go-version: stable
 
       - name: Run checks
-        run: bun run check
+        run: go vet ./... && go test ./... -race -count=1 && go build ./...
