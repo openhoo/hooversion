@@ -8,7 +8,12 @@ on:
       - main
     types:
       - completed
-
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to rebuild and re-upload assets for (e.g. v1.0.1)'
+        required: true
+        type: string
 permissions:
   contents: read
 
@@ -79,3 +84,55 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${{ steps.release.outputs.tag }}" dist/* --clobber
+
+  rebuild-assets:
+    name: Rebuild assets
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.tag }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Read release version
+        id: meta
+        run: |
+          set -euo pipefail
+          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        env:
+          RELEASE_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ldflags="-s -w -X main.version=${RELEASE_VERSION}"
+          for target in linux/amd64 linux/arm64 darwin/arm64 darwin/amd64 windows/amd64; do
+            os=${target%/*}
+            arch=${target#*/}
+            ext=
+            if [ "$os" = "windows" ]; then
+              ext=.exe
+            fi
+            stage="dist/hooversion_${RELEASE_VERSION}_${os}_${arch}"
+            mkdir -p "$stage"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$stage/hooversion${ext}" ./cmd/hooversion
+            tar -czf "dist/hooversion_${RELEASE_VERSION}_${os}_${arch}.tar.gz" -C "$stage" "hooversion${ext}"
+            rm -rf "$stage"
+          done
+
+      - name: Generate checksums
+        run: (cd dist && sha256sum -- *.tar.gz > SHA256SUMS)
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ inputs.tag }}" dist/* --clobber
