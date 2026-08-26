@@ -7,9 +7,9 @@ GitHub release for the requested version; no JavaScript runtime is required.
 ## Setup CLI
 
 ```yaml
-- uses: openhoo/hooversion/actions/setup@v0.3.0
+- uses: openhoo/hooversion/actions/setup@v1.0.0
   with:
-    version: 0.3.0
+    version: 1.0.0
 - run: hooversion plan
 ```
 
@@ -19,9 +19,9 @@ GitHub release for the requested version; no JavaScript runtime is required.
 - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
   with:
     fetch-depth: 0
-- uses: openhoo/hooversion/actions/lint@v0.3.0
+- uses: openhoo/hooversion/actions/lint@v1.0.0
   with:
-    version: 0.3.0
+    version: 1.0.0
 ```
 
 ## Release
@@ -40,9 +40,9 @@ steps:
       fetch-depth: 0
       ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
   - id: release
-    uses: openhoo/hooversion/actions/release@v0.3.0
+    uses: openhoo/hooversion/actions/release@v1.0.0
     with:
-      version: 0.3.0
+      version: 1.0.0
       install-command: npm ci
       github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
