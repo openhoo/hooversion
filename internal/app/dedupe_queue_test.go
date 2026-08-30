@@ -66,14 +66,14 @@ func TestQueueSameKeySerialDifferentKeysParallel(t *testing.T) {
 	order := make([]string, 0, 4)
 	done := make(chan struct{}, 4)
 
-	task := func(key string) func() error {
+	task := func(label string) func() error {
 		return func() error {
 			mu.Lock()
 			active++
 			if active > maxActive {
 				maxActive = active
 			}
-			order = append(order, key)
+			order = append(order, label)
 			mu.Unlock()
 			time.Sleep(20 * time.Millisecond)
 			mu.Lock()
@@ -87,10 +87,18 @@ func TestQueueSameKeySerialDifferentKeysParallel(t *testing.T) {
 	q := NewReleaseTaskQueue(nil, QueueOptions{})
 	for i := 0; i < 4; i++ {
 		key := "repo-a:main"
+		label := "repo-a:1"
+		if i == 1 {
+			label = "repo-a:2"
+		}
 		if i >= 2 {
 			key = "repo-b:main"
+			label = "repo-b:1"
+			if i == 3 {
+				label = "repo-b:2"
+			}
 		}
-		q.Enqueue(key, task(key), nil)
+		q.Enqueue(key, task(label), nil)
 	}
 	q.Wait()
 
@@ -99,11 +107,12 @@ func TestQueueSameKeySerialDifferentKeysParallel(t *testing.T) {
 	if maxActive != 2 {
 		t.Fatalf("max concurrent %d, want 2 (one per key)", maxActive)
 	}
-	wantOrder := []string{"repo-a:main", "repo-a:main", "repo-b:main", "repo-b:main"}
-	for i := range wantOrder {
-		if order[i] != wantOrder[i] {
-			t.Fatalf("order %v, want %v", order, wantOrder)
-		}
+	positions := make(map[string]int, len(order))
+	for i, label := range order {
+		positions[label] = i
+	}
+	if positions["repo-a:1"] >= positions["repo-a:2"] || positions["repo-b:1"] >= positions["repo-b:2"] {
+		t.Fatalf("per-key order violated: %v", order)
 	}
 }
 
