@@ -1,5 +1,16 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.3 (2026-08-30)
+
+### Bug Fixes
+
+- **actions:** harden shared Hoostack integration (6596a66)
+- **actions:** resolve bundled setup from action path (165b4f9)
+
+### Other Changes
+
+- **app:** assert only per-key queue order (bd501d2)
+
 ## 1.0.2 (2026-08-30)
 
 ### Bug Fixes
