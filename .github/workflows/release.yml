@@ -58,14 +58,14 @@ jobs:
         id: rel
         run: go run ./cmd/hooversion release --no-push --no-github
 
-      - name: Push release branch and tags
+      - name: Push release branch
         id: push
         if: steps.rel.outputs.published == 'true'
         run: |
           set -euo pipefail
           tag="${{ steps.rel.outputs.tag }}"
           branch="release/${tag}"
-          git push origin "HEAD:refs/heads/${branch}" "refs/tags/${tag}"
+          git push origin "HEAD:refs/heads/${branch}"
           echo "branch=${branch}" >> "$GITHUB_OUTPUT"
 
       - name: Open and merge release PR
@@ -116,25 +116,46 @@ jobs:
         with:
           go-version: stable
 
-      - name: Configure release git author
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      # Resumes the SHA-bound plan from the verified release commit/tag,
-      # pushes the tag atomically, and creates the GitHub Release.
-      - name: Release
-        id: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: go run ./cmd/hooversion release
-
-      - name: Read release version
+      - name: Read and verify release metadata
         id: meta
         run: |
           set -euo pipefail
-          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
+          version=$(tr -d '[:space:]' < VERSION)
+          tag="v${version}"
+          test "$(git log -1 --format=%s HEAD)" = "chore(release): hooversion ${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      # Tag the checked, protected-branch release commit. The prepare job keeps
+      # its pre-rebase tag local so no published tag can point outside main.
+      - name: Create or verify release tag
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          expected=$(git rev-parse HEAD)
+          remote_ref=$(git ls-remote --tags origin "refs/tags/${RELEASE_TAG}")
+          if [ -n "$remote_ref" ]; then
+            git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+            test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$expected"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" -m "hooversion ${{ steps.meta.outputs.version }}"
+            git push origin "refs/tags/${RELEASE_TAG}"
+          fi
+
+      - name: Publish GitHub release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "$RELEASE_TAG" --generate-notes
+          fi
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
         if: steps.release.outputs.published == 'true'
@@ -166,7 +187,7 @@ jobs:
         if: steps.release.outputs.published == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ steps.release.outputs.tag }}" dist/* --clobber
+        run: gh release upload "${{ steps.meta.outputs.tag }}" dist/* --clobber
 
   rebuild-assets:
     name: Rebuild assets
