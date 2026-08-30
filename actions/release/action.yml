@@ -4,7 +4,7 @@ inputs:
   version:
     description: Hooversion release version to install.
     required: false
-    default: "1.0.0"
+    default: "1.0.1"
   working-directory:
     description: Repository directory where Hooversion should run.
     required: false
@@ -102,8 +102,8 @@ runs:
       run: |
         set -euo pipefail
         if [[ -n "$INPUT_GITHUB_TOKEN" ]]; then
-          export GITHUB_TOKEN="$INPUT_GITHUB_TOKEN"
-          export GH_TOKEN="$INPUT_GITHUB_TOKEN"
+          export GITHUB_TOKEN="$INPUT_GITHUB_TOKEN" # hooray:allow-secret
+          export GH_TOKEN="$INPUT_GITHUB_TOKEN" # hooray:allow-secret
         fi
         args=(release)
         if [[ -n "$INPUT_CONFIG" ]]; then
