@@ -85,7 +85,7 @@ jobs:
             --body "Automated release PR for \`${RELEASE_TAG}\`. Merging publishes the GitHub Release.")
           # Required status checks gate the merge; retry until they settle.
           ok=
-          for i in $(seq 1 60); do
+          for _ in $(seq 1 60); do
             if gh pr merge "$pr_url" --rebase \
                  --subject "chore(release): hooversion ${RELEASE_VERSION}"; then
               ok=1
