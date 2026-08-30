@@ -58,9 +58,13 @@ runs:
   using: composite
   steps:
     - name: Set up Hooversion
-      uses: ./setup
-      with:
-        version: ${{ inputs.version }}
+      id: setup
+      shell: bash
+      env:
+        HOOVERSION_VERSION: ${{ inputs.version }}
+        RUNNER_OS_VALUE: ${{ runner.os }}
+        RUNNER_ARCH_VALUE: ${{ runner.arch }}
+      run: bash "$GITHUB_ACTION_PATH/../setup/install.sh"
 
     - name: Configure release git author
       shell: bash
