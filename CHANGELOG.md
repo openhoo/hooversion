@@ -1,5 +1,11 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.5 (2026-08-30)
+
+### Bug Fixes
+
+- **release:** publish prepared tag after protected PR (#23) (07e8654)
+
 ## 1.0.4 (2026-08-30)
 
 ### Bug Fixes
