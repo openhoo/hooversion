@@ -1,5 +1,11 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.2 (2026-08-30)
+
+### Bug Fixes
+
+- **actions:** harden shared Hoostack integration (6596a66)
+
 ## 1.0.1 (2026-08-26)
 
 ### Bug Fixes
