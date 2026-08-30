@@ -19,18 +19,10 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
+      - name: Dogfood Hooversion commit lint action
+        uses: ./actions/lint
         with:
-          go-version: stable
-
-      - name: Validate latest commit
-        if: github.event_name != 'pull_request'
-        run: go run ./cmd/hooversion lint --last
-
-      - name: Validate PR commits
-        if: github.event_name == 'pull_request'
-        run: go run ./cmd/hooversion lint --from "${{ github.event.pull_request.base.sha }}" --to "${{ github.event.pull_request.head.sha }}"
+          version: 1.0.2
 
   build:
     name: Test and build
