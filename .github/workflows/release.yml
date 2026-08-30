@@ -175,7 +175,8 @@ jobs:
             stage="dist/hooversion_${RELEASE_VERSION}_${os}_${arch}"
             mkdir -p "$stage"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$stage/hooversion${ext}" ./cmd/hooversion
-            tar -czf "dist/hooversion_${RELEASE_VERSION}_${os}_${arch}.tar.gz" -C "$stage" "hooversion${ext}"
+            install -m 0644 LICENSE "$stage/LICENSE"
+            tar -czf "dist/hooversion_${RELEASE_VERSION}_${os}_${arch}.tar.gz" -C "$stage" "hooversion${ext}" LICENSE
             rm -rf "$stage"
           done
 
@@ -229,7 +230,8 @@ jobs:
             stage="dist/hooversion_${RELEASE_VERSION}_${os}_${arch}"
             mkdir -p "$stage"
             CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags "$ldflags" -o "$stage/hooversion${ext}" ./cmd/hooversion
-            tar -czf "dist/hooversion_${RELEASE_VERSION}_${os}_${arch}.tar.gz" -C "$stage" "hooversion${ext}"
+            install -m 0644 LICENSE "$stage/LICENSE"
+            tar -czf "dist/hooversion_${RELEASE_VERSION}_${os}_${arch}.tar.gz" -C "$stage" "hooversion${ext}" LICENSE
             rm -rf "$stage"
           done
 
