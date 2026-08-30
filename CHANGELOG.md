@@ -1,5 +1,11 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.6 (2026-08-30)
+
+### Bug Fixes
+
+- **release:** include license in binary archives (#25) (0410989)
+
 ## 1.0.5 (2026-08-30)
 
 ### Bug Fixes
