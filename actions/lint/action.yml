@@ -4,7 +4,7 @@ inputs:
   version:
     description: Hooversion release version to install.
     required: false
-    default: "1.0.6"
+    default: "1.0.7"
   working-directory:
     description: Repository directory where Hooversion should run.
     required: false
