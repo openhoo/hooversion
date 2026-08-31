@@ -1,0 +1,130 @@
+name: Prepare Protected Release
+description: Prepare and push a Hooversion release branch without bypassing protected branches.
+inputs:
+  version:
+    description: Hooversion release version to install.
+    required: false
+    default: "1.0.7"
+  working-directory:
+    description: Repository directory where Hooversion should run.
+    required: false
+    default: "."
+  config:
+    description: Optional Hooversion config path.
+    required: false
+    default: ""
+  base-branch:
+    description: Protected branch that will receive the release pull request.
+    required: false
+    default: "main"
+  dry-run:
+    description: Preview the release without creating a commit, branch, or pull request.
+    required: false
+    default: "false"
+  github-token:
+    description: Token used to push the release branch.
+    required: true
+  install-command:
+    description: Optional project dependency install command to run before release.
+    required: false
+    default: ""
+  git-user-name:
+    description: git user.name for release commits.
+    required: false
+    default: "github-actions[bot]"
+  git-user-email:
+    description: git user.email for release commits.
+    required: false
+    default: "41898282+github-actions[bot]@users.noreply.github.com"
+outputs:
+  prepared:
+    description: true when a release branch was pushed.
+    value: ${{ steps.branch.outputs.prepared }}
+  version:
+    description: Prepared single-package release version.
+    value: ${{ steps.release.outputs.version }}
+  tag:
+    description: Prepared single-package release tag.
+    value: ${{ steps.release.outputs.tag }}
+  pull-request-url:
+    description: Compare URL for opening the release pull request.
+    value: ${{ steps.branch.outputs.url }}
+runs:
+  using: composite
+  steps:
+    - name: Set up Hooversion
+      shell: bash
+      env:
+        HOOVERSION_VERSION: ${{ inputs.version }}
+        RUNNER_OS_VALUE: ${{ runner.os }}
+        RUNNER_ARCH_VALUE: ${{ runner.arch }}
+      run: bash "$GITHUB_ACTION_PATH/../setup/install.sh"
+
+    - name: Configure release git author
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        GIT_USER_NAME: ${{ inputs.git-user-name }}
+        GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+        INPUT_GITHUB_TOKEN: ${{ inputs.github-token }}
+      run: |
+        set -euo pipefail
+        git config user.name "$GIT_USER_NAME"
+        git config user.email "$GIT_USER_EMAIL"
+        server="${GITHUB_SERVER_URL:-https://github.com}"
+        server="${server#https://}"
+        git remote set-url origin "https://x-access-token:${INPUT_GITHUB_TOKEN}@${server}/${GITHUB_REPOSITORY}.git"
+
+    - name: Install project dependencies
+      if: ${{ inputs.install-command != '' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INSTALL_COMMAND: ${{ inputs.install-command }}
+      run: |
+        set -euo pipefail
+        eval "$INSTALL_COMMAND"
+
+    - name: Prepare release commit
+      id: release
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_CONFIG: ${{ inputs.config }}
+        INPUT_DRY_RUN: ${{ inputs.dry-run }}
+      run: |
+        set -euo pipefail
+        args=(release --no-push --no-github)
+        if [ -n "$INPUT_CONFIG" ]; then
+          args+=(--config "$INPUT_CONFIG")
+        fi
+        if [ "$INPUT_DRY_RUN" = true ]; then
+          args+=(--dry-run)
+        fi
+        hooversion "${args[@]}"
+
+    - name: Push release branch
+      id: branch
+      if: ${{ steps.release.outputs.published == 'true' && inputs.dry-run != 'true' }}
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE_BRANCH: ${{ inputs.base-branch }}
+        RELEASE_TAG: ${{ steps.release.outputs.tag }}
+        RELEASE_VERSION: ${{ steps.release.outputs.version }}
+      run: |
+        set -euo pipefail
+        test -n "$RELEASE_TAG"
+        test -n "$RELEASE_VERSION"
+        branch="release/${RELEASE_TAG}"
+        git push origin "HEAD:refs/heads/${branch}"
+        url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${branch}?expand=1"
+        {
+          echo "prepared=true"
+          echo "url=$url"
+        } >> "$GITHUB_OUTPUT"
+        {
+          echo "## Release branch ready"
+          echo
+          echo "Open and merge the protected release PR: [$branch]($url)"
+        } >> "$GITHUB_STEP_SUMMARY"

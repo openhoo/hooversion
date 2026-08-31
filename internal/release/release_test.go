@@ -259,6 +259,41 @@ func TestResumesExactGeneratedReleaseCommitWithoutSecondCommit(t *testing.T) {
 	}
 }
 
+func TestResumesSquashMergedReleaseCommitAndCreatesMissingTag(t *testing.T) {
+	cwd := seedAppRepo(t)
+	config := singleAppConfig(false)
+
+	plan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := Execute(cwd, config, plan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil || !first.Published {
+		t.Fatalf("first run: %v %+v", err, first)
+	}
+	releaseHead := gitOut(t, cwd, "rev-parse", "HEAD")
+	commitCount := gitOut(t, cwd, "rev-list", "--count", "HEAD")
+	gitOut(t, cwd, "tag", "--delete", "v1.0.1")
+
+	rerunPlan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := Execute(cwd, config, rerunPlan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.Published || len(run.Plan.Releases) != 1 {
+		t.Fatalf("protected-branch resume result wrong: %+v", run)
+	}
+	if got := gitOut(t, cwd, "rev-list", "-n", "1", "v1.0.1"); got != releaseHead {
+		t.Fatalf("recreated tag points to %q, want %q", got, releaseHead)
+	}
+	if got := gitOut(t, cwd, "rev-list", "--count", "HEAD"); got != commitCount {
+		t.Fatalf("resume created extra commits: %s -> %s", commitCount, got)
+	}
+}
+
 func TestForeignUntrackedBlocksButManagedOutputsPreserved(t *testing.T) {
 	cwd := seedAppRepo(t)
 	config := singleAppConfig(false)

@@ -68,32 +68,20 @@ jobs:
           git push origin "HEAD:refs/heads/${branch}"
           echo "branch=${branch}" >> "$GITHUB_OUTPUT"
 
-      - name: Open and merge release PR
+      - name: Report release pull request URL
         if: steps.push.outputs.branch != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_BRANCH: ${{ steps.push.outputs.branch }}
           RELEASE_VERSION: ${{ steps.rel.outputs.version }}
           RELEASE_TAG: ${{ steps.rel.outputs.tag }}
         run: |
           set -euo pipefail
-          # Detached-HEAD checkout: gh cannot infer the PR, so thread the
-          # explicit URL from create into merge.
-          pr_url=$(gh pr create \
-            --base main --head "${RELEASE_BRANCH}" \
-            --title "chore(release): hooversion ${RELEASE_VERSION}" \
-            --body "Automated release PR for \`${RELEASE_TAG}\`. Merging publishes the GitHub Release.")
-          # Required status checks gate the merge; retry until they settle.
-          ok=
-          for _ in $(seq 1 60); do
-            if gh pr merge "$pr_url" --rebase \
-                 --subject "chore(release): hooversion ${RELEASE_VERSION}"; then
-              ok=1
-              break
-            fi
-            sleep 20
-          done
-          [ -n "$ok" ] || { echo "release PR did not become mergeable in time: $pr_url" >&2; exit 1; }
+          url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/main...${RELEASE_BRANCH}?expand=1"
+          {
+            echo "## Release branch ready"
+            echo
+            echo "Open and merge the protected release PR: [${RELEASE_TAG}]($url)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   publish:
     name: Publish release

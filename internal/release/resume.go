@@ -16,10 +16,11 @@ import (
 )
 
 // DeriveResumable reconstructs a ReleasePlan from an already-executed release
-// commit (HEAD carries the tag, manifest already bumped). It returns nil when
-// the repository state does not prove a resumable release: no HEAD^, no
-// package tagged at its manifest version at HEAD, wrong commit subject,
-// unresolvable version transition, or a byte-exact commit-message mismatch.
+// commit (manifest already bumped). The release tag may either already point at
+// HEAD or still be absent after a protected-branch release PR was squash-merged.
+// It returns nil when the repository state does not prove a resumable release:
+// no HEAD^, wrong commit subject, unresolvable version transition, or a
+// byte-exact commit-message mismatch.
 // Callers only invoke it for fresh plans with zero releases.
 func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.ReleasePlan, error) {
 	head, err := git.HeadSha(cwd)
@@ -34,57 +35,77 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 		return nil, nil
 	}
 
-	type taggedPackage struct {
+	type releasePackage struct {
 		pkg         types.NormalizedPackageConfig
 		nextVersion string
 		tag         string
 	}
-	var tagged []taggedPackage
-	for _, pkg := range config.Packages {
-		nextVersion, err := readManifestVersion(cwd, pkg)
-		if err != nil {
-			return nil, err
-		}
-		tag := plan.TagFor(config, pkg, nextVersion)
-		ref, err := git.RefSha(cwd, "refs/tags/"+tag)
-		if err != nil {
-			return nil, err
-		}
-		if ref == head {
-			tagged = append(tagged, taggedPackage{pkg: pkg, nextVersion: nextVersion, tag: tag})
-		}
-	}
-	if len(tagged) == 0 {
-		return nil, nil
-	}
-
 	message, err := git.CommitMessage(cwd, "HEAD")
 	if err != nil {
 		return nil, err
 	}
 	subject, body := splitSubjectBody(message)
-	var expectedSubject string
-	if len(tagged) == 1 {
-		expectedSubject = fmt.Sprintf("chore(release): %s %s", tagged[0].pkg.Name, tagged[0].nextVersion)
-	} else {
-		parts := make([]string, 0, len(tagged))
-		for _, entry := range tagged {
-			parts = append(parts, fmt.Sprintf("%s@%s", entry.pkg.Name, entry.nextVersion))
-		}
-		expectedSubject = fmt.Sprintf("chore(release): %s", strings.Join(parts, ", "))
-	}
-	if subject != expectedSubject {
+	const prefix = "chore(release): "
+	if !strings.HasPrefix(subject, prefix) {
 		return nil, nil
 	}
 
-	releases := make([]types.PackageRelease, 0, len(tagged))
-	for _, entry := range tagged {
+	versions := make(map[string]string, len(config.Packages))
+	packages := make(map[string]types.NormalizedPackageConfig, len(config.Packages))
+	for _, pkg := range config.Packages {
+		nextVersion, err := readManifestVersion(cwd, pkg)
+		if err != nil {
+			return nil, err
+		}
+		versions[pkg.Name] = nextVersion
+		packages[pkg.Name] = pkg
+	}
+
+	var selected []releasePackage
+	releaseSubject := strings.TrimPrefix(subject, prefix)
+	if name, version, ok := strings.Cut(releaseSubject, " "); ok && !strings.Contains(name, "@") {
+		pkg, exists := packages[name]
+		if !exists || versions[name] != version {
+			return nil, nil
+		}
+		selected = append(selected, releasePackage{
+			pkg: pkg, nextVersion: version, tag: plan.TagFor(config, pkg, version),
+		})
+	} else {
+		for _, part := range strings.Split(releaseSubject, ", ") {
+			name, version, ok := strings.Cut(part, "@")
+			pkg, exists := packages[name]
+			if !ok || !exists || versions[name] != version {
+				return nil, nil
+			}
+			selected = append(selected, releasePackage{
+				pkg: pkg, nextVersion: version, tag: plan.TagFor(config, pkg, version),
+			})
+		}
+		if len(selected) < 2 {
+			return nil, nil
+		}
+	}
+
+	for _, entry := range selected {
+		ref, err := git.RefSha(cwd, "refs/tags/"+entry.tag)
+		if err != nil {
+			return nil, err
+		}
+		if ref != "" && ref != head {
+			return nil, errors.New(
+				"Release resume found tag drift: expected %s at %s, found %s.", entry.tag, head, ref)
+		}
+	}
+
+	releases := make([]types.PackageRelease, 0, len(selected))
+	for _, entry := range selected {
 		currentVersion, releaseType, ok := inferReleaseTransition(cwd, config, entry.pkg, entry.nextVersion)
 		if !ok {
 			return nil, nil
 		}
 		notes := body
-		if len(tagged) > 1 {
+		if len(selected) > 1 {
 			marker := fmt.Sprintf("# %s %s\n\n", entry.pkg.Name, entry.nextVersion)
 			start := strings.Index(body, marker)
 			if start < 0 {
@@ -175,7 +196,7 @@ func inferReleaseTransition(
 
 // isResumableRelease reports whether HEAD is exactly the release commit of a
 // prior partial run: one commit ahead of plan.SourceSha, carrying the exact
-// release message, with every planned tag pointing at HEAD.
+// release message, with every planned tag either absent or pointing at HEAD.
 func isResumableRelease(cwd string, effective *types.ReleasePlan) bool {
 	if len(effective.Releases) == 0 {
 		return false
@@ -194,7 +215,7 @@ func isResumableRelease(cwd string, effective *types.ReleasePlan) bool {
 	}
 	for _, release := range effective.Releases {
 		ref, err := git.RefSha(cwd, "refs/tags/"+release.Tag)
-		if err != nil || ref != head {
+		if err != nil || (ref != "" && ref != head) {
 			return false
 		}
 	}

@@ -62,6 +62,24 @@ Hooversion verifies the source before mutation. If a prior run created the
 expected release commit and tags but did not finish publication, rerunning it
 resumes only that verified state and rejects remote drift.
 
-In repositories where `main` requires pull requests, allow GitHub Actions to
-bypass release-only branch protections so Hooversion can keep releases
-automatic while human changes remain pull-request gated.
+In repositories where `main` requires pull requests, use
+`actions/prepare-release`. It pushes the generated release commit to a release
+branch and writes the pull-request compare URL to the job summary. A maintainer
+opens and squash-merges that PR, so required checks and code scanning still gate
+the release. This works when enterprise policy forbids Actions-created PRs.
+
+```yaml
+permissions:
+  contents: write
+
+steps:
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    with:
+      fetch-depth: 0
+  - uses: openhoo/hooversion/actions/prepare-release@<immutable-commit>
+    with:
+      github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+After the squashed release commit lands on protected `main`, the repository
+release workflow must create the tag on that exact commit and publish artifacts.
