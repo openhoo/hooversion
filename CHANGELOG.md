@@ -1,5 +1,11 @@
 # @openhoo/hooversion Changelog
 
+## 1.1.0 (2026-08-31)
+
+### Features
+
+- **verify:** add published release verification (#30) (75d3a4b)
+
 ## 1.0.7 (2026-08-31)
 
 ### Bug Fixes
