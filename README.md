@@ -25,7 +25,7 @@ versionhoo-app
 Install with Go:
 
 ```sh
-go install github.com/openhoo/hooversion/cmd/hooversion@latest
+go install github.com/openhoo/hooversion/cmd/hooversion@v1.0.6
 ```
 
 Or download a prebuilt static binary from the
@@ -120,6 +120,11 @@ existing GitHub Release, and uploads only missing asset names. This makes the
 post-push GitHub Release/asset step retryable without another branch or tag
 push.
 
+This repository's release workflow publishes cross-platform archives together
+with an SPDX SBOM and sorted SHA-256 checksums. Every archive, SBOM, and checksum
+file receives a keyless Sigstore bundle plus a GitHub artifact attestation.
+Manual asset recovery rebuilds and reattests the same immutable tag.
+
 Release outputs are managed files. Each non-dry-run release clears prior
 generated output, writes `.hooversion/outputs.json` and per-tag notes, and
 writes `.release-version` only for a single release (removing it otherwise).
@@ -167,23 +172,23 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: openhoo/hooversion/actions/setup@v1.0.0
+      - uses: openhoo/hooversion/actions/setup@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.0
+          version: 1.0.6
       - run: hooversion plan
 
   commitlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: openhoo/hooversion/actions/lint@v1.0.0
+      - uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.0
+          version: 1.0.6
 
   release:
     runs-on: ubuntu-latest
@@ -192,13 +197,13 @@ jobs:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - id: release
-        uses: openhoo/hooversion/actions/release@v1.0.0
+        uses: openhoo/hooversion/actions/release@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.0
+          version: 1.0.6
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 

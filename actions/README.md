@@ -7,21 +7,21 @@ GitHub release for the requested version; no JavaScript runtime is required.
 ## Setup CLI
 
 ```yaml
-- uses: openhoo/hooversion/actions/setup@v1.0.0
+- uses: openhoo/hooversion/actions/setup@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
   with:
-    version: 1.0.0
+    version: 1.0.6
 - run: hooversion plan
 ```
 
 ## Lint Commits
 
 ```yaml
-- uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+- uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   with:
     fetch-depth: 0
-- uses: openhoo/hooversion/actions/lint@v1.0.0
+- uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
   with:
-    version: 1.0.0
+    version: 1.0.6
 ```
 
 ## Release
@@ -35,14 +35,14 @@ concurrency:
   cancel-in-progress: false
 
 steps:
-  - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+  - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
     with:
       fetch-depth: 0
       ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
   - id: release
-    uses: openhoo/hooversion/actions/release@v1.0.0
+    uses: openhoo/hooversion/actions/release@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
     with:
-      version: 1.0.0
+      version: 1.0.6
       install-command: npm ci
       github-token: ${{ secrets.GITHUB_TOKEN }}
 ```

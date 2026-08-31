@@ -6,6 +6,7 @@ packages:
     type: version-file
     manifest: VERSION
 hooks:
-  afterVersion: []
+  afterVersion:
+    - scripts/sync-action-versions.sh "$(tr -d '[:space:]' < VERSION)"
 github:
   releases: true
