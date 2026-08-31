@@ -1,5 +1,12 @@
 # @openhoo/hooversion Changelog
 
+## 1.0.7 (2026-08-31)
+
+### Bug Fixes
+
+- align Hoostack policy and release supply chain (#27) (29e0517)
+- **release:** support protected release pull requests (8eff47f)
+
 ## 1.0.6 (2026-08-30)
 
 ### Bug Fixes

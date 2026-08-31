@@ -9,7 +9,7 @@ GitHub release for the requested version; no JavaScript runtime is required.
 ```yaml
 - uses: openhoo/hooversion/actions/setup@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
   with:
-    version: 1.0.6
+    version: 1.0.7
 - run: hooversion plan
 ```
 
@@ -21,7 +21,7 @@ GitHub release for the requested version; no JavaScript runtime is required.
     fetch-depth: 0
 - uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
   with:
-    version: 1.0.6
+    version: 1.0.7
 ```
 
 ## Release
@@ -42,7 +42,7 @@ steps:
   - id: release
     uses: openhoo/hooversion/actions/release@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
     with:
-      version: 1.0.6
+      version: 1.0.7
       install-command: npm ci
       github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
