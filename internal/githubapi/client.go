@@ -9,7 +9,9 @@
 package githubapi
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -21,13 +23,15 @@ const (
 	githubAPIVersion = "2022-11-28"
 	userAgent        = "hooversion"
 	githubAccept     = "application/vnd.github+json"
+	maxJSONBody      = 32 << 20
+	maxErrorBody     = 1 << 20
 )
 
 // Client talks to the GitHub REST API with a fixed bearer credential.
 type Client struct {
 	// BaseURL is the API root without a trailing slash (normalized by New).
 	BaseURL string
-	// Token is sent as "Authorization: Bearer <Token>" on every request.
+	// Token is sent as "Authorization: Bearer <Token>" when non-empty.
 	Token string
 	// HTTP is the transport; nil selects http.DefaultClient.
 	HTTP *http.Client
@@ -49,7 +53,9 @@ func (c *Client) newRequest(method, rawURL, contentType string, body io.Reader) 
 		return nil, err
 	}
 	req.Header.Set("Accept", githubAccept)
-	req.Header.Set("Authorization", "Bearer "+c.Token)
+	if c.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+c.Token)
+	}
 	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
 	req.Header.Set("User-Agent", userAgent)
 	if contentType != "" {
@@ -74,8 +80,11 @@ func (c *Client) do(req *http.Request, notFoundIsEmpty bool) (*http.Response, er
 		return resp, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
 		resp.Body.Close()
+		if len(body) > maxErrorBody {
+			body = append(body[:maxErrorBody], []byte("...[truncated]")...)
+		}
 		return nil, hverr.New("GitHub API request failed (%d %s): %s", resp.StatusCode, http.StatusText(resp.StatusCode), body)
 	}
 	return resp, nil
@@ -90,7 +99,25 @@ func drainAndClose(resp *http.Response) {
 
 func decodeJSONBody(resp *http.Response, dst any) error {
 	defer resp.Body.Close()
-	return json.NewDecoder(resp.Body).Decode(dst)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxJSONBody+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxJSONBody {
+		return fmt.Errorf("GitHub API response exceeds %d bytes", maxJSONBody)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return hverr.New("GitHub API response contains trailing JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 // encodeURIComponent percent-encodes exactly like the JS helper used for tag

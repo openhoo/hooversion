@@ -13,6 +13,7 @@ hooversion lint --from origin/main --to HEAD
 hooversion plan
 hooversion release --dry-run
 hooversion release
+hooversion verify-release --repository openhoo/hooversion --tag v1.0.7
 hooversion doctor
 hooversion migrate
 hooversion help
@@ -53,6 +54,12 @@ hooversion doctor           # sanity-check config, git, tokens
   validates Conventional Commits; exactly one selector is required.
 - `plan [--config <path>]` prints the next release plan.
 - `release [--dry-run] [--no-push] [--no-github] [--config <path>]`.
+- `verify-release [--repository <owner/repo>] [--tag <tag>]` independently
+  downloads a published release, resolves its tag to a commit, and requires
+  exact `SHA256SUMS` coverage. Strict flags verify SBOMs, embedded licenses,
+  Sigstore bundles, GitHub attestations, or annotated-tag signatures. `--output`
+  writes a SLSA VSA only after every selected check passes. See
+  [Release verification](docs/release-verification.md).
 - `doctor [--config <path>]` prints `ok:`/`warning:`/`error:` findings.
 - `migrate` converts a legacy TypeScript config (see [Migration](#migration)).
 - `help`, `version`.
@@ -124,6 +131,11 @@ This repository's release workflow publishes cross-platform archives together
 with an SPDX SBOM and sorted SHA-256 checksums. Every archive, SBOM, and checksum
 file receives a keyless Sigstore bundle plus a GitHub artifact attestation.
 Manual asset recovery rebuilds and reattests the same immutable tag.
+
+Publication and verification remain separate states. `verify-release` reads the
+live tag, release metadata, assets, signatures, and attestations back from
+GitHub; a local build, green workflow, or existing tag alone is not accepted as
+proof of the published artifact set.
 
 Release outputs are managed files. Each non-dry-run release clears prior
 generated output, writes `.hooversion/outputs.json` and per-tag notes, and

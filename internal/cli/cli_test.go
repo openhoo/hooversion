@@ -4,12 +4,15 @@
 package cli
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/openhoo/hooversion/internal/verifyrelease"
 )
 
 const nodeAppConfig = "packages:\n  - name: app\n    type: node\ngithub:\n  enabled: false\npush: false\n"
@@ -499,6 +502,10 @@ func TestVersionHelpAndDefaultCommand(t *testing.T) {
 		"  hooversion lint --edit <commit-msg-file>\n" +
 		"  hooversion plan [--config <path>]\n" +
 		"  hooversion release [--dry-run] [--no-push] [--no-github] [--config <path>]\n" +
+		"  hooversion verify-release [--repository <owner/repo>] [--tag <tag>] [--checksums <asset>] [--require-sbom] [--require-license]\n" +
+		"                            [--require-signatures --signature-identity <identity> --signature-issuer <issuer>]\n" +
+		"                            [--require-attestations --signer-workflow <owner/repo/path>] [--source-ref <ref>]\n" +
+		"                            [--require-signed-tag] [--output <path>]\n" +
 		"  hooversion doctor [--config <path>]\n" +
 		"  hooversion app\n\n"
 
@@ -520,6 +527,59 @@ func TestVersionHelpAndDefaultCommand(t *testing.T) {
 	stdout, _, _ = runCLI(t, cwd, "dev", "-v")
 	if stdout != "hooversion dev\n" {
 		t.Fatalf("-v output = %q", stdout)
+	}
+}
+
+func TestVerifyReleaseMapsStrictPolicyAndWritesVSAExclusively(t *testing.T) {
+	cwd := t.TempDir()
+	output := filepath.Join(cwd, "release.vsa.json")
+	saved := runVerifyRelease
+	defer func() { runVerifyRelease = saved }()
+	var received verifyrelease.Options
+	runVerifyRelease = func(_ context.Context, options verifyrelease.Options) (verifyrelease.Result, error) {
+		received = options
+		return verifyrelease.Result{
+			Repository: options.Repository,
+			Tag:        options.Tag,
+			TagCommit:  strings.Repeat("a", 40),
+			Statement: verifyrelease.Statement{
+				Type:          "https://in-toto.io/Statement/v1",
+				PredicateType: verifyrelease.VSAPredicateType,
+				Subject: []verifyrelease.Subject{
+					{Name: "artifact.tar.gz", Digest: map[string]string{"sha256": strings.Repeat("b", 64)}},
+					{Name: "SHA256SUMS", Digest: map[string]string{"sha256": strings.Repeat("c", 64)}},
+				},
+			},
+		}, nil
+	}
+	t.Setenv("GH_TOKEN", "test-token")
+	stdout, stderr, code := runCLI(t, cwd, "dev",
+		"verify-release", "--repository", "openhoo/demo", "--tag", "v1.2.3",
+		"--checksums", "SUMS", "--require-sbom", "--require-license", "--require-signed-tag",
+		"--require-signatures", "--signature-identity", "identity", "--signature-issuer", "issuer",
+		"--require-attestations", "--signer-workflow", "openhoo/demo/.github/workflows/release.yml",
+		"--source-ref", "refs/heads/main", "--verifier-id", "verifier", "--policy-uri", "policy",
+		"--api-url", "https://api.example.test", "--output", output,
+	)
+	if code != 0 || stderr != "" {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if received.Repository != "openhoo/demo" || received.Token != "test-token" || received.ChecksumsAsset != "SUMS" ||
+		!received.RequireSBOM || !received.RequireLicense || !received.RequireSignedTag || !received.RequireSignatures ||
+		!received.RequireAttestations || received.SignatureIdentity != "identity" || received.SignatureIssuer != "issuer" ||
+		received.SignerWorkflow != "openhoo/demo/.github/workflows/release.yml" || received.SourceRef != "refs/heads/main" ||
+		received.VerifierID != "verifier" || received.PolicyURI != "policy" || received.APIURL != "https://api.example.test" {
+		t.Fatalf("options not mapped: %#v", received)
+	}
+	if !strings.Contains(stdout, "Verified 2 release artifacts for openhoo/demo@v1.2.3") {
+		t.Fatalf("unexpected stdout: %q", stdout)
+	}
+	data, err := os.ReadFile(output)
+	if err != nil || !strings.Contains(string(data), verifyrelease.VSAPredicateType) {
+		t.Fatalf("VSA data=%q err=%v", data, err)
+	}
+	if _, _, code := runCLI(t, cwd, "dev", "verify-release", "--repository", "openhoo/demo", "--tag", "v1.2.3", "--output", output); code == 0 {
+		t.Fatal("existing VSA output was overwritten")
 	}
 }
 
