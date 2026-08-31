@@ -45,12 +45,10 @@ type Result struct {
 // managed-output exemption, mutations, atomic push, GitHub publish, outputs.
 func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, o Options) (Result, error) {
 	effective := plan
-	if len(plan.Releases) == 0 {
-		if derived, err := DeriveResumable(cwd, config); err != nil {
-			return Result{}, err
-		} else if derived != nil {
-			effective = derived
-		}
+	if derived, err := DeriveResumable(cwd, config); err != nil {
+		return Result{}, err
+	} else if derived != nil {
+		effective = derived
 	}
 	resumable := isResumableRelease(cwd, effective)
 
@@ -121,6 +119,19 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 			message := fmt.Sprintf("%s %s", release.Package.Name, release.NextVersion)
 			if err := git.CreateAnnotatedTag(cwd, release.Tag, message); err != nil {
 				return Result{}, err
+			}
+		}
+	} else {
+		for _, release := range effective.Releases {
+			ref, err := git.RefSha(cwd, "refs/tags/"+release.Tag)
+			if err != nil {
+				return Result{}, err
+			}
+			if ref == "" {
+				message := fmt.Sprintf("%s %s", release.Package.Name, release.NextVersion)
+				if err := git.CreateAnnotatedTag(cwd, release.Tag, message); err != nil {
+					return Result{}, err
+				}
 			}
 		}
 	}
