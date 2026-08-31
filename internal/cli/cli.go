@@ -9,6 +9,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -23,13 +24,17 @@ import (
 	"github.com/openhoo/hooversion/internal/git"
 	"github.com/openhoo/hooversion/internal/plan"
 	"github.com/openhoo/hooversion/internal/release"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
+	"github.com/openhoo/hooversion/internal/verifyrelease"
 )
 
 // AppEntry starts the Versionhoo app server with an env lookup function.
 // cmd/hooversion assigns it from internal/app before calling Run; when nil,
 // `hooversion app` fails with a dedicated error.
 var AppEntry func(getenv func(string) string) error
+
+var runVerifyRelease = verifyrelease.Verify
 
 // cliFlags is the parsed flag set of one invocation.
 type cliFlags struct {
@@ -58,9 +63,20 @@ var commandOptions = map[string]commandSpec{
 		values:   []string{"action-owner-repo", "action-ref", "hooversion-version"},
 		booleans: []string{"force", "no-workflow"},
 	},
-	"lint":      {values: []string{"edit", "from", "to"}, booleans: []string{"last"}},
-	"plan":      {values: []string{"config"}, booleans: []string{}},
-	"release":   {values: []string{"config"}, booleans: []string{"dry-run", "no-push", "no-github"}},
+	"lint":    {values: []string{"edit", "from", "to"}, booleans: []string{"last"}},
+	"plan":    {values: []string{"config"}, booleans: []string{}},
+	"release": {values: []string{"config"}, booleans: []string{"dry-run", "no-push", "no-github"}},
+	"verify-release": {
+		values: []string{
+			"repository", "tag", "api-url", "checksums", "output",
+			"signature-identity", "signature-issuer", "signer-workflow", "source-ref",
+			"verifier-id", "policy-uri",
+		},
+		booleans: []string{
+			"require-sbom", "require-license", "require-signed-tag",
+			"require-signatures", "require-attestations",
+		},
+	},
 	"doctor":    {values: []string{"config"}, booleans: []string{}},
 	"migrate":   {values: []string{}, booleans: []string{}}, // accepts one optional positional path
 	"app":       {values: []string{}, booleans: []string{}},
@@ -101,6 +117,8 @@ func Run(args []string, version string) int {
 		err = planCommand(cwd, flags)
 	case "release":
 		err = releaseCommand(cwd, flags)
+	case "verify-release":
+		err = verifyReleaseCommand(cwd, flags)
 	case "doctor":
 		err = doctorCommand(cwd, flags)
 	case "migrate":
@@ -453,6 +471,83 @@ func releaseCommand(cwd string, flags *cliFlags) error {
 	return nil
 }
 
+func verifyReleaseCommand(cwd string, flags *cliFlags) error {
+	repository := flags.value("repository")
+	if repository == "" {
+		var err error
+		repository, err = git.OriginRepository(cwd)
+		if err != nil {
+			return err
+		}
+		if repository == "" {
+			return hverrors.New("verify-release requires --repository <owner/name> outside a recognized GitHub checkout.")
+		}
+	}
+	token := os.Getenv("GH_TOKEN")
+	if token == "" {
+		token = os.Getenv("GITHUB_TOKEN")
+	}
+	result, err := runVerifyRelease(context.Background(), verifyrelease.Options{
+		Repository:          repository,
+		Tag:                 flags.value("tag"),
+		APIURL:              flags.value("api-url"),
+		Token:               token,
+		ChecksumsAsset:      flags.value("checksums"),
+		RequireSBOM:         flags.boolean("require-sbom"),
+		RequireLicense:      flags.boolean("require-license"),
+		RequireSignedTag:    flags.boolean("require-signed-tag"),
+		RequireSignatures:   flags.boolean("require-signatures"),
+		SignatureIdentity:   flags.value("signature-identity"),
+		SignatureIssuer:     flags.value("signature-issuer"),
+		RequireAttestations: flags.boolean("require-attestations"),
+		SignerWorkflow:      flags.value("signer-workflow"),
+		SourceRef:           flags.value("source-ref"),
+		VerifierID:          flags.value("verifier-id"),
+		PolicyURI:           flags.value("policy-uri"),
+	})
+	if err != nil {
+		return err
+	}
+	if outputPath := flags.value("output"); outputPath != "" {
+		data, err := verifyrelease.MarshalStatement(result.Statement)
+		if err != nil {
+			return err
+		}
+		if err := writeExclusive(outputPath, data); err != nil {
+			return fmt.Errorf("write verification statement: %w", err)
+		}
+		fmt.Fprintf(os.Stdout, "Wrote VSA to %s.\n", outputPath)
+	}
+	fmt.Fprintf(os.Stdout, "Verified %d release artifacts for %s@%s at commit %s.\n",
+		len(result.Statement.Subject), result.Repository, result.Tag, result.TagCommit)
+	return nil
+}
+
+func writeExclusive(path string, data []byte) (err error) {
+	file, err := safefs.CreateExclusive(path, 0o600)
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		_ = file.Close()
+		if !keep {
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	keep = true
+	return nil
+}
+
 func doctorCommand(cwd string, flags *cliFlags) error {
 	cfg, err := config.Load(cwd, flags.value("config"))
 	if err != nil {
@@ -582,6 +677,10 @@ Usage:
   hooversion lint --edit <commit-msg-file>
   hooversion plan [--config <path>]
   hooversion release [--dry-run] [--no-push] [--no-github] [--config <path>]
+  hooversion verify-release [--repository <owner/repo>] [--tag <tag>] [--checksums <asset>] [--require-sbom] [--require-license]
+                            [--require-signatures --signature-identity <identity> --signature-issuer <issuer>]
+                            [--require-attestations --signer-workflow <owner/repo/path>] [--source-ref <ref>]
+                            [--require-signed-tag] [--output <path>]
   hooversion doctor [--config <path>]
   hooversion app
 `+"\n")
