@@ -47,7 +47,7 @@ Alternatively install it with Go or download a prebuilt binary from GitHub
 Releases:
 
 ```sh
-go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.0.7
+go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.0
 versionhoo-app
 ```
 

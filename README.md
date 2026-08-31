@@ -26,7 +26,7 @@ versionhoo-app
 Install with Go:
 
 ```sh
-go install github.com/openhoo/hooversion/cmd/hooversion@v1.0.7
+go install github.com/openhoo/hooversion/cmd/hooversion@v1.1.0
 ```
 
 Or download a prebuilt static binary from the
@@ -189,7 +189,7 @@ jobs:
           fetch-depth: 0
       - uses: openhoo/hooversion/actions/setup@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.7
+          version: 1.1.0
       - run: hooversion plan
 
   commitlint:
@@ -200,7 +200,7 @@ jobs:
           fetch-depth: 0
       - uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.7
+          version: 1.1.0
 
   release:
     runs-on: ubuntu-latest
@@ -215,7 +215,7 @@ jobs:
       - id: release
         uses: openhoo/hooversion/actions/release@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
         with:
-          version: 1.0.7
+          version: 1.1.0
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
