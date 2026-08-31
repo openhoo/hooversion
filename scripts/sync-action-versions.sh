@@ -50,7 +50,7 @@ for meta in actions/*/action.y*ml; do
   rewrite "$meta"
 done
 
-for doc in README.md actions/README.md; do
+for doc in README.md actions/README.md docs/github-app.md; do
   [ -f "$doc" ] || continue
   rewrite "$doc"
 done

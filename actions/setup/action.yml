@@ -4,7 +4,7 @@ inputs:
   version:
     description: Hooversion release version to install.
     required: false
-    default: "1.0.1"
+    default: "1.0.6"
 outputs:
   version:
     description: Hooversion version configured by this action.

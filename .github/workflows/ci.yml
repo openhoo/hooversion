@@ -15,14 +15,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Dogfood Hooversion commit lint action
         uses: ./actions/lint
         with:
-          version: 1.0.3
+          version: 1.0.6
 
   build:
     name: Test and build
@@ -30,10 +30,10 @@ jobs:
     needs: commitlint
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
 
@@ -45,30 +45,40 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Enforce Hoolicy policy
-        uses: openhoo/hoolicy/actions/check@584ed5abf673dfb9b1d5279dfaa78329a94a9ea5 # v0.2.3
+        uses: openhoo/hoolicy/actions/check@f1b9be32483e3353e38ef3b5703217d2723e735e # v0.2.4
         with:
-          version: 0.2.3
+          version: 0.2.4
 
       - name: Scan with Hooray
-        uses: openhoo/hooray/actions/scan@d06c0948b4747995e2ef755cb6260d07f75c1b14 # v0.6.2
+        uses: openhoo/hooray/actions/scan@5446c51a79d115048601d3f42d6a9127b49fb322 # v0.6.3
         with:
-          version: 0.6.2
+          version: 0.6.3
           policy: hooray-policy.yaml
           format: table
           output: ""
 
       - name: Analyze with Hoonarqube
-        uses: openhoo/hoonarqube/actions/analyze@79e847af3edebc70685aaf90d3db7cdfcb557e97 # v0.2.2
+        uses: openhoo/hoonarqube/actions/analyze@0ed50de75e6e8c097c44e6b50a16f6d8817acedf # v0.2.3
         with:
-          version: 0.2.2
+          version: 0.2.3
           paths: |
             cmd
             internal
           output: ${{ runner.temp }}/hoonarqube.json
           fail-on: none
+
+      - name: Set up HooNeedsUpdates
+        uses: openhoo/hooneedsupdates/actions/setup@4a833fd00dafc8fb017d5cabec0c38dddba4bc70 # v0.1.1
+        with:
+          version: 0.1.1
+
+      - name: Audit dependency freshness
+        run: hooneedsupdates scan --fail-on unresolved .
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
