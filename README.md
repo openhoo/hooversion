@@ -13,7 +13,7 @@ hooversion lint --from origin/main --to HEAD
 hooversion plan
 hooversion release --dry-run
 hooversion release
-hooversion verify-release --repository openhoo/hooversion --tag v1.0.7
+hooversion verify-release --repository openhoo/hooversion --tag v1.1.0
 hooversion doctor
 hooversion migrate
 hooversion help
@@ -187,7 +187,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: openhoo/hooversion/actions/setup@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
+      - uses: openhoo/hooversion/actions/setup@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
         with:
           version: 1.1.0
       - run: hooversion plan
@@ -198,7 +198,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: openhoo/hooversion/actions/lint@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
+      - uses: openhoo/hooversion/actions/lint@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
         with:
           version: 1.1.0
 
@@ -213,7 +213,7 @@ jobs:
         with:
           fetch-depth: 0
       - id: release
-        uses: openhoo/hooversion/actions/release@528576f6fbc6136ec5f76ac53bf81d3e04aca4b3 # v1.0.6
+        uses: openhoo/hooversion/actions/release@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
         with:
           version: 1.1.0
           github-token: ${{ secrets.GITHUB_TOKEN }}
