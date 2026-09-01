@@ -8,7 +8,7 @@ release mutation and emits no VSA until every selected policy check passes.
 ```sh
 hooversion verify-release \
   --repository openhoo/hooversion \
-  --tag v1.0.7
+  --tag v1.1.0
 ```
 
 Without `--tag`, GitHub's latest release is selected. Inside a recognized
@@ -32,7 +32,7 @@ Baseline verification:
 
 ```sh
 repo=openhoo/hooversion
-tag=v1.0.7
+tag=v1.1.0
 hooversion verify-release \
   --repository "$repo" \
   --tag "$tag" \
@@ -86,7 +86,7 @@ version: 1
 external:
   - id: published-release
     type: provenance
-    path: evidence/v1.0.7.vsa.intoto.json
+    path: evidence/v1.1.0.vsa.intoto.json
     sha256: sha256:<digest-of-vsa-file>
     subjectDigest: sha256:<one-verified-release-subject>
     requiredProducer: https://openhoo.dev/hooversion/verify-release/v1
