@@ -11,8 +11,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to rebuild and re-upload assets for (e.g. v1.0.1)'
-        required: true
+        description: 'Existing release tag to rebuild assets; leave empty to prepare a release from main'
+        required: false
+        default: ''
         type: string
 
 permissions:
@@ -26,9 +27,18 @@ jobs:
   prepare:
     name: Prepare release PR
     if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'push' &&
-      !contains(github.event.workflow_run.head_commit.message, 'chore(release):')
+      (
+        github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' &&
+        inputs.tag == ''
+      ) ||
+      (
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -38,7 +48,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && 'main' || github.event.workflow_run.head_sha }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -86,9 +96,11 @@ jobs:
   publish:
     name: Publish release
     if: >-
+      github.event_name == 'workflow_run' &&
       github.event.workflow_run.conclusion == 'success' &&
       github.event.workflow_run.event == 'push' &&
-      contains(github.event.workflow_run.head_commit.message, 'chore(release):')
+      github.event.workflow_run.head_branch == 'main' &&
+      startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
     runs-on: ubuntu-latest
     permissions:
       attestations: write
@@ -212,29 +224,59 @@ jobs:
 
   rebuild-assets:
     name: Rebuild assets
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.tag != ''
     runs-on: ubuntu-latest
+    env:
+      REBUILD_TAG: ${{ inputs.tag }}
     permissions:
       attestations: write
       contents: write
       id-token: write
     steps:
+      - name: Validate rebuild tag input
+        shell: bash
+        env:
+          REBUILD_TAG: ${{ env.REBUILD_TAG }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$REBUILD_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::rebuild tag must be a stable semantic version prefixed with v." >&2
+            exit 2
+          fi
+
       - name: Checkout tag
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          ref: ${{ env.REBUILD_TAG }}
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: stable
 
-      - name: Read release version
+      - name: Read and verify release metadata
         id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REBUILD_TAG: ${{ env.REBUILD_TAG }}
         run: |
           set -euo pipefail
-          echo "version=$(cat VERSION)" >> "$GITHUB_OUTPUT"
-
+          version="${REBUILD_TAG#v}"
+          test "$(tr -d '[:space:]' < VERSION)" = "$version"
+          git fetch --no-tags origin main
+          tag_commit="$(git rev-parse --verify "${REBUILD_TAG}^{commit}")"
+          head_commit="$(git rev-parse --verify HEAD)"
+          test "$tag_commit" = "$head_commit"
+          test "$(git log -1 --format=%s HEAD)" = "chore(release): hooversion ${version}"
+          git merge-base --is-ancestor "$head_commit" refs/remotes/origin/main
+          gh release view "$REBUILD_TAG" >/dev/null
+          {
+            echo "version=$version"
+            echo "tag=$REBUILD_TAG"
+            echo "commit=$head_commit"
+          } >> "$GITHUB_OUTPUT"
       - name: Build release binaries
         env:
           RELEASE_VERSION: ${{ steps.meta.outputs.version }}
@@ -262,7 +304,7 @@ jobs:
         with:
           path: .
           format: spdx-json
-          output-file: dist/hooversion_${{ inputs.tag }}.spdx.json
+          output-file: dist/hooversion_v${{ steps.meta.outputs.version }}.spdx.json
           artifact-name: hooversion-sbom.spdx.json
           syft-version: v1.51.0
           upload-artifact: false
@@ -289,4 +331,5 @@ jobs:
       - name: Upload release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload "${{ inputs.tag }}" dist/* --clobber
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

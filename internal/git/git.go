@@ -68,9 +68,19 @@ func runCommand(cwd string, env []string, args ...string) commandResult {
 	return res
 }
 
-// childEnv merges auth variables over the parent environment, exactly like the
-// TS `{ ...process.env, ...auth }` spawnSync merge. Nil means "inherit parent
-// env untouched".
+// childEnv merges auth variables over base. A nil base preserves ordinary CLI
+// inheritance; an explicit base is copied so release execution is isolated.
+func childEnvWithBase(base []string, auth types.GitAuth) []string {
+	if base == nil {
+		return childEnv(auth)
+	}
+	env := append([]string{}, base...)
+	for k, v := range auth {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
 func childEnv(auth types.GitAuth) []string {
 	if len(auth) == 0 {
 		return nil
@@ -80,6 +90,18 @@ func childEnv(auth types.GitAuth) []string {
 		env = append(env, k+"="+v)
 	}
 	return env
+}
+
+func gitRunWithBase(cwd string, args []string, allowFailure bool, auth types.GitAuth, base []string) (string, error) {
+	res := runCommand(cwd, childEnvWithBase(base, auth), args...)
+	if res.code != 0 && !allowFailure {
+		detail := res.stderr
+		if detail == "" {
+			detail = res.stdout
+		}
+		return "", hverrors.New("git %s failed:\n%s", strings.Join(args, " "), detail)
+	}
+	return trimEnd(res.stdout), nil
 }
 
 func trimEnd(s string) string {
@@ -486,4 +508,387 @@ func OriginRepository(cwd string) (string, error) {
 		return m[1], nil
 	}
 	return "", nil
+}
+
+// HeadShaWithEnv is HeadSha with an explicit child environment.
+func HeadShaWithEnv(cwd string, baseEnv []string) (string, error) {
+	out, err := gitRunWithBase(cwd, []string{"rev-parse", "HEAD"}, false, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// RefShaWithEnv resolves a whitelisted revision with an explicit environment.
+func RefShaWithEnv(cwd, ref string, baseEnv []string) (string, error) {
+	var commitRef string
+	switch {
+	case ref == "HEAD" || ref == "HEAD^" || isFullSha(ref):
+		commitRef = ref
+	case strings.HasPrefix(ref, "refs/tags/"):
+		tag := strings.TrimPrefix(ref, "refs/tags/")
+		if err := AssertValidGitRef("tag", tag); err != nil {
+			return "", err
+		}
+		commitRef = ref + "^{commit}"
+	case strings.HasPrefix(ref, "refs/heads/"):
+		if err := AssertValidGitRef("branch", strings.TrimPrefix(ref, "refs/heads/")); err != nil {
+			return "", err
+		}
+		commitRef = ref
+	default:
+		return "", hverrors.New("Invalid Git revision: %s", jsQuote(ref))
+	}
+	res := runCommand(cwd, childEnvWithBase(baseEnv, nil), "rev-parse", "--verify", "--quiet", "--end-of-options", commitRef)
+	if res.code != 0 {
+		return "", nil
+	}
+	return strings.TrimSpace(res.stdout), nil
+}
+
+// RemoteTagSha resolves a remote tag, peeling annotated tags to their commit.
+// It returns ErrNoRemote when origin is not configured and an empty SHA when
+// the tag is absent.
+func RemoteTagSha(cwd, tag string) (string, error) {
+	return RemoteTagShaWithEnv(cwd, tag, nil)
+}
+
+func RemoteTagShaWithEnv(cwd, tag string, baseEnv []string) (string, error) {
+	if err := AssertValidGitRef("tag", tag); err != nil {
+		return "", err
+	}
+	remote, err := gitRunWithBase(cwd, []string{"config", "--get", "remote.origin.url"}, true, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(remote) == "" {
+		return "", ErrNoRemote
+	}
+	out, err := gitRunWithBase(cwd, []string{"ls-remote", "--", "origin", "refs/tags/" + tag, "refs/tags/" + tag + "^{}"}, true, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	var direct, peeled string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[1] {
+		case "refs/tags/" + tag:
+			direct = fields[0]
+		case "refs/tags/" + tag + "^{}":
+			peeled = fields[0]
+		}
+	}
+	if peeled != "" {
+		return peeled, nil
+	}
+	return direct, nil
+}
+
+func RemoteBranchShaWithEnv(cwd, branch string, baseEnv []string) (string, error) {
+	if err := AssertValidGitRef("branch", branch); err != nil {
+		return "", err
+	}
+	remote, err := gitRunWithBase(cwd, []string{"config", "--get", "remote.origin.url"}, true, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(remote) == "" {
+		return "", ErrNoRemote
+	}
+	output, err := gitRunWithBase(cwd, []string{"ls-remote", "--", "origin", "refs/heads/" + branch}, true, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return fields[0], nil
+}
+
+func RemoteBranchShaWithAuthEnv(cwd, branch string, baseEnv []string, auth types.GitAuth) (string, error) {
+	if err := AssertValidGitRef("branch", branch); err != nil {
+		return "", err
+	}
+	remote, err := gitRunWithBase(cwd, []string{"config", "--get", "remote.origin.url"}, true, auth, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(remote) == "" {
+		return "", ErrNoRemote
+	}
+	output, err := gitRunWithBase(cwd, []string{"ls-remote", "--", "origin", "refs/heads/" + branch}, true, auth, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return "", nil
+	}
+	return fields[0], nil
+}
+
+func RemoteTagShaWithAuthEnv(cwd, tag string, baseEnv []string, auth types.GitAuth) (string, error) {
+	if err := AssertValidGitRef("tag", tag); err != nil {
+		return "", err
+	}
+	remote, err := gitRunWithBase(cwd, []string{"config", "--get", "remote.origin.url"}, true, auth, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(remote) == "" {
+		return "", ErrNoRemote
+	}
+	out, err := gitRunWithBase(cwd, []string{"ls-remote", "--", "origin", "refs/tags/" + tag, "refs/tags/" + tag + "^{}"}, true, auth, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	var direct, peeled string
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		switch fields[1] {
+		case "refs/tags/" + tag:
+			direct = fields[0]
+		case "refs/tags/" + tag + "^{}":
+			peeled = fields[0]
+		}
+	}
+	if peeled != "" {
+		return peeled, nil
+	}
+	return direct, nil
+}
+
+// FileAtRef returns a repository file from a whitelisted revision.
+func FileAtRef(cwd, ref, path string) ([]byte, error) {
+	return FileAtRefWithEnv(cwd, ref, path, nil)
+}
+
+func FileAtRefWithEnv(cwd, ref, path string, baseEnv []string) ([]byte, error) {
+	if _, err := RefShaWithEnv(cwd, ref, baseEnv); err != nil {
+		return nil, err
+	}
+	clean := filepath.Clean(path)
+	if filepath.IsAbs(path) || clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, hverrors.New("Invalid Git path: %s", jsQuote(path))
+	}
+	res := runCommand(cwd, childEnvWithBase(baseEnv, nil), "show", ref+":"+filepath.ToSlash(clean))
+	if res.code != 0 {
+		detail := res.stderr
+		if detail == "" {
+			detail = res.stdout
+		}
+		return nil, hverrors.New("git show %s failed:\n%s", ref+":"+filepath.ToSlash(clean), detail)
+	}
+	return []byte(res.stdout), nil
+}
+
+func CurrentBranchWithEnv(cwd string, baseEnv []string) (string, error) {
+	branch, err := gitRunWithBase(cwd, []string{"branch", "--show-current"}, false, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	branch = strings.TrimSpace(branch)
+	if branch != "" {
+		return branch, nil
+	}
+	if v := os.Getenv("GITHUB_HEAD_REF"); v != "" {
+		return v, nil
+	}
+	if os.Getenv("GITHUB_REF_TYPE") != "tag" {
+		if v := os.Getenv("GITHUB_REF_NAME"); v != "" {
+			return v, nil
+		}
+	}
+	out, err := gitRunWithBase(cwd, []string{"rev-parse", "--abbrev-ref", "HEAD"}, false, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+func EnsureCleanWorkingTreeWithEnv(cwd string, managed map[string]bool, baseEnv []string) error {
+	exempt := make(map[string]bool, len(managed))
+	abs := func(p string) string {
+		if filepath.IsAbs(p) {
+			return filepath.Clean(p)
+		}
+		return filepath.Join(cwd, p)
+	}
+	for p := range managed {
+		exempt[abs(p)] = true
+	}
+	statusOut, err := gitRunWithBase(cwd, []string{"status", "--porcelain", "--untracked-files=all"}, false, nil, baseEnv)
+	if err != nil {
+		return err
+	}
+	var unexpected []string
+	for _, line := range strings.Split(statusOut, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		entry := line
+		if len(line) > 3 {
+			entry = strings.TrimSpace(line[3:])
+		}
+		if !exempt[abs(entry)] {
+			unexpected = append(unexpected, line)
+		}
+	}
+	for dir, scoped := range managed {
+		if !scoped {
+			continue
+		}
+		rel := dir
+		if filepath.IsAbs(dir) {
+			rel, err = filepath.Rel(cwd, dir)
+			if err != nil {
+				continue
+			}
+		}
+		if rel == "." || rel == ".." || rel == "" || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		ignoredOut, err := gitRunWithBase(cwd, []string{
+			"ls-files", "--others", "--ignored", "--exclude-standard", "--", rel,
+		}, true, nil, baseEnv)
+		if err != nil {
+			continue
+		}
+		for _, p := range strings.Split(ignoredOut, "\n") {
+			p = strings.TrimSpace(p)
+			if p == "" || exempt[abs(p)] {
+				continue
+			}
+			unexpected = append(unexpected, "?? "+p)
+		}
+	}
+	if len(unexpected) > 0 {
+		return hverrors.New("Working tree must be clean before release:\n%s", strings.Join(unexpected, "\n"))
+	}
+	return nil
+}
+
+func LatestTagWithEnv(cwd, pattern string, baseEnv []string) (string, error) {
+	output, err := gitRunWithBase(cwd, []string{"describe", "--tags", "--abbrev=0", "--match", pattern}, true, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return "", ErrNoTag
+	}
+	return output, nil
+}
+
+func TagExistsWithEnv(cwd, tag string, baseEnv []string) (bool, error) {
+	if err := AssertValidGitRef("tag", tag); err != nil {
+		return false, err
+	}
+	return runCommand(cwd, childEnvWithBase(baseEnv, nil), "rev-parse", "--verify", "--quiet", "refs/tags/"+tag).code == 0, nil
+}
+
+func CommitMessageWithEnv(cwd, ref string, baseEnv []string) (string, error) {
+	return gitRunWithBase(cwd, []string{"show", "-s", "--format=%B", ref}, false, nil, baseEnv)
+}
+
+func CreateReleaseCommitWithEnv(cwd, message string, baseEnv []string) error {
+	if _, err := gitRunWithBase(cwd, []string{"add", "--all"}, false, nil, baseEnv); err != nil {
+		return err
+	}
+	status, err := gitRunWithBase(cwd, []string{"status", "--porcelain"}, false, nil, baseEnv)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(status) == "" {
+		return nil
+	}
+	_, err = gitRunWithBase(cwd, []string{"commit", "-m", message}, false, nil, baseEnv)
+	return err
+}
+
+func CreateAnnotatedTagWithEnv(cwd, tag, message string, baseEnv []string) error {
+	if err := AssertValidGitRef("tag", tag); err != nil {
+		return err
+	}
+	_, err := gitRunWithBase(cwd, []string{"tag", "-a", tag, "-m", message}, false, nil, baseEnv)
+	return err
+}
+
+func PushReleaseWithEnv(cwd, branch string, tags []string, auth types.GitAuth, baseEnv []string) error {
+	if err := AssertValidGitRef("branch", branch); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if err := AssertValidGitRef("tag", tag); err != nil {
+			return err
+		}
+	}
+	args := []string{"push", "--atomic", "--no-verify", "--", "origin", "HEAD:refs/heads/" + branch}
+	for _, tag := range tags {
+		args = append(args, "refs/tags/"+tag)
+	}
+	_, err := gitRunWithBase(cwd, args, false, auth, baseEnv)
+	return err
+}
+
+func OriginRepositoryWithEnv(cwd string, baseEnv []string) (string, error) {
+	remote, err := gitRunWithBase(cwd, []string{"config", "--get", "remote.origin.url"}, true, nil, baseEnv)
+	if err != nil {
+		return "", err
+	}
+	remote = strings.TrimSpace(remote)
+	if remote == "" {
+		return "", nil
+	}
+	if m := sshRepoRE.FindStringSubmatch(remote); m != nil {
+		return m[1], nil
+	}
+	if m := httpsRepoRE.FindStringSubmatch(remote); m != nil {
+		return m[1], nil
+	}
+	return "", nil
+}
+
+func CommitsWithEnv(cwd, from, to string, baseEnv []string) ([]types.RawCommit, error) {
+	rangeArg := to
+	if from != "" {
+		rangeArg = from + ".." + to
+	}
+	revList, err := gitRunWithBase(cwd, []string{"rev-list", "--reverse", rangeArg}, true, nil, baseEnv)
+	if err != nil {
+		return nil, err
+	}
+	if revList == "" {
+		return []types.RawCommit{}, nil
+	}
+	commits := make([]types.RawCommit, 0)
+	for _, hash := range strings.Split(revList, "\n") {
+		subject, err := gitRunWithBase(cwd, []string{"show", "-s", "--format=%s", hash}, false, nil, baseEnv)
+		if err != nil {
+			return nil, err
+		}
+		body, err := gitRunWithBase(cwd, []string{"show", "-s", "--format=%b", hash}, false, nil, baseEnv)
+		if err != nil {
+			return nil, err
+		}
+		filesOut, err := gitRunWithBase(cwd, []string{"diff-tree", "--root", "--no-commit-id", "--name-only", "-r", hash}, true, nil, baseEnv)
+		if err != nil {
+			return nil, err
+		}
+		var files []string
+		for _, f := range strings.Split(filesOut, "\n") {
+			if f = strings.TrimSpace(f); f != "" {
+				files = append(files, f)
+			}
+		}
+		commits = append(commits, types.RawCommit{Hash: hash, Subject: subject, Body: body, Files: files})
+	}
+	return commits, nil
 }

@@ -41,6 +41,22 @@ jobs:
       - name: Run checks
         run: go vet ./... && go test ./... -race -count=1 && go build ./...
 
+  windows:
+    name: Windows spool and config
+    runs-on: windows-latest
+    needs: commitlint
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+
+      - name: Test Windows spool and config
+        run: go test ./internal/app ./internal/config -count=1
+
   policy:
     name: Hoostack policy
     runs-on: ubuntu-latest

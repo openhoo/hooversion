@@ -110,10 +110,6 @@
 
 - Harden GitHub App intake and execution with repository and installation isolation, bounded webhook bodies, delivery deduplication, and token- and secret-safe handling.
 
-### Public API and packaging
-
-- Publish typed package declarations and the supported `lintCommits`, `lintCommit`, and `parseCommit` consumer API.
-
 ### Tests
 
 - Expand coverage for source verification, resumable publication, CLI/configuration and manifest validation, managed outputs, and App authorization boundaries.

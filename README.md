@@ -18,7 +18,7 @@ hooversion doctor
 hooversion migrate
 hooversion help
 hooversion version
-versionhoo-app
+hooversion app
 ```
 
 ## Install
@@ -29,9 +29,11 @@ Install with Go:
 go install github.com/openhoo/hooversion/cmd/hooversion@v1.1.0
 ```
 
-Or download a prebuilt static binary from the
+Or download the `hooversion` prebuilt static binary from the
 [GitHub Releases](https://github.com/openhoo/hooversion/releases) page and put
-it on your `PATH`. The same releases power the GitHub Actions integration below.
+it on your `PATH`. Start the GitHub App server from that release binary with
+`hooversion app`; release archives do not contain a standalone `versionhoo-app`
+executable. The same releases power the GitHub Actions integration below.
 
 ## Quickstart
 
@@ -140,18 +142,29 @@ proof of the published artifact set.
 Release outputs are managed files. Each non-dry-run release clears prior
 generated output, writes `.hooversion/outputs.json` and per-tag notes, and
 writes `.release-version` only for a single release (removing it otherwise).
-These paths are generated release state, not user-owned files. Corresponding CI
+When clearing older payloads, legacy `notesPath` values are removed only when
+they remain contained by the configured output directory. These paths are
+generated release state, not user-owned files. Corresponding CI
 outputs are written to `GITHUB_OUTPUT` when available. In protected repositories
 that allow GitHub Actions to bypass release-only branch protections, this keeps
 releases automatic while human changes to `main` remain pull-request gated.
 
+Webhook bodies are bounded by `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES` before
+signature verification and durable admission. Every validated handled
+`workflow_run` is fsynced to the bounded file-backed webhook spool before the
+app returns HTTP 202. The execution queue remains bounded at 64 running or
+waiting jobs and serializes each repository/ref; queue saturation leaves the
+durable record pending instead of returning a lossy `503`.
+
+`VERSIONHOO_WEBHOOK_SPOOL_DIR` selects the durable backlog directory and
+`VERSIONHOO_WEBHOOK_SPOOL_MAX_BYTES` bounds its total size (64 MiB by default).
+Sequence-numbered records preserve per-repository/ref FIFO and are recovered
+and retried after restart. Dedupe reservations remain in memory for 24 hours
+and are released after final failure or an admission error, never just because
+the in-memory queue is full. Corrupt, oversized, symlinked, and unsafe-path
+records are quarantined or skipped without blocking later deliveries.
+
 ## Migration
-
-Version 0.2 of Hooversion replaces the Bun/TypeScript implementation and the
-npm-distributed `@openhoo/hooversion` package with a single static binary.
-
-**Legacy configs:** `hooversion.config.ts`, `.mjs`, `.js`, and `.cjs` files are
-no longer executed. Run:
 
 ```sh
 hooversion migrate
@@ -180,42 +193,52 @@ Hooversion ships composite actions for downstream CI. The actions download a
 static binary from GitHub Releases using the `version` input:
 
 ```yaml
+name: Release
+
+on:
+  workflow_run:
+    workflows:
+      - CI
+    branches:
+      - main
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: openhoo/hooversion/actions/setup@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
-        with:
-          version: 1.1.0
-      - run: hooversion plan
-
-  commitlint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - uses: openhoo/hooversion/actions/lint@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
-        with:
-          version: 1.1.0
-
   release:
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    if: >-
+      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.repository.full_name == github.repository) ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
     permissions:
       contents: write
-      pull-requests: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
-      - id: release
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
+      - name: Prepare protected-branch release
+        if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):'))
+        uses: openhoo/hooversion/actions/prepare-release@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
+        with:
+          version: 1.1.0
+          install-command: bun install --frozen-lockfile
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Finalize protected-branch release
+        id: finalize
+        if: github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
         uses: openhoo/hooversion/actions/release@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
         with:
           version: 1.1.0
+          install-command: bun install --frozen-lockfile
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
 
@@ -224,6 +247,12 @@ jobs:
 `releases-json` outputs for downstream package, Docker, or archive publishing
 jobs.
 
+
+Generated workflows keep the immutable action commit pinned to the latest
+published Hooversion action, independently of the CLI version selected by
+`HOOVERSION_VERSION`. For a Node package in a subdirectory, the generator
+preserves that directory for dependency installation and checks while running
+both protected-release action phases from the repository root.
 The generated release workflow checks out the successful workflow run's immutable
 `head_sha` and uses repository-scoped concurrency with
 `cancel-in-progress: false`, so a later release never cancels an already-running
@@ -238,6 +267,24 @@ installation tokens from the app private key, clones repositories, runs the
 same release engine, pushes release commits and tags, creates GitHub Releases,
 and reports a `Versionhoo Release` check back to GitHub.
 
+The `versionhoo-app` executable name is reserved for the app's Go and
+container routes:
+
+```sh
+go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.0
+go build -o bin/versionhoo-app ./cmd/versionhoo-app
+```
+
+The container route builds the same app from source:
+
+```sh
+docker build -t versionhoo-app .
+```
+
 Use this when `main` is pull-request gated for humans but a dedicated app should
 be allowed to perform release-only writes. See `docs/github-app.md` for the app
 permissions, webhook settings, ruleset bypass setup, and runtime environment.
+
+The App runner deliberately rejects repository dependency installation and all
+repository hooks. Hooversion itself has a release hook, so it must not be put
+in a `versionhoo-app` allow-list; use the workflow action for this repository.

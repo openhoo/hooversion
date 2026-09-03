@@ -381,14 +381,19 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 				Releases: []ReleaseRef{},
 			}
 		}
-
-		if err := installProjectDependencies(repoDir, spec.InstallCommand, spec.Token, env); err != nil {
-			return failureOutcome(spec, err)
+		if spec.InstallCommand != "" {
+			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects dependency installation; use a hook-free, preinstalled repository release"))
+		}
+		if _, err := os.Stat(filepath.Join(repoDir, "bun.lock")); err == nil {
+			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects implicit dependency installation from bun.lock; use a hook-free, preinstalled repository release"))
 		}
 
 		cfg, err := config.Load(repoDir, spec.ConfigPath)
 		if err != nil {
 			return failureOutcome(spec, err)
+		}
+		if len(cfg.Hooks.BeforeRelease) > 0 || len(cfg.Hooks.AfterVersion) > 0 || len(cfg.Hooks.AfterRelease) > 0 {
+			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects repository hooks; use a hook-free repository release"))
 		}
 		trustedApiURL, err := ValidateGitHubApiURL(orDefault(spec.ApiURL, "https://api.github.com"), spec.TrustedAPIURLs)
 		if err != nil {
@@ -402,7 +407,7 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			cfg.GitHub.Repository = repoIdentity
 			cfg.GitHub.ApiUrl = trustedApiURL
 		}
-		releasePlan, err := plan.CreatePlan(repoDir, cfg, spec.Branch, nil)
+		releasePlan, err := plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env)
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
@@ -413,6 +418,7 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			GitHub:      true,
 			GitHubToken: spec.Token,
 			GitAuth:     auth.env,
+			BaseEnv:     env,
 		})
 		if err != nil {
 			return failureOutcome(spec, err)

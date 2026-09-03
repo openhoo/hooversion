@@ -46,12 +46,18 @@ outputs:
   tag:
     description: Prepared single-package release tag.
     value: ${{ steps.release.outputs.tag }}
+  releases-json:
+    description: JSON array of package release outputs.
+    value: ${{ steps.release.outputs.releases_json }}
   pull-request-url:
     description: Compare URL for opening the release pull request.
     value: ${{ steps.branch.outputs.url }}
 runs:
   using: composite
   steps:
+    - name: Install pinned Cosign verifier
+      uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
     - name: Set up Hooversion
       shell: bash
       env:
@@ -112,11 +118,36 @@ runs:
         BASE_BRANCH: ${{ inputs.base-branch }}
         RELEASE_TAG: ${{ steps.release.outputs.tag }}
         RELEASE_VERSION: ${{ steps.release.outputs.version }}
+        RELEASES_JSON: ${{ steps.release.outputs.releases_json }}
       run: |
         set -euo pipefail
-        test -n "$RELEASE_TAG"
-        test -n "$RELEASE_VERSION"
-        branch="release/${RELEASE_TAG}"
+        release_count="$(jq -er 'if type == "array" then length else error("releases_json must be an array") end' <<<"$RELEASES_JSON")"
+        case "$release_count" in
+          1)
+            test -n "$RELEASE_TAG"
+            test -n "$RELEASE_VERSION"
+            branch="release/${RELEASE_TAG}"
+            ;;
+          0)
+            echo "::error::Hooversion reported published=true with no releases." >&2
+            exit 1
+            ;;
+          *)
+            commit="$(git rev-parse HEAD)"
+            if command -v sha256sum >/dev/null 2>&1; then
+              release_set_hash="$(
+                printf '%s\n%s\n' "$commit" "$RELEASES_JSON" |
+                  sha256sum | awk '{ print $1 }'
+              )"
+            else
+              release_set_hash="$(
+                printf '%s\n%s\n' "$commit" "$RELEASES_JSON" |
+                  shasum -a 256 | awk '{ print $1 }'
+              )"
+            fi
+            branch="release/multi-${commit:0:12}-${release_set_hash:0:20}"
+            ;;
+        esac
         git push origin "HEAD:refs/heads/${branch}"
         url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/compare/${BASE_BRANCH}...${branch}?expand=1"
         {

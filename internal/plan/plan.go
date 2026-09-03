@@ -47,16 +47,21 @@ func TagFor(config *types.NormalizedConfig, pkg types.NormalizedPackageConfig, v
 // by the caller; policy extends/overrides the default bump map (nil policy =
 // defaults only).
 func CreatePlan(cwd string, config *types.NormalizedConfig, branch string, policy *types.CommitPolicy) (*types.ReleasePlan, error) {
-	sourceSha, err := git.HeadSha(cwd)
+	return CreatePlanWithEnv(cwd, config, branch, policy, nil)
+}
+
+// CreatePlanWithEnv derives a plan using the supplied child environment.
+func CreatePlanWithEnv(cwd string, config *types.NormalizedConfig, branch string, policy *types.CommitPolicy, baseEnv []string) (*types.ReleasePlan, error) {
+	sourceSha, err := git.HeadShaWithEnv(cwd, baseEnv)
 	if err != nil {
 		return nil, err
 	}
 
 	rules := releaseRules(policy)
 	if len(config.Packages) == 1 {
-		return createSinglePackagePlan(cwd, config, branch, sourceSha, rules, policy)
+		return createSinglePackagePlan(cwd, config, branch, sourceSha, rules, policy, baseEnv)
 	}
-	return createIndependentPlan(cwd, config, branch, sourceSha, rules, policy)
+	return createIndependentPlan(cwd, config, branch, sourceSha, rules, policy, baseEnv)
 }
 
 func createSinglePackagePlan(
@@ -66,13 +71,14 @@ func createSinglePackagePlan(
 	sourceSha string,
 	rules map[string]types.ReleaseType,
 	policy *types.CommitPolicy,
+	baseEnv []string,
 ) (*types.ReleasePlan, error) {
 	pkg := config.Packages[0]
-	latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg))
+	latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg), baseEnv)
 	if err != nil {
 		return nil, err
 	}
-	commits, err := collectCommits(cwd, latestTag, sourceSha, policy)
+	commits, err := collectCommits(cwd, latestTag, sourceSha, policy, baseEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -100,27 +106,32 @@ func createIndependentPlan(
 	sourceSha string,
 	rules map[string]types.ReleaseType,
 	policy *types.CommitPolicy,
+	baseEnv []string,
 ) (*types.ReleasePlan, error) {
 	latestTags := make(map[string]string)
+	eligibleByPackage := make(map[string]map[string]bool)
 	var candidateOrder []string
 	candidateCommits := make(map[string]types.ParsedCommit)
 
 	for _, pkg := range config.Packages {
-		latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg))
+		latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg), baseEnv)
 		if err != nil {
 			return nil, err
 		}
 		latestTags[pkg.Name] = latestTag
-		commits, err := collectCommits(cwd, latestTag, sourceSha, policy)
+		commits, err := collectCommits(cwd, latestTag, sourceSha, policy, baseEnv)
 		if err != nil {
 			return nil, err
 		}
+		eligible := make(map[string]bool, len(commits))
 		for _, parsed := range commits {
+			eligible[parsed.Hash] = true
 			if _, seen := candidateCommits[parsed.Hash]; !seen {
 				candidateOrder = append(candidateOrder, parsed.Hash)
 			}
 			candidateCommits[parsed.Hash] = parsed
 		}
+		eligibleByPackage[pkg.Name] = eligible
 	}
 
 	candidates := make([]types.ParsedCommit, 0, len(candidateOrder))
@@ -129,14 +140,18 @@ func createIndependentPlan(
 	}
 
 	affected := routing.DirectAffected(config, candidates)
-
-	// Reverse index: commit hash -> packages it directly affects.
+	// Reverse index: only commits eligible in the package's own post-tag window
+	// may be attributed to that package.
 	directPackages := make(map[string][]string)
 	inAnyDirect := make(map[string]bool)
 	for _, pkg := range config.Packages {
+		eligible := eligibleByPackage[pkg.Name]
 		for _, parsed := range affected[pkg.Name] {
-			directPackages[parsed.Hash] = append(directPackages[parsed.Hash], pkg.Name)
 			inAnyDirect[parsed.Hash] = true
+			if !eligible[parsed.Hash] {
+				continue
+			}
+			directPackages[parsed.Hash] = append(directPackages[parsed.Hash], pkg.Name)
 		}
 	}
 
@@ -264,8 +279,8 @@ func uniqueCommits(commits []types.ParsedCommit) []types.ParsedCommit {
 
 // latestTagOrEmpty maps the ErrNoTag sentinel to an empty baseline so a
 // first release plans from full reachable history.
-func latestTagOrEmpty(cwd, pattern string) (string, error) {
-	tag, err := git.LatestTag(cwd, pattern)
+func latestTagOrEmpty(cwd, pattern string, baseEnv []string) (string, error) {
+	tag, err := git.LatestTagWithEnv(cwd, pattern, baseEnv)
 	if err == git.ErrNoTag {
 		return "", nil
 	}
@@ -274,8 +289,8 @@ func latestTagOrEmpty(cwd, pattern string) (string, error) {
 
 // collectCommits gathers raw commits since from (whole history when empty),
 // drops ignored subjects, and parses what remains under policy.
-func collectCommits(cwd, from, to string, policy *types.CommitPolicy) ([]types.ParsedCommit, error) {
-	raws, err := git.Commits(cwd, from, to)
+func collectCommits(cwd, from, to string, policy *types.CommitPolicy, baseEnv []string) ([]types.ParsedCommit, error) {
+	raws, err := git.CommitsWithEnv(cwd, from, to, baseEnv)
 	if err != nil {
 		return nil, err
 	}

@@ -286,6 +286,7 @@ func initCommand(cwd string, flags *cliFlags, version string) error {
 			hooversionVersion: flags.value("hooversion-version"),
 			force:             force,
 			cliVersion:        version,
+			packages:          packages,
 		})
 		if err != nil {
 			return err

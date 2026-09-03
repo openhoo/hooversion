@@ -393,3 +393,62 @@ func TestRustShorthandMultilineInlineAndErrors(t *testing.T) {
 		t.Errorf("case-insensitive match failed: %+v", parsed.Dependencies)
 	}
 }
+
+func TestReadTomlAllowsInlineComments(t *testing.T) {
+	dir := t.TempDir()
+	for _, content := range []string{
+		"[package]\r\nname = \"owner#name\" # package\r\nversion = '1.2.3' # release\r\n",
+		"[project]\nname = 'owner'\nversion = \"2.3.4\" # release\n",
+	} {
+		path := filepath.Join(dir, "manifest.toml")
+		mustWrite(t, path, content)
+		kind := types.PackageRust
+		if strings.Contains(content, "[project]") {
+			kind = types.PackagePython
+		}
+		name, version, err := Read(pkg("owner", kind, path, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if name == "" || version == "" {
+			t.Fatalf("read %q = %q,%q", content, name, version)
+		}
+	}
+}
+
+func TestReadTomlRejectsMultilineQuotedValues(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		kind    types.PackageType
+		content string
+	}{
+		{
+			name:    "rust double quote",
+			kind:    types.PackageRust,
+			content: "[package]\nname = \"owner'\nname\"\nversion = \"1.0.0\"\n",
+		},
+		{
+			name:    "rust single quote",
+			kind:    types.PackageRust,
+			content: "[package]\nname = 'owner\"\nname'\nversion = '1.0.0'\n",
+		},
+		{
+			name:    "python double quote",
+			kind:    types.PackagePython,
+			content: "[project]\nname = \"owner'\nname\"\nversion = \"1.0.0\"\n",
+		},
+		{
+			name:    "python single quote",
+			kind:    types.PackagePython,
+			content: "[project]\nname = 'owner\"\nname'\nversion = '1.0.0'\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "manifest.toml")
+			mustWrite(t, path, tc.content)
+			if _, _, err := Read(pkg("owner", tc.kind, path, nil)); err == nil {
+				t.Fatalf("accepted multiline quoted value:\n%s", tc.content)
+			}
+		})
+	}
+}
