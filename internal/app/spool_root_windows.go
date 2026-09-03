@@ -83,7 +83,7 @@ var (
 
 var (
 	windowsSystemSID = [...]byte{
-		1, 2, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+		1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
 	}
 	windowsAdministratorsSID = [...]byte{
 		1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0,
