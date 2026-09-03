@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -131,6 +132,7 @@ func TestWebhookSpoolQuarantinesCorruptAndUnsafeRecords(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer spool.Close()
 	if pending, err := spool.Pending(); err != nil {
 		t.Fatal(err)
 	} else if len(pending) != 0 {
@@ -178,14 +180,18 @@ func TestWebhookSpoolRejectsUnsafeRoots(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewWebhookSpool(link, 1024); err == nil {
+	if spool, err := NewWebhookSpool(link, 1024); err == nil {
+		_ = spool.Close()
 		t.Fatal("symlink spool root accepted")
 	}
-	if err := os.Chmod(target, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := NewWebhookSpool(target, 1024); err == nil {
-		t.Fatal("world-readable spool root accepted")
+	if runtime.GOOS != "windows" {
+		if err := os.Chmod(target, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if spool, err := NewWebhookSpool(target, 1024); err == nil {
+			_ = spool.Close()
+			t.Fatal("world-readable spool root accepted")
+		}
 	}
 }
 

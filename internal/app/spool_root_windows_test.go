@@ -49,8 +49,9 @@ func TestWebhookSpoolWindowsACL(t *testing.T) {
 		if err := spool.Close(); err != nil {
 			t.Fatal(err)
 		}
-		grantWindowsWriteACL(t, filepath.Join(dir, webhookSpoolOwnerName), "*S-1-1-0")
-		if _, err := NewWebhookSpool(dir, 1024); err == nil {
+		grantWindowsDirectWriteACL(t, filepath.Join(dir, webhookSpoolOwnerName), "*S-1-1-0")
+		if spool, err := NewWebhookSpool(dir, 1024); err == nil {
+			_ = spool.Close()
 			t.Fatal("accepted permissive owner-lock ACL")
 		}
 	})
@@ -75,6 +76,14 @@ func grantWindowsWriteACL(t *testing.T, path, sid string) {
 	t.Helper()
 	permission := sid + ":(OI)(CI)W"
 	command := exec.Command("icacls", path, "/grant", permission)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Skipf("icacls cannot set the focused ACL: %v (%s)", err, output)
+	}
+}
+
+func grantWindowsDirectWriteACL(t *testing.T, path, sid string) {
+	t.Helper()
+	command := exec.Command("icacls", path, "/grant", sid+":W")
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Skipf("icacls cannot set the focused ACL: %v (%s)", err, output)
 	}

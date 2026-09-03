@@ -302,11 +302,7 @@ func validateWindowsSpoolDACL(dacl, currentSID uintptr) error {
 			if windowsSIDEqual(sid, currentSID) ||
 				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsSystemSID[0]))) ||
 				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsAdministratorsSID[0]))) ||
-				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsCreatorOwnerSID[0]))) ||
-				header.AceFlags&aceInheritedFlag != 0 &&
-					(windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsEveryoneSID[0]))) ||
-						windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsUsersSID[0]))) ||
-						windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsAuthenticatedUsersSID[0])))) {
+				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsCreatorOwnerSID[0]))) {
 				continue
 			}
 			return fmt.Errorf(
