@@ -7,7 +7,7 @@ GitHub release for the requested version; no JavaScript runtime is required.
 ## Setup CLI
 
 ```yaml
-- uses: openhoo/hooversion/actions/setup@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
+- uses: openhoo/hooversion/actions/setup@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
   with:
     version: 1.1.1
 - run: hooversion plan
@@ -24,7 +24,7 @@ the binary.
 - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
   with:
     fetch-depth: 0
-- uses: openhoo/hooversion/actions/lint@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
+- uses: openhoo/hooversion/actions/lint@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
   with:
     version: 1.1.1
 ```
@@ -45,7 +45,7 @@ steps:
       fetch-depth: 0
       ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
   - id: release
-    uses: openhoo/hooversion/actions/release@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
+    uses: openhoo/hooversion/actions/release@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
     with:
       version: 1.1.1
       install-command: npm ci
