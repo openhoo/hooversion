@@ -16,7 +16,7 @@ import (
 
 const (
 	defaultActionOwnerRepo  = "openhoo/hooversion"
-	defaultActionVersion    = "1.1.0"
+	defaultActionVersion    = "1.1.1"
 	defaultReleaseBranch    = "main"
 	checkoutSha             = "3d3c42e5aac5ba805825da76410c181273ba90b1"
 	setupBunSha             = "0c5077e51419868618aeaa5fe8019c62421857d6"
@@ -35,7 +35,7 @@ var (
 // workflow's Hooversion CLI version: a new CLI can generate workflows that
 // still consume the latest published action release.
 var knownActionRefs = map[string]string{
-	"1.1.0": "f2186561c587b58c5ea08c74c15800cdd39eab42",
+	"1.1.1": "ac503b23b9b36ebbf39ee6103713c81f1f18b64d",
 }
 
 type workflowProjectKind string

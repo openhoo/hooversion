@@ -13,7 +13,7 @@ hooversion lint --from origin/main --to HEAD
 hooversion plan
 hooversion release --dry-run
 hooversion release
-hooversion verify-release --repository openhoo/hooversion --tag v1.1.0
+hooversion verify-release --repository openhoo/hooversion --tag v1.1.1
 hooversion doctor
 hooversion migrate
 hooversion help
@@ -227,7 +227,7 @@ jobs:
           ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
       - name: Prepare protected-branch release
         if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):'))
-        uses: openhoo/hooversion/actions/prepare-release@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
+        uses: openhoo/hooversion/actions/prepare-release@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
         with:
           version: 1.1.1
           install-command: bun install --frozen-lockfile
@@ -235,7 +235,7 @@ jobs:
       - name: Finalize protected-branch release
         id: finalize
         if: github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
-        uses: openhoo/hooversion/actions/release@f2186561c587b58c5ea08c74c15800cdd39eab42 # v1.1.0
+        uses: openhoo/hooversion/actions/release@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
         with:
           version: 1.1.1
           install-command: bun install --frozen-lockfile
