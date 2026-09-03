@@ -133,6 +133,9 @@ func validateWindowsSpoolPathComponent(path string, final bool) error {
 	if err := validateWindowsSpoolHandle(directory); err != nil {
 		return err
 	}
+	if !final {
+		return nil
+	}
 	ownerSID, dacl, descriptor, err := windowsSecurityDescriptor(directory)
 	if err != nil {
 		return err
