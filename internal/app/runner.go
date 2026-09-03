@@ -270,9 +270,9 @@ func checkedOutput(env []string, dir, command string, args []string, secret stri
 	return strings.TrimSpace(stdout.String()), nil
 }
 
-// installProjectDependencies mirrors installProjectDependencies: the
-// configured command wins, else `bun install --frozen-lockfile` when
-// bun.lock exists; output is redacted on failure.
+// installProjectDependencies runs a configured executable without invoking a
+// command shell. The command string is tokenized into an executable and
+// explicit arguments; shell metacharacters are rejected.
 func installProjectDependencies(repoDir string, configuredCommand, secret string, env []string) error {
 	command := configuredCommand
 	if command == "" {
@@ -283,7 +283,15 @@ func installProjectDependencies(repoDir string, configuredCommand, secret string
 	if command == "" {
 		return nil
 	}
-	cmd := exec.Command("/bin/sh", "-c", command)
+	parts, err := splitCommand(command)
+	if err != nil {
+		return hverr.New("Install command rejected: %s", redact(err.Error(), secret))
+	}
+	executable, err := exec.LookPath(parts[0])
+	if err != nil {
+		return hverr.New("Install executable is unavailable: %s", redact(parts[0], secret))
+	}
+	cmd := exec.Command(executable, parts[1:]...)
 	cmd.Dir = repoDir
 	cmd.Env = env
 	var stdout, stderr bytes.Buffer
@@ -297,6 +305,64 @@ func installProjectDependencies(repoDir string, configuredCommand, secret string
 		return hverr.New("Install command failed: %s\n%s", redact(command, secret), redact(detail, secret))
 	}
 	return nil
+}
+
+func splitCommand(command string) ([]string, error) {
+	var parts []string
+	var current strings.Builder
+	var quote byte
+	escaped, token := false, false
+	flush := func() {
+		if token {
+			parts = append(parts, current.String())
+			current.Reset()
+			token = false
+		}
+	}
+	for index := range len(command) {
+		char := command[index]
+		if char == 0 {
+			return nil, hverr.New("command contains a NUL byte")
+		}
+		if escaped {
+			current.WriteByte(char)
+			token = true
+			escaped = false
+			continue
+		}
+		if quote != 0 {
+			if char == quote {
+				quote = 0
+			} else {
+				current.WriteByte(char)
+				token = true
+			}
+			continue
+		}
+		switch char {
+		case '\\':
+			escaped = true
+			token = true
+		case '\'', '"':
+			quote = char
+			token = true
+		case ';', '&', '|', '<', '>', '`', '$', '\n', '\r':
+			return nil, hverr.New("command contains shell syntax")
+		case ' ', '\t':
+			flush()
+		default:
+			current.WriteByte(char)
+			token = true
+		}
+	}
+	if escaped || quote != 0 {
+		return nil, hverr.New("command contains an unterminated escape or quote")
+	}
+	flush()
+	if len(parts) == 0 {
+		return nil, hverr.New("command is empty")
+	}
+	return parts, nil
 }
 
 // runVersionhooRelease mirrors runVersionhooRelease.
@@ -381,14 +447,19 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 				Releases: []ReleaseRef{},
 			}
 		}
-
-		if err := installProjectDependencies(repoDir, spec.InstallCommand, spec.Token, env); err != nil {
-			return failureOutcome(spec, err)
+		if spec.InstallCommand != "" {
+			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects dependency installation; use a hook-free, preinstalled repository release"))
+		}
+		if _, err := os.Stat(filepath.Join(repoDir, "bun.lock")); err == nil {
+			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects implicit dependency installation from bun.lock; use a hook-free, preinstalled repository release"))
 		}
 
 		cfg, err := config.Load(repoDir, spec.ConfigPath)
 		if err != nil {
 			return failureOutcome(spec, err)
+		}
+		if len(cfg.Hooks.BeforeRelease) > 0 || len(cfg.Hooks.AfterVersion) > 0 || len(cfg.Hooks.AfterRelease) > 0 {
+			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects repository hooks; use a hook-free repository release"))
 		}
 		trustedApiURL, err := ValidateGitHubApiURL(orDefault(spec.ApiURL, "https://api.github.com"), spec.TrustedAPIURLs)
 		if err != nil {
@@ -402,7 +473,7 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			cfg.GitHub.Repository = repoIdentity
 			cfg.GitHub.ApiUrl = trustedApiURL
 		}
-		releasePlan, err := plan.CreatePlan(repoDir, cfg, spec.Branch, nil)
+		releasePlan, err := plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env)
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
@@ -413,6 +484,7 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			GitHub:      true,
 			GitHubToken: spec.Token,
 			GitAuth:     auth.env,
+			BaseEnv:     env,
 		})
 		if err != nil {
 			return failureOutcome(spec, err)

@@ -13,6 +13,11 @@ GitHub release for the requested version; no JavaScript runtime is required.
 - run: hooversion plan
 ```
 
+The setup action installs a commit-pinned Cosign verifier and validates both
+the release archive and `SHA256SUMS` Sigstore bundles against the exact
+Hooversion release workflow identity before checking checksums or extracting
+the binary.
+
 ## Lint Commits
 
 ```yaml
@@ -48,9 +53,13 @@ steps:
 ```
 
 Generated release workflows run after a successful CI `workflow_run` and also
-support `workflow_dispatch` on the release branch. They serialize releases per
-repository; successful `workflow_run` releases check out the exact SHA
-validated by CI. Custom workflows should use the same checkout SHA and
+expose `workflow_dispatch` on the configured release branch (`main` by
+default). Manual dispatches from that branch run `actions/prepare-release` so
+the release remains protected by a release PR; only a successful
+`workflow_run` for a merged `chore(release):` commit runs `actions/release`.
+Dispatches from tags or any other branch skip the release job. They serialize
+releases per repository; successful `workflow_run` releases check out the exact
+SHA validated by CI. Custom workflows should use the same checkout SHA and
 `release-${{ github.repository }}` concurrency group.
 
 `published` is `true` when one or more packages were released. `version` and
@@ -58,15 +67,16 @@ validated by CI. Custom workflows should use the same checkout SHA and
 JSON array containing every package release. Gate downstream publishing on
 `published`, and use `releases-json` for multi-package releases.
 
+`actions/prepare-release` exposes the same `releases-json` output. It keeps the
+`release/<tag>` branch name for a single package. For multiple packages it
+uses the deterministic, Git-ref-safe
+`release/multi-<commit-prefix>-<release-set-hash-prefix>` branch name, derived
+from the generated release commit and complete release set; singular `version`
+and `tag` outputs remain unset.
+
 Hooversion verifies the source before mutation. If a prior run created the
 expected release commit and tags but did not finish publication, rerunning it
 resumes only that verified state and rejects remote drift.
-
-In repositories where `main` requires pull requests, use
-`actions/prepare-release`. It pushes the generated release commit to a release
-branch and writes the pull-request compare URL to the job summary. A maintainer
-opens and squash-merges that PR, so required checks and code scanning still gate
-the release. This works when enterprise policy forbids Actions-created PRs.
 
 ```yaml
 permissions:

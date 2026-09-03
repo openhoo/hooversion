@@ -23,11 +23,15 @@ import (
 // byte-exact commit-message mismatch.
 // Callers only invoke it for fresh plans with zero releases.
 func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.ReleasePlan, error) {
-	head, err := git.HeadSha(cwd)
+	return DeriveResumableWithEnv(cwd, config, nil)
+}
+
+func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv []string) (*types.ReleasePlan, error) {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv)
 	if err != nil {
 		return nil, err
 	}
-	sourceSha, err := git.RefSha(cwd, "HEAD^")
+	sourceSha, err := git.RefShaWithEnv(cwd, "HEAD^", baseEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +44,7 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 		nextVersion string
 		tag         string
 	}
-	message, err := git.CommitMessage(cwd, "HEAD")
+	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +67,11 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 
 	var selected []releasePackage
 	releaseSubject := strings.TrimPrefix(subject, prefix)
-	if name, version, ok := strings.Cut(releaseSubject, " "); ok && !strings.Contains(name, "@") {
+	if !strings.Contains(releaseSubject, ", ") {
+		name, version, ok := strings.Cut(releaseSubject, " ")
+		if !ok || name == "" || version == "" {
+			return nil, nil
+		}
 		pkg, exists := packages[name]
 		if !exists || versions[name] != version {
 			return nil, nil
@@ -73,9 +81,13 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 		})
 	} else {
 		for _, part := range strings.Split(releaseSubject, ", ") {
-			name, version, ok := strings.Cut(part, "@")
+			at := strings.LastIndex(part, "@")
+			if at <= 0 || at == len(part)-1 {
+				return nil, nil
+			}
+			name, version := part[:at], part[at+1:]
 			pkg, exists := packages[name]
-			if !ok || !exists || versions[name] != version {
+			if !exists || versions[name] != version {
 				return nil, nil
 			}
 			selected = append(selected, releasePackage{
@@ -88,7 +100,7 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 	}
 
 	for _, entry := range selected {
-		ref, err := git.RefSha(cwd, "refs/tags/"+entry.tag)
+		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+entry.tag, baseEnv)
 		if err != nil {
 			return nil, err
 		}
@@ -100,7 +112,7 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 
 	releases := make([]types.PackageRelease, 0, len(selected))
 	for _, entry := range selected {
-		currentVersion, releaseType, ok := inferReleaseTransition(cwd, config, entry.pkg, entry.nextVersion)
+		currentVersion, releaseType, ok := inferReleaseTransition(cwd, config, entry.pkg, entry.nextVersion, baseEnv)
 		if !ok {
 			return nil, nil
 		}
@@ -132,12 +144,12 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 	}
 
 	reconstructed := &types.ReleasePlan{
-		Branch:      gitBranchOf(cwd),
+		Branch:      gitBranchOfWithEnv(cwd, baseEnv),
 		SourceSha:   sourceSha,
 		Independent: len(config.Packages) > 1,
 		Releases:    releases,
 	}
-	headMessage, err := git.CommitMessage(cwd, "HEAD")
+	headMessage, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -154,6 +166,7 @@ func inferReleaseTransition(
 	config *types.NormalizedConfig,
 	pkg types.NormalizedPackageConfig,
 	nextVersion string,
+	baseEnv []string,
 ) (string, types.ReleaseType, bool) {
 	parsed, err := semver.Parse(nextVersion)
 	if err != nil {
@@ -183,7 +196,7 @@ func inferReleaseTransition(
 			}
 		}
 		tag := plan.TagFor(config, pkg, candidate.currentVersion)
-		ref, err := git.RefSha(cwd, "refs/tags/"+tag)
+		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+tag, baseEnv)
 		if err != nil {
 			return "", "", false
 		}
@@ -191,30 +204,59 @@ func inferReleaseTransition(
 			return candidate.currentVersion, candidate.releaseType, true
 		}
 	}
-	return "", "", false
+	parentData, err := git.FileAtRefWithEnv(cwd, "HEAD^", pkg.Manifest, baseEnv)
+	if err != nil {
+		return "", "", false
+	}
+	parentName, parentVersion, err := manifest.ReadData(pkg, parentData)
+	if err != nil || parentName != pkg.Name {
+		return "", "", false
+	}
+	parent, err := semver.Parse(parentVersion)
+	if err != nil {
+		return "", "", false
+	}
+	valid := []types.ReleaseType{types.Major, types.Minor, types.Patch}
+	var matched types.ReleaseType
+	for _, releaseType := range valid {
+		if semver.Bump(parent, releaseType).String() == parsed.String() {
+			if matched != "" {
+				return "", "", false
+			}
+			matched = releaseType
+		}
+	}
+	if matched == "" {
+		return "", "", false
+	}
+	return parentVersion, matched, true
 }
 
 // isResumableRelease reports whether HEAD is exactly the release commit of a
 // prior partial run: one commit ahead of plan.SourceSha, carrying the exact
 // release message, with every planned tag either absent or pointing at HEAD.
 func isResumableRelease(cwd string, effective *types.ReleasePlan) bool {
+	return isResumableReleaseWithEnv(cwd, effective, nil)
+}
+
+func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) bool {
 	if len(effective.Releases) == 0 {
 		return false
 	}
-	head, err := git.HeadSha(cwd)
+	head, err := git.HeadShaWithEnv(cwd, baseEnv)
 	if err != nil || head == effective.SourceSha {
 		return false
 	}
-	parent, err := git.RefSha(cwd, "HEAD^")
+	parent, err := git.RefShaWithEnv(cwd, "HEAD^", baseEnv)
 	if err != nil || parent != effective.SourceSha {
 		return false
 	}
-	message, err := git.CommitMessage(cwd, "HEAD")
+	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
 	if err != nil || message != CommitMessage(effective) {
 		return false
 	}
 	for _, release := range effective.Releases {
-		ref, err := git.RefSha(cwd, "refs/tags/"+release.Tag)
+		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+release.Tag, baseEnv)
 		if err != nil || (ref != "" && ref != head) {
 			return false
 		}
@@ -226,14 +268,43 @@ func isResumableRelease(cwd string, effective *types.ReleasePlan) bool {
 // or the remote branch drifted from it. The remote lookup is tri-state:
 // ErrNoRemote skips the check, "" means the branch is missing remotely.
 func verifySource(cwd string, effective *types.ReleasePlan) error {
-	head, err := git.HeadSha(cwd)
+	return verifySourceWithEnv(cwd, effective, nil)
+}
+
+func verifySourceWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv)
 	if err != nil {
 		return err
 	}
 	if head != effective.SourceSha {
 		return errors.New("Release source changed locally: expected %s, found %s.", effective.SourceSha, head)
 	}
-	remote, err := git.RemoteBranchSha(cwd, effective.Branch)
+	remote, err := git.RemoteBranchShaWithEnv(cwd, effective.Branch, baseEnv)
+	if err == git.ErrNoRemote {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if remote != effective.SourceSha {
+		found := remote
+		if found == "" {
+			found = "missing"
+		}
+		return errors.New("Release source changed remotely: expected %s, found %s.", effective.SourceSha, found)
+	}
+	return nil
+}
+
+func verifySourceWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth) error {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv)
+	if err != nil {
+		return err
+	}
+	if head != effective.SourceSha {
+		return errors.New("Release source changed locally: expected %s, found %s.", effective.SourceSha, head)
+	}
+	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth)
 	if err == git.ErrNoRemote {
 		return nil
 	}
@@ -253,11 +324,15 @@ func verifySource(cwd string, effective *types.ReleasePlan) error {
 // verifyResumableRemote accepts a remote sitting at either HEAD (fully pushed)
 // or SourceSha (push failed before anything landed); anything else drifts.
 func verifyResumableRemote(cwd string, effective *types.ReleasePlan) error {
-	head, err := git.HeadSha(cwd)
+	return verifyResumableRemoteWithEnv(cwd, effective, nil)
+}
+
+func verifyResumableRemoteWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv)
 	if err != nil {
 		return err
 	}
-	remote, err := git.RemoteBranchSha(cwd, effective.Branch)
+	remote, err := git.RemoteBranchShaWithEnv(cwd, effective.Branch, baseEnv)
 	if err == git.ErrNoRemote {
 		return nil
 	}
@@ -281,6 +356,28 @@ func splitSubjectBody(message string) (string, string) {
 	}
 	return message[:separator], strings.TrimSpace(message[separator:])
 }
+
+func verifyResumableRemoteWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth) error {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv)
+	if err != nil {
+		return err
+	}
+	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth)
+	if err == git.ErrNoRemote {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if remote != head && remote != effective.SourceSha {
+		found := remote
+		if found == "" {
+			found = "missing"
+		}
+		return errors.New("Release resume found remote drift: expected %s, found %s.", head, found)
+	}
+	return nil
+}
 func readManifestVersion(cwd string, pkg types.NormalizedPackageConfig) (string, error) {
 	pkg.Manifest = filepath.Join(cwd, pkg.Manifest)
 	_, version, err := manifest.Read(pkg)
@@ -289,6 +386,14 @@ func readManifestVersion(cwd string, pkg types.NormalizedPackageConfig) (string,
 
 func gitBranchOf(cwd string) string {
 	branch, err := git.CurrentBranch(cwd)
+	if err != nil {
+		return ""
+	}
+	return branch
+}
+
+func gitBranchOfWithEnv(cwd string, baseEnv []string) string {
+	branch, err := git.CurrentBranchWithEnv(cwd, baseEnv)
 	if err != nil {
 		return ""
 	}

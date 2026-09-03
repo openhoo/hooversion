@@ -81,6 +81,76 @@ func TestClearRemovesOnlyManagedFilesAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestClearRemovesLegacyNotesPathOnlyWithinOutputDir(t *testing.T) {
+	store, cwd := newStore(t)
+	outputDir := filepath.Join(cwd, ".hooversion")
+	outsideDir := t.TempDir()
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	insidePath := filepath.Join(outputDir, "legacy-notes.md")
+	outsidePath := filepath.Join(outsideDir, "legacy-outside-notes.md")
+	relativeOutside, err := filepath.Rel(cwd, outsidePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(insidePath, []byte("remove\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsidePath, []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{
+		"releases": []map[string]string{
+			{"notesPath": ".hooversion/legacy-notes.md"},
+			{"notesPath": relativeOutside},
+			{"notesPath": outsidePath},
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outputDir, "outputs.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Clear(); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	assertMissing(t, insidePath)
+	if got := mustRead(t, outsidePath); got != "keep\n" {
+		t.Fatalf("outside legacy note touched: %q", got)
+	}
+}
+
+func TestClearIgnoresLegacyNotesPathThroughSymlinkParent(t *testing.T) {
+	store, cwd := newStore(t)
+	outputDir := filepath.Join(cwd, ".hooversion")
+	outsideDir := t.TempDir()
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsidePath := filepath.Join(outsideDir, "legacy-notes.md")
+	if err := os.WriteFile(outsidePath, []byte("keep\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outsideDir, filepath.Join(outputDir, "legacy")); err != nil {
+		t.Fatal(err)
+	}
+	data := []byte(`{"releases":[{"notesPath":".hooversion/legacy/legacy-notes.md"}]}`)
+	if err := os.WriteFile(filepath.Join(outputDir, "outputs.json"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := store.Clear(); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+	if got := mustRead(t, outsidePath); got != "keep\n" {
+		t.Fatalf("symlink target touched: %q", got)
+	}
+}
+
 func TestClearTreatsMissingFilesAsClean(t *testing.T) {
 	store, _ := newStore(t)
 	for range 2 {
@@ -290,6 +360,99 @@ func TestWriteSanitizesTagForNoteNames(t *testing.T) {
 	raw := mustRead(t, filepath.Join(cwd, ".hooversion", "outputs.json"))
 	if !strings.Contains(raw, `"notesPath": ".hooversion/release-v1.0.0-meta-x-notes.md"`) {
 		t.Fatalf("sanitized notesPath missing: %s", raw)
+	}
+}
+
+func TestWriteUsesDistinctNotePathsForSanitizationCollision(t *testing.T) {
+	store, cwd := newStore(t)
+	releases := []types.PackageRelease{
+		{Package: types.NormalizedPackageConfig{Name: "slash"}, NextVersion: "1.0.1", Tag: "a/b@v1.0.1", Notes: "slash"},
+		{Package: types.NormalizedPackageConfig{Name: "dash"}, NextVersion: "1.0.1", Tag: "a-b@v1.0.1", Notes: "dash"},
+	}
+	if err := store.Write(releases, true); err != nil {
+		t.Fatal(err)
+	}
+	var payload storedPayload
+	data := []byte(mustRead(t, filepath.Join(cwd, ".hooversion", "outputs.json")))
+	if err := json.Unmarshal(data, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Releases) != 2 || payload.Releases[0].NotesPath == payload.Releases[1].NotesPath {
+		t.Fatalf("colliding notes paths: %+v", payload.Releases)
+	}
+	for i, release := range releases {
+		if got := mustRead(t, filepath.Join(cwd, payload.Releases[i].NotesPath)); got != release.Notes+"\n" {
+			t.Fatalf("notes %d = %q", i, got)
+		}
+	}
+}
+
+func TestWriteBoundsLongCollidingNoteNamesAndClearsStale(t *testing.T) {
+	store, cwd := newStore(t)
+	component := strings.Repeat("x", 190)
+	makeReleases := func(prefix string) []types.PackageRelease {
+		return []types.PackageRelease{
+			{
+				Package:     types.NormalizedPackageConfig{Name: prefix + "-slash"},
+				NextVersion: "1.0.0",
+				Tag:         prefix + "/" + component,
+				Notes:       prefix + " slash",
+				ReleaseType: types.Patch,
+			},
+			{
+				Package:     types.NormalizedPackageConfig{Name: prefix + "-dash"},
+				NextVersion: "1.0.0",
+				Tag:         prefix + "-" + component,
+				Notes:       prefix + " dash",
+				ReleaseType: types.Patch,
+			},
+		}
+	}
+
+	staleReleases := makeReleases("old")
+	if err := store.Write(staleReleases, true); err != nil {
+		t.Fatalf("write stale releases: %v", err)
+	}
+	var stalePayload storedPayload
+	if err := json.Unmarshal([]byte(mustRead(t, filepath.Join(cwd, ".hooversion", "outputs.json"))), &stalePayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(stalePayload.Releases) != len(staleReleases) ||
+		stalePayload.Releases[0].NotesPath == stalePayload.Releases[1].NotesPath {
+		t.Fatalf("stale note paths are not distinct: %+v", stalePayload.Releases)
+	}
+	for i, release := range stalePayload.Releases {
+		if got := len(filepath.Base(release.NotesPath)); got > maxNoteFileNameBytes {
+			t.Fatalf("stale note filename length = %d, want <= %d", got, maxNoteFileNameBytes)
+		}
+		if got := mustRead(t, filepath.Join(cwd, release.NotesPath)); got != staleReleases[i].Notes+"\n" {
+			t.Fatalf("stale note %d = %q", i, got)
+		}
+	}
+
+	currentReleases := makeReleases("new")
+	if err := store.Write(currentReleases, true); err != nil {
+		t.Fatalf("write current releases: %v", err)
+	}
+	for _, release := range stalePayload.Releases {
+		assertMissing(t, filepath.Join(cwd, release.NotesPath))
+	}
+
+	var currentPayload storedPayload
+	if err := json.Unmarshal([]byte(mustRead(t, filepath.Join(cwd, ".hooversion", "outputs.json"))), &currentPayload); err != nil {
+		t.Fatal(err)
+	}
+	if len(currentPayload.Releases) != len(currentReleases) ||
+		currentPayload.Releases[0].NotesPath == currentPayload.Releases[1].NotesPath {
+		t.Fatalf("current note paths are not distinct: %+v", currentPayload.Releases)
+	}
+	for i, release := range currentPayload.Releases {
+		if got := len(filepath.Base(release.NotesPath)); got > maxNoteFileNameBytes {
+			t.Fatalf("current note filename length = %d, want <= %d", got, maxNoteFileNameBytes)
+		}
+		if got := mustRead(t, filepath.Join(cwd, release.NotesPath)); got != currentReleases[i].Notes+"\n" {
+			t.Fatalf("current note %d = %q", i, got)
+		}
 	}
 }
 

@@ -55,8 +55,8 @@ func TestQueueClamps(t *testing.T) {
 		t.Fatalf("clamps low: %d %v", q2.maxAttempts, q2.retryDelayMs)
 	}
 	q3 := NewReleaseTaskQueue(nil, QueueOptions{})
-	if q3.maxAttempts != 1 || q3.retryDelayMs != 0 {
-		t.Fatalf("defaults: %d %v", q3.maxAttempts, q3.retryDelayMs)
+	if q3.maxAttempts != 1 || q3.retryDelayMs != 0 || q3.maxPending != DefaultQueueMaxPending {
+		t.Fatalf("defaults: %d %v %d", q3.maxAttempts, q3.retryDelayMs, q3.maxPending)
 	}
 }
 
@@ -145,4 +145,54 @@ func TestQueueRetryAndFinalFailure(t *testing.T) {
 	if finalFailures != 1 || q2.Failure() == nil || q2.Failure().Error() != "permanent" {
 		t.Fatalf("final failure handling: calls=%d last=%v", finalFailures, q2.Failure())
 	}
+}
+
+func TestQueueEnqueueDoesNotWaitForRunningTask(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	q := NewReleaseTaskQueue(func(error) {}, QueueOptions{})
+	q.Enqueue("same", func() error {
+		close(started)
+		<-release
+		return nil
+	}, nil)
+	<-started
+	done := make(chan struct{})
+	go func() {
+		q.Enqueue("same", func() error { return nil }, nil)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("Enqueue blocked behind running task")
+	}
+	close(release)
+	q.Wait()
+}
+
+func TestQueueRejectsSaturatedAdmissionAndReleasesCapacity(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	q := NewReleaseTaskQueue(func(error) {}, QueueOptions{MaxPending: 1})
+	if !q.Enqueue("first", func() error {
+		close(started)
+		<-release
+		return nil
+	}, nil) {
+		t.Fatal("first task rejected")
+	}
+	<-started
+	if q.Enqueue("second", func() error {
+		t.Fatal("saturated task ran")
+		return nil
+	}, nil) {
+		t.Fatal("saturated task accepted")
+	}
+	close(release)
+	q.Wait()
+	if !q.Enqueue("second", func() error { return nil }, nil) {
+		t.Fatal("capacity was not released after completion")
+	}
+	q.Wait()
 }

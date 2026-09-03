@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -82,18 +83,16 @@ func TestGitAuthArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	tokenInfo, err := os.Stat(auth.tokenPath)
-	if err != nil || tokenInfo.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && (err != nil || tokenInfo.Mode().Perm() != 0o600) {
 		t.Fatalf("token mode %v err %v", tokenInfo.Mode(), err)
 	}
 	content, _ := os.ReadFile(auth.tokenPath)
 	if string(content) != "tok123\n" {
 		t.Fatalf("token content %q", content)
 	}
-
 	askpassInfo, err := os.Stat(auth.askpassPath)
-	if err != nil || askpassInfo.Mode().Perm() != 0o700 {
+	if runtime.GOOS != "windows" && (err != nil || askpassInfo.Mode().Perm() != 0o700) {
 		t.Fatalf("askpass mode %v err %v", askpassInfo.Mode(), err)
 	}
 	script, _ := os.ReadFile(auth.askpassPath)
@@ -136,20 +135,11 @@ func prepareRepo(t *testing.T, extra func(dir string)) (string, string) {
 func TestChildEnvIsExactlyScrubbed(t *testing.T) {
 	repoDir, headSha := prepareRepo(t, nil)
 	spec := JobSpec{
-		RepositoryFullName: "octo/hello", Branch: "main", HeadSha: headSha,
-		Token: "TOK", RepoDir: repoDir,
-		InstallCommand: "env > envdump.txt",
+		RepositoryFullName: "octo/hello", Branch: "main", HeadSha: headSha, RepoDir: repoDir,
 	}
-	out := Runner(spec)
-	if out.Err == nil {
-		t.Fatal("expected later failure (missing config) after env capture")
-	}
-	dump, err := os.ReadFile(filepath.Join(repoDir, "envdump.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	env := childEnv(spec, t.TempDir())
 	got := map[string]string{}
-	for _, line := range strings.Split(strings.TrimSpace(string(dump)), "\n") {
+	for _, line := range env {
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) == 2 {
 			got[parts[0]] = parts[1]
@@ -163,10 +153,6 @@ func TestChildEnvIsExactlyScrubbed(t *testing.T) {
 		"VERSIONHOO_REPOSITORY": true, "VERSIONHOO_BRANCH": true, "VERSIONHOO_SHA": true,
 	}
 	for key := range got {
-		// _ / PWD / SHLVL are injected by the child shell itself, not by us.
-		if key == "_" || key == "PWD" || key == "SHLVL" {
-			continue
-		}
 		if !wantKeys[key] {
 			t.Errorf("unexpected child env key %s=%s", key, got[key])
 		}
@@ -179,8 +165,7 @@ func TestChildEnvIsExactlyScrubbed(t *testing.T) {
 		t.Errorf("webhook context vars wrong: %v", got)
 	}
 }
-
-func TestInstallFailureRedactsToken(t *testing.T) {
+func TestAppRejectsConfiguredInstallBeforeExecution(t *testing.T) {
 	repoDir, headSha := prepareRepo(t, nil)
 	spec := JobSpec{
 		RepositoryFullName: "octo/hello", Branch: "main", HeadSha: headSha,
@@ -189,39 +174,27 @@ func TestInstallFailureRedactsToken(t *testing.T) {
 	}
 	out := Runner(spec)
 	if out.Err == nil {
-		t.Fatal("expected install failure")
+		t.Fatal("expected App install rejection")
 	}
-	mustContain(t, out.Err.Error(), "Install command failed:")
-	mustContain(t, out.Err.Error(), "[redacted]")
+	mustContain(t, out.Err.Error(), "App mode rejects dependency installation")
 	if strings.Contains(out.Err.Error(), "SECRETTOKEN123") {
 		t.Fatalf("token leaked: %s", out.Err.Error())
 	}
 }
 
-func TestBunLockSelectsDefaultInstall(t *testing.T) {
-	binDir := t.TempDir()
-	argsFile := filepath.Join(t.TempDir(), "bunargs.txt")
-	writeFile(t, filepath.Join(binDir, "bun"),
-		"#!/bin/sh\nprintf '%s\\n' \"$@\" >> "+argsFile+"\nexit 0\n")
-	os.Chmod(filepath.Join(binDir, "bun"), 0o755)
-
+func TestAppRejectsImplicitBunInstall(t *testing.T) {
 	repoDir, headSha := prepareRepo(t, func(dir string) {
 		writeFile(t, filepath.Join(dir, "bun.lock"), "{}")
 	})
-	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
-
 	spec := JobSpec{
 		RepositoryFullName: "octo/hello", Branch: "main", HeadSha: headSha,
-		Token: "TOK", RepoDir: repoDir, InstallCommand: "",
+		Token: "TOK", RepoDir: repoDir,
 	}
 	out := Runner(spec)
-	_ = out // config load fails afterwards; install must have run
-	rawArgs, err := os.ReadFile(argsFile)
-	if err != nil {
-		t.Fatalf("default bun install not invoked: %v", err)
+	if out.Err == nil {
+		t.Fatal("expected implicit install rejection")
 	}
-	mustContain(t, string(rawArgs), "install")
-	mustContain(t, string(rawArgs), "--frozen-lockfile")
+	mustContain(t, out.Err.Error(), "App mode rejects implicit dependency installation")
 }
 
 // --- Fake GitHub server -----------------------------------------------------

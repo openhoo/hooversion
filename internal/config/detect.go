@@ -7,19 +7,27 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 
 	"github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
+const maxPackageJSONBytes = 1 << 20
+
+var openJSONNoFollow = safefs.OpenReadNoFollow
+
 // DetectPackages returns the raw PackageConfig candidates found in cwd:
-// package.json (node), Cargo.toml root plus existing workspace members (rust),
-// pyproject.toml [project] (python), and a version file (version-file, named
-// after the cwd basename). Candidates are deduped by "type:path".
+// package.json files (node), Cargo.toml root plus existing workspace members
+// (rust), pyproject.toml [project] (python), and a version file (version-file,
+// named after the cwd basename). Node manifests below ignored/generated
+// directories are skipped. Candidates are deduped by "type:path".
 func DetectPackages(cwd string) ([]types.PackageConfig, error) {
 	var candidates []types.PackageConfig
 
@@ -31,6 +39,11 @@ func DetectPackages(cwd string) ([]types.PackageConfig, error) {
 		}
 		candidates = append(candidates, types.PackageConfig{Type: types.PackageNode, Path: ".", Name: name})
 	}
+	nestedNodePackages, err := detectNestedNodePackages(cwd)
+	if err != nil {
+		return nil, err
+	}
+	candidates = append(candidates, nestedNodePackages...)
 
 	cargoToml := filepath.Join(cwd, "Cargo.toml")
 	if fileExists(cargoToml) {
@@ -57,15 +70,72 @@ func DetectPackages(cwd string) ([]types.PackageConfig, error) {
 
 	seen := make(map[string]bool, len(candidates))
 	deduped := candidates[:0]
-	for _, pkg := range candidates {
-		key := fmt.Sprintf("%s:%s", pkg.Type, filepath.Clean(pkg.Path))
+	for index := range candidates {
+		normalizedPath, err := normalizeRelative(candidates[index].Path)
+		if err != nil {
+			return nil, err
+		}
+		candidates[index].Path = normalizedPath
+		key := fmt.Sprintf("%s:%s", candidates[index].Type, normalizedPath)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		deduped = append(deduped, pkg)
+		deduped = append(deduped, candidates[index])
 	}
 	return deduped, nil
+}
+
+var ignoredNodePackageDirs = map[string]struct{}{
+	".git":         {},
+	".github":      {},
+	".hg":          {},
+	".hooversion":  {},
+	".svn":         {},
+	"node_modules": {},
+	"vendor":       {},
+}
+
+func detectNestedNodePackages(cwd string) ([]types.PackageConfig, error) {
+	var packages []types.PackageConfig
+	err := filepath.WalkDir(cwd, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != cwd {
+				if _, ignored := ignoredNodePackageDirs[entry.Name()]; ignored {
+					return fs.SkipDir
+				}
+			}
+			return nil
+		}
+		if entry.Name() != "package.json" || filepath.Dir(path) == cwd || !fileExists(path) {
+			return nil
+		}
+		name, err := readJSONName(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(cwd, filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		packagePath, err := normalizeRelative(rel)
+		if err != nil {
+			return err
+		}
+		packages = append(packages, types.PackageConfig{
+			Type: types.PackageNode,
+			Path: packagePath,
+			Name: name,
+		})
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return packages, nil
 }
 
 // DefaultManifestPath mirrors defaultManifestPath in src/manifest.ts; python
@@ -120,14 +190,34 @@ func detectCargoPackages(cwd string) ([]types.PackageConfig, error) {
 }
 
 func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
+	info, err := os.Lstat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 func readJSONName(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	file, err := openJSONNoFollow(path)
 	if err != nil {
 		return "", err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return "", err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return "", errors.New("%s must be a regular file", path)
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxPackageJSONBytes+1))
+	closeErr := file.Close()
+	if readErr != nil {
+		return "", readErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if len(data) > maxPackageJSONBytes {
+		return "", errors.New("%s exceeds the maximum package.json size", path)
 	}
 	var doc struct {
 		Name string `json:"name"`

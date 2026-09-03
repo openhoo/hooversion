@@ -7,9 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/openhoo/hooversion/internal/types"
 )
@@ -383,6 +386,132 @@ func TestDetectPackagesEcosystemsAndDedupe(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("entry %d = %+v, want %+v", i, got[i], want[i])
 		}
+	}
+}
+
+func TestDetectPackagesFindsNestedNodePackagesAndSkipsGeneratedDirectories(t *testing.T) {
+	cwd := t.TempDir()
+	writeJSON(t, cwd, "apps/web/package.json", "web")
+	writeJSON(t, cwd, "apps/admin/package.json", "admin")
+	writeJSON(t, cwd, "node_modules/dependency/package.json", "dependency")
+	writeJSON(t, cwd, ".git/hooks/package.json", "hook")
+	writeJSON(t, cwd, ".hooversion/cache/package.json", "cache")
+
+	pkgs, err := DetectPackages(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pkgs) != 2 {
+		t.Fatalf("detected %v, want two nested Node packages", pkgs)
+	}
+	if pkgs[0].Type != types.PackageNode || pkgs[0].Path != "apps/admin" || pkgs[0].Name != "admin" {
+		t.Fatalf("first package = %+v, want admin", pkgs[0])
+	}
+	if pkgs[1].Type != types.PackageNode || pkgs[1].Path != "apps/web" || pkgs[1].Name != "web" {
+		t.Fatalf("second package = %+v, want web", pkgs[1])
+	}
+}
+
+func TestDetectPackagesNestedFIFO(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFO is a Unix filesystem primitive")
+	}
+	cwd := t.TempDir()
+	fifoDir := filepath.Join(cwd, "apps", "blocked")
+	if err := os.MkdirAll(fifoDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fifoPath := filepath.Join(fifoDir, "package.json")
+	if output, err := exec.Command("mkfifo", fifoPath).CombinedOutput(); err != nil {
+		t.Fatalf("mkfifo: %v (%s)", err, output)
+	}
+
+	type result struct {
+		packages []types.PackageConfig
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		packages, err := DetectPackages(cwd)
+		done <- result{packages: packages, err: err}
+	}()
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		if len(got.packages) != 0 {
+			t.Fatalf("FIFO must not be detected as a package: %+v", got.packages)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("DetectPackages blocked while inspecting a FIFO package.json")
+	}
+}
+
+func TestReadJSONNameRejectsCheckedPathReplacement(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("FIFO is a Unix filesystem primitive")
+	}
+	cwd := t.TempDir()
+	path := filepath.Join(cwd, "package.json")
+	if err := os.WriteFile(path, []byte(`{"name":"safe"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := openJSONNoFollow
+	defer func() { openJSONNoFollow = original }()
+	openJSONNoFollow = func(name string) (*os.File, error) {
+		originalPath := name + ".checked"
+		if err := os.Rename(name, originalPath); err != nil {
+			return nil, err
+		}
+		if output, err := exec.Command("mkfifo", name).CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("mkfifo: %v (%s)", err, output)
+		}
+		return original(name)
+	}
+	if _, err := readJSONName(path); err == nil {
+		t.Fatal("accepted manifest path replaced with FIFO")
+	}
+}
+
+func TestDetectPackagesNestedNonRegularManifest(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink semantics differ on Windows")
+	}
+	cwd := t.TempDir()
+	writeJSON(t, cwd, "apps/real/package.json", "real")
+	linkPath := filepath.Join(cwd, "apps", "link", "package.json")
+	if err := os.MkdirAll(filepath.Dir(linkPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("..", "real", "package.json"), linkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	packages, err := DetectPackages(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packages) != 1 || packages[0].Path != "apps/real" || packages[0].Name != "real" {
+		t.Fatalf("detected non-regular manifest: %+v", packages)
+	}
+}
+
+func TestDetectPackagesOversizedNestedManifest(t *testing.T) {
+	cwd := t.TempDir()
+	manifest := make([]byte, maxPackageJSONBytes+1)
+	copy(manifest, `{"name":"app","padding":"`)
+	writeFilePath := filepath.Join(cwd, "apps", "large", "package.json")
+	if err := os.MkdirAll(filepath.Dir(writeFilePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(writeFilePath, manifest, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := DetectPackages(cwd)
+	if err == nil || !strings.Contains(err.Error(), "exceeds the maximum package.json size") {
+		t.Fatalf("oversized manifest error = %v", err)
 	}
 }
 

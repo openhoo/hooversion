@@ -26,16 +26,25 @@ import (
 // Read returns the package name and current version from the package
 // manifest (mirrors readManifest).
 func Read(pkg types.NormalizedPackageConfig) (string, string, error) {
-	path := pkg.Manifest
+	data, err := os.ReadFile(pkg.Manifest)
+	if err != nil {
+		return "", "", err
+	}
+	return ReadData(pkg, data)
+}
+
+// ReadData parses manifest bytes using the same format rules as Read. The
+// manifest path is used only for diagnostics and is never opened.
+func ReadData(pkg types.NormalizedPackageConfig, data []byte) (string, string, error) {
 	switch pkg.Type {
 	case types.PackageNode:
-		return readPackageJSON(path)
+		return readPackageJSONData(pkg.Manifest, data)
 	case types.PackageRust:
-		return readTomlPackage(path, "package")
+		return readTomlPackageData(pkg.Manifest, string(data), "package")
 	case types.PackageVersionFile:
-		return readVersionFile(path, pkg.Name)
+		return readVersionFileData(pkg.Manifest, pkg.Name, data)
 	default:
-		return readTomlPackage(path, "project")
+		return readTomlPackageData(pkg.Manifest, string(data), "project")
 	}
 }
 
@@ -989,6 +998,10 @@ func readPackageJSON(path string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	return readPackageJSONData(path, data)
+}
+
+func readPackageJSONData(path string, data []byte) (string, string, error) {
 	root, err := decodeOrderedJSON(data)
 	if err != nil {
 		return "", "", err
@@ -1008,7 +1021,10 @@ func readTomlPackage(path, sectionName string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	text := string(data)
+	return readTomlPackageData(path, string(data), sectionName)
+}
+
+func readTomlPackageData(path, text, sectionName string) (string, string, error) {
 	section := getTomlSection(text, sectionName)
 	name, _ := readTomlString(section, "name")
 	version, _ := readTomlString(section, "version")
@@ -1023,6 +1039,10 @@ func readVersionFile(path, name string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	return readVersionFileData(path, name, data)
+}
+
+func readVersionFileData(path, name string, data []byte) (string, string, error) {
 	version := strings.TrimSpace(string(data))
 	if version == "" {
 		return "", "", hverrors.New("%s must contain a version", path)
@@ -1051,12 +1071,15 @@ func getTomlSection(text, sectionName string) string {
 }
 
 func readTomlString(section, key string) (string, bool) {
-	re := regexp.MustCompile(`(?m)^\s*` + escapeRegExp(key) + `\s*=\s*["']([^"']+)["']\s*$`)
+	re := regexp.MustCompile(`(?m)^[ \t]*` + escapeRegExp(key) + `[ \t]*=[ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)')[ \t]*(?:#[^\r\n]*)?$`)
 	m := re.FindStringSubmatch(section)
 	if m == nil {
 		return "", false
 	}
-	return m[1], true
+	if m[1] != "" {
+		return m[1], true
+	}
+	return m[2], true
 }
 
 func updateTomlSectionVersion(path, sectionName, version string) error {

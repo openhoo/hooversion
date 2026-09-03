@@ -4,6 +4,8 @@ package output
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,13 +31,15 @@ type Store struct {
 
 type stalePayload struct {
 	Releases []struct {
-		Tag any `json:"tag"`
+		Tag       any    `json:"tag"`
+		NotesPath string `json:"notesPath"`
 	} `json:"releases"`
 }
 
 // Paths returns every managed path: outputs.json, .release-version, the
-// per-tag note names inferred from a stale payload (advisory), and the
-// output directory itself.
+// per-tag note names inferred from a stale payload (advisory), legacy
+// notesPath names that remain inside the output directory, and the output
+// directory itself.
 func (s Store) Paths() ManagedPaths {
 	outputsPath := s.outputsPath()
 	releaseVersionPath := filepath.Join(s.Cwd, ".release-version")
@@ -51,18 +55,112 @@ func (s Store) Paths() ManagedPaths {
 		return paths
 	}
 	for _, release := range payload.Releases {
-		tag, ok := release.Tag.(string)
+		if notePath, ok := legacyNotePath(s.Cwd, dir, release.NotesPath); ok {
+			paths[notePath] = false
+		}
+	}
+
+	tags := make([]string, 0, len(payload.Releases))
+	for _, release := range payload.Releases {
+		if tag, ok := release.Tag.(string); ok {
+			tags = append(tags, tag)
+		}
+	}
+	noteNames, err := deriveNoteNames(tags)
+	if err != nil {
+		return paths
+	}
+	tagIndex := 0
+	for _, release := range payload.Releases {
+		_, ok := release.Tag.(string)
 		if !ok {
 			continue
 		}
-		notePath := filepath.Join(dir, sanitizeFileName(tag)+"-notes.md")
-		rel, err := filepath.Rel(dir, notePath)
-		if err != nil || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
+		noteName := noteNames[tagIndex]
+		tagIndex++
+		if notePath, ok := containedPath(dir, filepath.Join(dir, noteName)); ok {
+			paths[notePath] = false
 		}
-		paths[notePath] = false
 	}
 	return paths
+}
+
+// legacyNotePath resolves a stored notesPath against the checkout and admits
+// it only when it is a non-root descendant of the configured output directory.
+// Old payloads are advisory input, so paths outside that directory are ignored.
+func legacyNotePath(cwd, outputDir, notesPath string) (string, bool) {
+	if notesPath == "" {
+		return "", false
+	}
+	path := notesPath
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(cwd, path)
+	}
+	candidate, ok := containedPath(outputDir, path)
+	if !ok || hasSymlinkParent(outputDir, candidate) {
+		return "", false
+	}
+	return candidate, true
+}
+
+// containedPath returns candidate only when it is strictly contained by root.
+// Absolute paths are used for the comparison so relative checkout paths cannot
+// bypass the boundary with traversal segments.
+func containedPath(root, candidate string) (string, bool) {
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return "", false
+	}
+	candidateAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(rootAbs, candidateAbs)
+	if err != nil || rel == "" || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) ||
+		filepath.IsAbs(rel) {
+		return "", false
+	}
+	return filepath.Clean(candidate), true
+}
+
+// hasSymlinkParent rejects a legacy note whose parent component would make
+// os.Remove follow a symlink outside the output directory. A missing parent
+// is safe because Clear skips a missing candidate.
+func hasSymlinkParent(root, candidate string) bool {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return true
+		}
+	} else if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return true
+	}
+	rootAbs, err := filepath.Abs(root)
+	if err != nil {
+		return true
+	}
+	candidateAbs, err := filepath.Abs(candidate)
+	if err != nil {
+		return true
+	}
+	rel, err := filepath.Rel(rootAbs, candidateAbs)
+	if err != nil || rel == "." || rel == "" {
+		return true
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	current := root
+	for _, part := range parts[:len(parts)-1] {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return !os.IsNotExist(err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return true
+		}
+	}
+	return false
 }
 
 // readStalePayload parses outputs.json without following a symlink planted at
@@ -139,6 +237,14 @@ type storedPayload struct {
 // whether the pipeline actually published; it is combined with the release
 // count exactly like src/output.ts derives it.
 func (s Store) Write(releases []types.PackageRelease, published bool) error {
+	tags := make([]string, len(releases))
+	for i, release := range releases {
+		tags[i] = release.Tag
+	}
+	noteNames, err := deriveNoteNames(tags)
+	if err != nil {
+		return err
+	}
 	if err := s.Clear(); err != nil {
 		return err
 	}
@@ -148,8 +254,8 @@ func (s Store) Write(releases []types.PackageRelease, published bool) error {
 	}
 
 	stored := make([]storedRelease, 0, len(releases))
-	for _, release := range releases {
-		noteName := sanitizeFileName(release.Tag) + "-notes.md"
+	for i, release := range releases {
+		noteName := noteNames[i]
 		if err := os.WriteFile(filepath.Join(dir, noteName), []byte(release.Notes+"\n"), 0o644); err != nil {
 			return err
 		}
@@ -227,10 +333,46 @@ func marshalJSONCompact(value any) string {
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)
 	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(value); err != nil { // never fails for this shape
+	if err := encoder.Encode(value); err != nil {
 		return "null"
 	}
 	return strings.TrimRight(buf.String(), "\n")
+}
+
+const (
+	maxNoteFileNameBytes = 255
+	noteFileSuffix       = "-notes.md"
+)
+
+func deriveNoteNames(tags []string) ([]string, error) {
+	baseCounts := make(map[string]int, len(tags))
+	for _, tag := range tags {
+		baseCounts[sanitizeFileName(tag)]++
+	}
+	const hashHexBytes = sha256.Size * 2
+	hashSuffixBytes := 1 + hashHexBytes + len(noteFileSuffix)
+	maxReadableBaseBytes := maxNoteFileNameBytes - hashSuffixBytes
+	names := make([]string, len(tags))
+	seen := make(map[string]string, len(tags))
+	for i, tag := range tags {
+		base := sanitizeFileName(tag)
+		needsHash := baseCounts[base] > 1 || len(base)+len(noteFileSuffix) > maxNoteFileNameBytes
+		name := base
+		if needsHash {
+			sum := sha256.Sum256([]byte(tag))
+			if len(name) > maxReadableBaseBytes {
+				name = name[:maxReadableBaseBytes]
+			}
+			name += "-" + hex.EncodeToString(sum[:])
+		}
+		name += noteFileSuffix
+		if previous, exists := seen[name]; exists {
+			return nil, fmt.Errorf("release note path collision for tags %q and %q", previous, tag)
+		}
+		seen[name] = tag
+		names[i] = name
+	}
+	return names, nil
 }
 
 func sanitizeFileName(value string) string {

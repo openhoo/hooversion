@@ -39,17 +39,23 @@ go build -o bin/versionhoo-app ./cmd/versionhoo-app
 VERSIONHOO_APP_ID=12345 \
 VERSIONHOO_PRIVATE_KEY_PATH=/run/secrets/versionhoo-app.pem \
 VERSIONHOO_WEBHOOK_SECRET=... \
-VERSIONHOO_ALLOWED_REPOS=openhoo/hooversion,openhoo/mouserhoo \
 ./bin/versionhoo-app
 ```
 
-Alternatively install it with Go or download a prebuilt binary from GitHub
-Releases:
+`VERSIONHOO_ALLOWED_REPOS` is intentionally omitted above. If you set it, list
+only repositories without Hooversion hooks; App mode rejects dependency
+installation and every repository hook. In particular, do not allow-list
+`openhoo/hooversion`, whose release configuration uses an `afterVersion` hook.
+
+Alternatively install the app with Go:
 
 ```sh
 go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.0
 versionhoo-app
 ```
+
+Release archives contain the app-capable `hooversion` CLI, not a standalone
+`versionhoo-app`; use `hooversion app` after downloading that CLI.
 
 Health check:
 
@@ -62,9 +68,14 @@ Container build:
 ```sh
 docker build -t versionhoo-app .
 docker run --rm -p 3000:3000 --env-file examples/versionhoo-app.env.example \
+  -v versionhoo-app-data:/var/lib/versionhoo \
   -v /secure/versionhoo-app.pem:/run/secrets/versionhoo-app.pem:ro \
   versionhoo-app
 ```
+
+The named `versionhoo-app-data` volume is part of the deployment state; retain
+and reuse it when replacing the container so accepted webhook records survive
+restarts.
 
 ## Environment
 
@@ -89,6 +100,15 @@ docker run --rm -p 3000:3000 --env-file examples/versionhoo-app.env.example \
 - `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES`: positive integer maximum webhook body
   size. Defaults to `1048576` (1 MiB); oversized declared or streamed bodies
   are rejected.
+- `VERSIONHOO_WEBHOOK_SPOOL_DIR`: durable webhook backlog directory. Defaults
+  to the explicit value, then `<workdir>/webhook-spool` when a workdir is
+  configured, then `os.UserCacheDir()/versionhoo/webhook-spool`, then
+  `$HOME/.cache/versionhoo/webhook-spool` when the user cache directory cannot
+  be resolved, and finally `os.TempDir()/versionhoo-webhook-spool`. The
+  directory and records are created with restrictive permissions.
+- `VERSIONHOO_WEBHOOK_SPOOL_MAX_BYTES`: positive integer maximum total spool
+  bytes. Defaults to `67108864` (64 MiB); a full spool is the only admission
+  condition that can return a retryable `503`.
 - `VERSIONHOO_WORKDIR`: parent directory for release clones. Defaults to the
   system temp directory.
 - `VERSIONHOO_ALLOWED_REPOS`: comma-separated allow-list. Empty means every
@@ -99,9 +119,10 @@ docker run --rm -p 3000:3000 --env-file examples/versionhoo-app.env.example \
   releases after success. Defaults to `CI`.
 - `VERSIONHOO_CONFIG`: optional path to a Hooversion config inside each cloned
   repository.
-- `VERSIONHOO_INSTALL_COMMAND`: optional command to install project dependencies
-  before release hooks run. If unset and `bun.lock` exists, the app runs
-  `bun install --frozen-lockfile`.
+- `VERSIONHOO_INSTALL_COMMAND`: rejected by App mode. Production App mode
+  always creates a fresh clone, so dependencies cannot be installed in advance;
+  a repository containing `bun.lock` is also rejected to prevent implicit
+  installation.
 - `VERSIONHOO_GIT_AUTHOR_NAME`: release commit author name. Defaults to
   `versionhoo[bot]`.
 - `VERSIONHOO_GIT_AUTHOR_EMAIL`: release commit author email. Defaults to
@@ -117,7 +138,16 @@ Each release runs in a secret-isolated child environment containing only the
 minimal process and repository metadata needed by the runner. Git credentials
 are written to temporary mode-restricted files for clone/push and removed in
 cleanup, including failure cleanup; the token is not placed in the child
-environment. Keep install commands and hooks bounded to the cloned repository.
+environment. App mode always creates a fresh clone and supports only
+repositories requiring neither dependency installation nor repository hooks.
+Use the GitHub Actions release workflow or ordinary CLI for repositories that
+need installation or hooks. The ordinary CLI retains its configured install
+and hook behavior.
+
+The listener enforces a 10-second header-read timeout, a 30-second whole-request
+read timeout, 30-second write timeout, 60-second idle timeout, and a 64 KiB
+maximum header size. If a reverse proxy is used, configure its request and
+upstream timeouts no longer than these bounds.
 
 ## Release Flow
 
@@ -139,10 +169,18 @@ environment. Keep install commands and hooks bounded to the cloned repository.
 Release commits beginning with `chore(release):` or containing `[skip ci]` are
 ignored to prevent release loops.
 
-Webhook bodies are bounded by `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES`. Webhook
-delivery and workflow-run reservations are deduplicated in memory for 24 hours:
-in-flight and succeeded duplicates are acknowledged and ignored, while a
-reservation is released after final job failure so a redelivery can retry.
-Release jobs are serialized per repository branch without cancelling an
-already-queued job, so two releases for the same branch cannot mutate it at the
-same time while different repositories can still release independently.
+Webhook bodies are bounded by `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES` before
+signature verification and durable admission. Every validated, handled
+`workflow_run` is written and fsynced as a bounded record in the spool before
+the app returns HTTP 202. The in-memory queue still accepts at most 64 running
+or waiting jobs and serializes jobs per repository/ref; a full queue therefore
+leaves the durable record pending rather than returning a lossy `503`.
+
+Spool records are sequence-numbered and drained FIFO for each repository/ref.
+Pending records are recovered and retried after process restart. Completed
+records and final failures are removed only after execution reaches its
+terminal callback. Delivery and workflow-run dedupe reservations stay in
+memory for 24 hours and are released after final failure (or an admission
+error), never merely because the bounded execution queue is saturated.
+Malformed, oversized, symlinked, or path-invalid spool entries are ignored or
+quarantined without blocking later records.

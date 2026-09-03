@@ -162,6 +162,39 @@ func TestUpdatesFilesCommitsTagsAndWritesOutputs(t *testing.T) {
 	}
 }
 
+func TestNoPushSkipsRemoteTagProofWhenGitHubPublicationDisabled(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		enabled  bool
+		releases bool
+	}{
+		{name: "github disabled", enabled: false, releases: true},
+		{name: "releases disabled", enabled: true, releases: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cwd := seedAppRepo(t)
+			config := singleAppConfig(false)
+			config.GitHub.Enabled = tc.enabled
+			config.GitHub.Releases = tc.releases
+
+			releasePlan, err := CreatePlanForTest(cwd, config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := Execute(cwd, config, releasePlan, Options{NoPushSet: true})
+			if err != nil {
+				t.Fatalf("release with disabled GitHub publication: %v", err)
+			}
+			if !result.Published || len(result.Plan.Releases) != 1 {
+				t.Fatalf("unexpected release result: %+v", result)
+			}
+			if got := gitOut(t, cwd, "tag", "--list", "v1.0.1"); got != "v1.0.1" {
+				t.Fatalf("tag missing: %q", got)
+			}
+		})
+	}
+}
+
 func TestRejectsPlanWhenLocalHeadAdvancedBeforeMutation(t *testing.T) {
 	cwd := seedAppRepo(t)
 	config := singleAppConfig(false)

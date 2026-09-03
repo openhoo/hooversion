@@ -202,6 +202,42 @@ func TestRoutesIndependentAndPropagatesDependentsAsPatch(t *testing.T) {
 	}
 }
 
+func TestStaggeredPackageTagsDoNotBlockEligibleRelease(t *testing.T) {
+	cwd := makeRepo(t)
+	writeFile(t, filepath.Join(cwd, "packages", "a", "package.json"), "{\"name\":\"a\",\"version\":\"0.1.0\"}\n")
+	writeFile(t, filepath.Join(cwd, "packages", "b", "package.json"), "{\"name\":\"b\",\"version\":\"0.1.0\"}\n")
+	commitAll(t, cwd, "initial import")
+	gitOut(t, cwd, "tag", "-a", "b@v0.1.0", "-m", "b@v0.1.0")
+
+	writeFile(t, filepath.Join(cwd, "packages", "a", "package.json"), "{\"name\":\"a\",\"version\":\"0.2.0\"}\n")
+	writeFile(t, filepath.Join(cwd, "packages", "a", "index.ts"), "export const a = true;\n")
+	commitAll(t, cwd, "feat(a): release a")
+	gitOut(t, cwd, "tag", "-a", "a@v0.2.0", "-m", "a@v0.2.0")
+
+	writeFile(t, filepath.Join(cwd, "packages", "b", "index.ts"), "export const b = true;\n")
+	commitAll(t, cwd, "fix(b): repair b")
+
+	config := baseConfig(
+		nodePkg("a", "packages/a", "packages/a/package.json"),
+		nodePkg("b", "packages/b", "packages/b/package.json"),
+	)
+	plan, err := CreatePlan(cwd, config, "main", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.UnmatchedCommits) != 0 {
+		t.Fatalf("stale routed commit was unmatched: %+v", plan.UnmatchedCommits)
+	}
+	if len(plan.Releases) != 1 || plan.Releases[0].Package.Name != "b" ||
+		plan.Releases[0].NextVersion != "0.1.1" {
+		t.Fatalf("expected only b patch release, got %+v", plan.Releases)
+	}
+	if len(plan.Releases[0].Commits) != 1 ||
+		plan.Releases[0].Commits[0].Subject != "fix(b): repair b" {
+		t.Fatalf("b release commits wrong: %+v", plan.Releases[0].Commits)
+	}
+}
+
 func TestNoCascadeWithoutDeclaredDependencyEdge(t *testing.T) {
 	cwd := makeRepo(t)
 	writeFile(t, filepath.Join(cwd, "packages", "one", "package.json"), "{\"name\": \"one\", \"version\": \"0.1.0\"}\n")

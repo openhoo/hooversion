@@ -7,12 +7,17 @@ package app
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
+	"time"
 
 	hverr "github.com/openhoo/hooversion/internal/errors"
 )
@@ -20,26 +25,36 @@ import (
 // DefaultWebhookMaxBodyBytes mirrors DEFAULT_WEBHOOK_MAX_BODY_BYTES (1 MiB).
 const DefaultWebhookMaxBodyBytes = 1024 * 1024
 
+const (
+	webhookReadHeaderTimeout = 10 * time.Second
+	webhookReadTimeout       = 30 * time.Second
+	webhookWriteTimeout      = 30 * time.Second
+	webhookIdleTimeout       = 60 * time.Second
+	webhookMaxHeaderBytes    = 64 * 1024
+)
+
 // AppConfig mirrors VersionhooAppConfig.
 type AppConfig struct {
-	AppID               string
-	PrivateKey          string
-	WebhookSecret       string
-	ApiURL              string
-	TrustedAPIURLs      []string
-	TrustedCloneHosts   []string
-	Host                string
-	Port                int
-	WorkDir             string
-	ConfigPath          string
-	InstallCommand      string
-	AllowedRepositories []string
-	ReleaseBranches     []string
-	CIWorkflowNames     []string
-	GitAuthorName       string
-	GitAuthorEmail      string
-	KeepWorkDir         bool
-	WebhookMaxBodyBytes int
+	AppID                string
+	PrivateKey           string
+	WebhookSecret        string
+	ApiURL               string
+	TrustedAPIURLs       []string
+	TrustedCloneHosts    []string
+	Host                 string
+	Port                 int
+	WorkDir              string
+	ConfigPath           string
+	InstallCommand       string
+	AllowedRepositories  []string
+	ReleaseBranches      []string
+	CIWorkflowNames      []string
+	GitAuthorName        string
+	GitAuthorEmail       string
+	KeepWorkDir          bool
+	WebhookMaxBodyBytes  int
+	WebhookSpoolDir      string
+	WebhookSpoolMaxBytes int64
 }
 
 // firstEnv returns the first non-empty value among names, mirroring readEnv.
@@ -125,30 +140,39 @@ func LoadAppConfigFromEnv(getenv func(string) string) (*AppConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	webhookSpoolMaxBytes, err := positiveIntEnv(getenv,
+		[2]string{"VERSIONHOO_WEBHOOK_SPOOL_MAX_BYTES", "HOOVERSION_WEBHOOK_SPOOL_MAX_BYTES"},
+		int(DefaultWebhookSpoolMaxBytes),
+		"VERSIONHOO_WEBHOOK_SPOOL_MAX_BYTES must be a positive integer.")
+	if err != nil {
+		return nil, err
+	}
 	privateKey, err := ReadGitHubAppPrivateKey(getenv)
 	if err != nil {
 		return nil, err
 	}
 
 	return &AppConfig{
-		AppID:               appID,
-		PrivateKey:          privateKey,
-		WebhookSecret:       webhookSecret,
-		ApiURL:              orDefault(firstEnv(getenv, "VERSIONHOO_GITHUB_API_URL", "HOOVERSION_GITHUB_API_URL"), "https://api.github.com"),
-		TrustedAPIURLs:      splitCSV(firstEnv(getenv, "VERSIONHOO_TRUSTED_GITHUB_API_URLS", "HOOVERSION_TRUSTED_GITHUB_API_URLS", "VERSIONHOO_TRUSTED_API_URLS", "HOOVERSION_TRUSTED_API_URLS")),
-		TrustedCloneHosts:   splitCSV(firstEnv(getenv, "VERSIONHOO_TRUSTED_GITHUB_CLONE_HOSTS", "HOOVERSION_TRUSTED_GITHUB_CLONE_HOSTS", "VERSIONHOO_TRUSTED_CLONE_HOSTS", "HOOVERSION_TRUSTED_CLONE_HOSTS")),
-		Host:                orDefault(firstEnv(getenv, "VERSIONHOO_HOST", "HOOVERSION_HOST"), "0.0.0.0"),
-		Port:                port,
-		ReleaseBranches:     splitCSV(orDefault(firstEnv(getenv, "VERSIONHOO_RELEASE_BRANCHES", "HOOVERSION_RELEASE_BRANCHES"), "main")),
-		WorkDir:             firstEnv(getenv, "VERSIONHOO_WORKDIR", "HOOVERSION_WORKDIR"),
-		ConfigPath:          firstEnv(getenv, "VERSIONHOO_CONFIG", "HOOVERSION_CONFIG"),
-		InstallCommand:      firstEnv(getenv, "VERSIONHOO_INSTALL_COMMAND", "HOOVERSION_INSTALL_COMMAND"),
-		AllowedRepositories: splitCSV(firstEnv(getenv, "VERSIONHOO_ALLOWED_REPOS", "HOOVERSION_ALLOWED_REPOS")),
-		CIWorkflowNames:     splitCSV(orDefault(firstEnv(getenv, "VERSIONHOO_CI_WORKFLOWS", "HOOVERSION_CI_WORKFLOWS"), "CI")),
-		GitAuthorName:       firstEnv(getenv, "VERSIONHOO_GIT_AUTHOR_NAME", "HOOVERSION_GIT_AUTHOR_NAME"),
-		GitAuthorEmail:      firstEnv(getenv, "VERSIONHOO_GIT_AUTHOR_EMAIL", "HOOVERSION_GIT_AUTHOR_EMAIL"),
-		KeepWorkDir:         readBoolean(firstEnv(getenv, "VERSIONHOO_KEEP_WORKDIR", "HOOVERSION_KEEP_WORKDIR")),
-		WebhookMaxBodyBytes: webhookMaxBodyBytes,
+		AppID:                appID,
+		PrivateKey:           privateKey,
+		WebhookSecret:        webhookSecret,
+		ApiURL:               orDefault(firstEnv(getenv, "VERSIONHOO_GITHUB_API_URL", "HOOVERSION_GITHUB_API_URL"), "https://api.github.com"),
+		TrustedAPIURLs:       splitCSV(firstEnv(getenv, "VERSIONHOO_TRUSTED_GITHUB_API_URLS", "HOOVERSION_TRUSTED_GITHUB_API_URLS", "VERSIONHOO_TRUSTED_API_URLS", "HOOVERSION_TRUSTED_API_URLS")),
+		TrustedCloneHosts:    splitCSV(firstEnv(getenv, "VERSIONHOO_TRUSTED_GITHUB_CLONE_HOSTS", "HOOVERSION_TRUSTED_GITHUB_CLONE_HOSTS", "VERSIONHOO_TRUSTED_CLONE_HOSTS", "HOOVERSION_TRUSTED_CLONE_HOSTS")),
+		Host:                 orDefault(firstEnv(getenv, "VERSIONHOO_HOST", "HOOVERSION_HOST"), "0.0.0.0"),
+		Port:                 port,
+		ReleaseBranches:      splitCSV(orDefault(firstEnv(getenv, "VERSIONHOO_RELEASE_BRANCHES", "HOOVERSION_RELEASE_BRANCHES"), "main")),
+		WorkDir:              firstEnv(getenv, "VERSIONHOO_WORKDIR", "HOOVERSION_WORKDIR"),
+		ConfigPath:           firstEnv(getenv, "VERSIONHOO_CONFIG", "HOOVERSION_CONFIG"),
+		WebhookSpoolDir:      firstEnv(getenv, "VERSIONHOO_WEBHOOK_SPOOL_DIR", "HOOVERSION_WEBHOOK_SPOOL_DIR"),
+		InstallCommand:       firstEnv(getenv, "VERSIONHOO_INSTALL_COMMAND", "HOOVERSION_INSTALL_COMMAND"),
+		AllowedRepositories:  splitCSV(firstEnv(getenv, "VERSIONHOO_ALLOWED_REPOS", "HOOVERSION_ALLOWED_REPOS")),
+		CIWorkflowNames:      splitCSV(orDefault(firstEnv(getenv, "VERSIONHOO_CI_WORKFLOWS", "HOOVERSION_CI_WORKFLOWS"), "CI")),
+		GitAuthorName:        firstEnv(getenv, "VERSIONHOO_GIT_AUTHOR_NAME", "HOOVERSION_GIT_AUTHOR_NAME"),
+		GitAuthorEmail:       firstEnv(getenv, "VERSIONHOO_GIT_AUTHOR_EMAIL", "HOOVERSION_GIT_AUTHOR_EMAIL"),
+		KeepWorkDir:          readBoolean(firstEnv(getenv, "VERSIONHOO_KEEP_WORKDIR", "HOOVERSION_KEEP_WORKDIR")),
+		WebhookMaxBodyBytes:  webhookMaxBodyBytes,
+		WebhookSpoolMaxBytes: int64(webhookSpoolMaxBytes),
 	}, nil
 }
 
@@ -160,25 +184,57 @@ func resolveWebhookMaxBodyBytes(value int) int {
 	return DefaultWebhookMaxBodyBytes
 }
 
-// Run is the versionhoo-app entrypoint: it loads configuration from env and
-// serves GET /health plus POST /webhooks/github until the listener fails.
+// newWebhookServer centralizes the public listener's bounded HTTP behavior.
+func newWebhookServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: webhookReadHeaderTimeout,
+		ReadTimeout:       webhookReadTimeout,
+		WriteTimeout:      webhookWriteTimeout,
+		IdleTimeout:       webhookIdleTimeout,
+		MaxHeaderBytes:    webhookMaxHeaderBytes,
+	}
+}
+
 func Run(getenv func(string) string) error {
 	cfg, err := LoadAppConfigFromEnv(getenv)
 	if err != nil {
 		return err
 	}
+	spool, err := NewWebhookSpool(resolveWebhookSpoolDir(cfg), cfg.WebhookMaxBodyBytes, cfg.WebhookSpoolMaxBytes)
+	if err != nil {
+		return err
+	}
+	defer spool.Close()
 	queue := NewReleaseTaskQueue(nil, QueueOptions{})
 	deduper := NewWebhookDeduper(0, nil)
-	handler := NewWebhookHandler(cfg, Runner, queue, deduper)
-
+	handler := NewWebhookHandler(cfg, Runner, queue, deduper, spool)
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	log.Printf("versionhoo app listening on http://%s:%d", cfg.Host, cfg.Port)
-	server := &http.Server{Handler: rootRoutes(handler)}
+	server := newWebhookServer(rootRoutes(handler))
 	return server.Serve(listener)
+}
+
+func resolveWebhookSpoolDir(cfg *AppConfig) string {
+	if cfg.WebhookSpoolDir != "" {
+		return cfg.WebhookSpoolDir
+	}
+	if cfg.WorkDir != "" {
+		return filepath.Join(cfg.WorkDir, "webhook-spool")
+	}
+	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
+		return filepath.Join(cacheDir, "versionhoo", "webhook-spool")
+	}
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		return filepath.Join(homeDir, ".cache", "versionhoo", "webhook-spool")
+	}
+	// This fallback is only used on systems without a discoverable user
+	// directory; NewWebhookSpool still enforces private ownership and mode.
+	return filepath.Join(os.TempDir(), "versionhoo-webhook-spool")
 }
 
 // rootRoutes mirrors the Bun.serve fetch dispatch: exact method+path matches,
@@ -247,13 +303,144 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Write(bytes.TrimRight(buf.Bytes(), "\n"))
 }
 
-// NewWebhookHandler mirrors createVersionhooWebhookHandler.
+func pendingWebhookEntries(spool *WebhookSpool, trustedCloneHosts []string) []WebhookSpoolEntry {
+	entries, err := spool.Pending()
+	if err != nil {
+		log.Printf("could not scan webhook spool: %v", err)
+		return nil
+	}
+	valid := make([]WebhookSpoolEntry, 0, len(entries))
+	for _, entry := range entries {
+		var parsed any
+		if err := json.Unmarshal(entry.Record.Payload, &parsed); err != nil {
+			spool.Discard(entry.Path)
+			continue
+		}
+		payload, validationError := DecodeWorkflowRunPayload(parsed, trustedCloneHosts)
+		if validationError != "" || payload == nil {
+			spool.Discard(entry.Path)
+			continue
+		}
+		if WorkflowRunKey(payload) == strings.TrimPrefix(entry.Record.WorkflowKey, "workflow_run:") &&
+			releaseQueueKey(payload) == entry.Record.QueueKey {
+			valid = append(valid, entry)
+			continue
+		}
+		spool.Discard(entry.Path)
+	}
+	return valid
+}
+
+func reserveSpoolEntry(entry WebhookSpoolEntry, deduper *WebhookDeduper) bool {
+	if !deduper.Reserve(entry.Record.DeliveryKey) {
+		return false
+	}
+	if !deduper.Reserve(entry.Record.WorkflowKey) {
+		deduper.Release(entry.Record.DeliveryKey)
+		return false
+	}
+	return true
+}
+
+// NewWebhookHandler mirrors createVersionhooWebhookHandler. The optional
+// spool is supplied by Run; omitting it retains the in-memory test seam.
 func NewWebhookHandler(
 	cfg *AppConfig,
 	runner func(JobSpec) Outcome,
 	queue *ReleaseTaskQueue,
 	deduper *WebhookDeduper,
+	spools ...*WebhookSpool,
 ) http.HandlerFunc {
+	var spool *WebhookSpool
+	if len(spools) > 0 {
+		spool = spools[0]
+	}
+	if spool != nil {
+		for _, entry := range pendingWebhookEntries(spool, cfg.TrustedCloneHosts) {
+			if !reserveSpoolEntry(entry, deduper) {
+				spool.Discard(entry.Path)
+			}
+		}
+		spool.Start(queue, func(entry WebhookSpoolEntry) (func() error, func(error)) {
+			businessComplete := false
+			acknowledge := func(status string) error {
+				if status == webhookSpoolStatusCompleted {
+					return spool.Ack(entry.Path)
+				}
+				return spool.AckTerminal(entry.Path, status)
+			}
+			var scheduleAckRetry func(string, func())
+			scheduleAckRetry = func(status string, onSuccess func()) {
+				go func() {
+					timer := time.NewTimer(time.Second)
+					defer timer.Stop()
+					<-timer.C
+					if spool.isClosed() {
+						return
+					}
+					if queue.Enqueue(entry.Record.QueueKey, func() error {
+						if err := acknowledge(status); err != nil {
+							return err
+						}
+						onSuccess()
+						return nil
+					}, func(error) {
+						scheduleAckRetry(status, onSuccess)
+					}) {
+						return
+					}
+					scheduleAckRetry(status, onSuccess)
+				}()
+			}
+			task := func() error {
+				if businessComplete {
+					return acknowledge(webhookSpoolStatusCompleted)
+				}
+				var parsed any
+				if err := json.Unmarshal(entry.Record.Payload, &parsed); err != nil {
+					return fmt.Errorf("invalid persisted webhook payload: %w", err)
+				}
+				payload, validationError := DecodeWorkflowRunPayload(parsed, cfg.TrustedCloneHosts)
+				if validationError != "" {
+					return errors.New(validationError)
+				}
+				if err := ReleaseFromWorkflowRun(payload, cfg, runner); err != nil {
+					return err
+				}
+				businessComplete = true
+				if err := acknowledge(webhookSpoolStatusCompleted); err != nil {
+					return fmt.Errorf("durably acknowledge completed webhook: %w", err)
+				}
+				deduper.Succeed(entry.Record.DeliveryKey)
+				deduper.Succeed(entry.Record.WorkflowKey)
+				return nil
+			}
+			onFinalFailure := func(error) {
+				if businessComplete {
+					if err := acknowledge(webhookSpoolStatusCompleted); err == nil {
+						deduper.Succeed(entry.Record.DeliveryKey)
+						deduper.Succeed(entry.Record.WorkflowKey)
+						return
+					}
+					scheduleAckRetry(webhookSpoolStatusCompleted, func() {
+						deduper.Succeed(entry.Record.DeliveryKey)
+						deduper.Succeed(entry.Record.WorkflowKey)
+					})
+					return
+				}
+				if err := acknowledge(webhookSpoolStatusFailed); err == nil {
+					deduper.Release(entry.Record.DeliveryKey)
+					deduper.Release(entry.Record.WorkflowKey)
+					return
+				}
+				scheduleAckRetry(webhookSpoolStatusFailed, func() {
+					deduper.Release(entry.Record.DeliveryKey)
+					deduper.Release(entry.Record.WorkflowKey)
+				})
+			}
+			return task, onFinalFailure
+		})
+	}
 	return func(w http.ResponseWriter, r *http.Request) {
 		event := r.Header.Get("x-github-event")
 		delivery := r.Header.Get("x-github-delivery")
@@ -297,6 +484,12 @@ func NewWebhookHandler(
 			writeJSON(w, http.StatusBadRequest, errorBody{Error: validationError})
 			return
 		}
+		decision := ShouldHandleWorkflowRun(payload, cfg)
+		if decision.Status == "ignored" {
+			writeJSON(w, http.StatusAccepted, ignoredDeliveryBody{OK: true, Status: "ignored",
+				Reason: decision.Reason, Delivery: delivery})
+			return
+		}
 
 		var deliveryKey string
 		if delivery != "unknown" {
@@ -315,7 +508,27 @@ func NewWebhookHandler(
 			return
 		}
 
-		queue.Enqueue(releaseQueueKey(payload), func() error {
+		queueKey := releaseQueueKey(payload)
+		if spool != nil {
+			_, err := spool.Admit(WebhookSpoolRecord{
+				DeliveryKey: deliveryKey,
+				WorkflowKey: workflowKey,
+				QueueKey:    queueKey,
+				Payload:     append([]byte(nil), body...),
+			})
+			if err != nil {
+				deduper.Release(deliveryKey)
+				deduper.Release(workflowKey)
+				if errors.Is(err, ErrWebhookSpoolFull) {
+					w.Header().Set("Retry-After", "1")
+					writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "webhook spool is full; retry later"})
+				} else {
+					writeJSON(w, http.StatusInternalServerError, errorBody{Error: "could not durably admit webhook"})
+				}
+				return
+			}
+			spool.Wake()
+		} else if !queue.Enqueue(queueKey, func() error {
 			err := ReleaseFromWorkflowRun(payload, cfg, runner)
 			if err != nil {
 				return err
@@ -326,7 +539,15 @@ func NewWebhookHandler(
 		}, func(error) {
 			deduper.Release(deliveryKey)
 			deduper.Release(workflowKey)
-		})
+		}) {
+			// The optional in-memory-only test seam retains the old bounded
+			// behavior. Production Run always supplies a durable spool.
+			deduper.Release(deliveryKey)
+			deduper.Release(workflowKey)
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusServiceUnavailable, errorBody{Error: "release queue is full; retry later"})
+			return
+		}
 
 		writeJSON(w, http.StatusAccepted, acceptedBody{OK: true, Status: "accepted", Delivery: delivery})
 	}
@@ -340,7 +561,11 @@ func readWebhookBody(r *http.Request, maxBytes int64) ([]byte, func(http.Respons
 			return nil, tooLargeResponder
 		}
 	}
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	limit := maxBytes
+	if maxBytes < int64(^uint64(0)>>1) {
+		limit++
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, limit))
 	if err != nil {
 		return nil, func(w http.ResponseWriter) {
 			writeJSON(w, http.StatusBadRequest, errorBody{Error: "invalid JSON webhook body"})

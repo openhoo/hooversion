@@ -12,7 +12,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/openhoo/hooversion/internal/types"
 	"github.com/openhoo/hooversion/internal/verifyrelease"
+	"gopkg.in/yaml.v3"
 )
 
 const nodeAppConfig = "packages:\n  - name: app\n    type: node\ngithub:\n  enabled: false\npush: false\n"
@@ -82,6 +84,80 @@ func mustContain(t *testing.T, haystack, needle, label string) {
 	t.Helper()
 	if !strings.Contains(haystack, needle) {
 		t.Fatalf("%s missing %q; got:\n%s", label, needle, haystack)
+	}
+}
+
+func parseWorkflowYAML(t *testing.T, data []byte) *yaml.Node {
+	t.Helper()
+	var document yaml.Node
+	if err := yaml.Unmarshal(data, &document); err != nil {
+		t.Fatalf("workflow YAML is invalid: %v\n%s", err, data)
+	}
+	if document.Kind != yaml.DocumentNode || len(document.Content) != 1 || document.Content[0].Kind != yaml.MappingNode {
+		t.Fatalf("workflow YAML root = %#v, want one mapping document", document)
+	}
+	return document.Content[0]
+}
+
+func workflowMapValue(t *testing.T, mapping *yaml.Node, key string) *yaml.Node {
+	t.Helper()
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		t.Fatalf("YAML node for %q is not a mapping: %#v", key, mapping)
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	t.Fatalf("YAML mapping missing key %q", key)
+	return nil
+}
+
+func workflowOptionalMapValue(mapping *yaml.Node, key string) *yaml.Node {
+	if mapping == nil || mapping.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return mapping.Content[i+1]
+		}
+	}
+	return nil
+}
+
+func workflowStep(t *testing.T, steps *yaml.Node, name string) *yaml.Node {
+	t.Helper()
+	if steps.Kind != yaml.SequenceNode {
+		t.Fatalf("steps node = %#v, want sequence", steps)
+	}
+	for _, step := range steps.Content {
+		if workflowOptionalMapValue(step, "name") != nil &&
+			workflowOptionalMapValue(step, "name").Value == name {
+			return step
+		}
+	}
+	t.Fatalf("steps missing %q", name)
+	return nil
+}
+
+func assertWorkflowMapKeys(t *testing.T, mapping *yaml.Node, want ...string) {
+	t.Helper()
+	wantSet := make(map[string]bool, len(want))
+	for _, key := range want {
+		wantSet[key] = true
+	}
+	if mapping.Kind != yaml.MappingNode {
+		t.Fatalf("node = %#v, want mapping", mapping)
+	}
+	var got []string
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		got = append(got, mapping.Content[i].Value)
+		if !wantSet[mapping.Content[i].Value] {
+			t.Fatalf("unexpected YAML key %q in %#v", mapping.Content[i].Value, mapping)
+		}
+	}
+	if len(got) != len(wantSet) {
+		t.Fatalf("YAML keys = %v, want exactly %v", got, want)
 	}
 }
 
@@ -215,10 +291,11 @@ func TestInitDetectFailureMessage(t *testing.T) {
 
 func TestInitWorkflowCollisionKeepsConfigUnwritten(t *testing.T) {
 	cwd := t.TempDir()
-	writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","version":"1.0.0"}`)
+	writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","version":"1.0.0","packageManager":"bun@1.3.14","scripts":{"check":"echo ok"}}`)
+	writeFile(t, filepath.Join(cwd, "bun.lock"), "lockfileVersion: 1\n")
 	writeFile(t, filepath.Join(cwd, ".github", "workflows", "ci.yml"), "name: User CI\n")
 
-	_, stderr, code := runCLI(t, cwd, "dev", "init")
+	_, stderr, code := runCLI(t, cwd, "dev", "init", "--hooversion-version", "1.1.0")
 	if code == 0 {
 		t.Fatal("init colliding with a user workflow should fail")
 	}
@@ -230,11 +307,12 @@ func TestInitWorkflowCollisionKeepsConfigUnwritten(t *testing.T) {
 
 func TestInitWritesConfigAndWorkflowsAndForceReplacesLegacy(t *testing.T) {
 	cwd := t.TempDir()
-	writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","version":"1.0.0"}`)
+	writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","version":"1.0.0","packageManager":"bun@1.3.14","scripts":{"check":"echo ok"}}`)
+	writeFile(t, filepath.Join(cwd, "bun.lock"), "lockfileVersion: 1\n")
 	legacyJSON := filepath.Join(cwd, "hooversion.config.json")
 	writeFile(t, legacyJSON, `{"packages":[{"name":"app","type":"node"}]}`)
 
-	stdout, _, code := runCLI(t, cwd, "dev", "init", "--force")
+	stdout, _, code := runCLI(t, cwd, "dev", "init", "--force", "--hooversion-version", "1.1.0")
 	if code != 0 {
 		t.Fatalf("init --force failed: %s", stdout)
 	}
@@ -265,6 +343,425 @@ func TestInitWritesConfigAndWorkflowsAndForceReplacesLegacy(t *testing.T) {
 	// The written config loads cleanly and rerunning init --force keeps it.
 	if _, _, code := runCLI(t, cwd, "dev", "init", "--no-workflow"); code == 0 {
 		t.Fatal("rerun without --force must still refuse over the fresh config")
+	}
+}
+
+func TestWorkflowInferenceSelectsOnlySupportedCommands(t *testing.T) {
+	t.Run("bun", func(t *testing.T) {
+		cwd := t.TempDir()
+		writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"bun@1.3.14","scripts":{"check":"echo ok"}}`)
+		writeFile(t, filepath.Join(cwd, "bun.lock"), "lockfileVersion: 1\n")
+		project, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}})
+		if err != nil || project.kind != workflowBun || project.bunVersion != "1.3.14" || project.installCommand != "bun install --frozen-lockfile" {
+			t.Fatalf("project = %+v, err = %v", project, err)
+		}
+		rendered, err := renderGitHubWorkflows(workflowOptions{hooversionVersion: "1.1.0", actionRef: knownActionRefs["1.1.0"], project: project})
+		lintStart := strings.Index(rendered.ci, "actions/lint")
+		buildStart := strings.Index(rendered.ci, "  build:")
+		if err != nil || lintStart < 0 || buildStart < 0 || strings.Contains(rendered.ci[lintStart:buildStart], "bun-version") {
+			t.Fatalf("Bun workflow unexpectedly passes bun-version to lint: err=%v", err)
+		}
+		if !strings.Contains(rendered.release, "install-command: bun install --frozen-lockfile") {
+			t.Fatal("Bun release workflow missing install command")
+		}
+	})
+
+	t.Run("bun test script", func(t *testing.T) {
+		cwd := t.TempDir()
+		writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"bun@1.4.0","scripts":{"test":"bun run vitest --run"}}`)
+		project, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}})
+		if err != nil || project.checkCommand != "bun run test" {
+			t.Fatalf("project = %+v, err = %v", project, err)
+		}
+	})
+
+	t.Run("npm engine", func(t *testing.T) {
+		cwd := t.TempDir()
+		writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"npm@10.9.2","engines":{"node":">=20 <22"},"scripts":{"test":"npm run vitest"}}`)
+		writeFile(t, filepath.Join(cwd, "package-lock.json"), "{}\n")
+		project, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}})
+		if err != nil || project.kind != workflowNode || project.nodeVersion != "20" || project.checkCommand != "npm run test" {
+			t.Fatalf("project = %+v, err = %v", project, err)
+		}
+		rendered, err := renderGitHubWorkflows(workflowOptions{hooversionVersion: "1.1.0", actionRef: knownActionRefs["1.1.0"], project: project})
+		if err != nil || !strings.Contains(rendered.ci, "node-version: 20") {
+			t.Fatalf("Node workflow = %q, err=%v", rendered.ci, err)
+		}
+	})
+
+	t.Run("npm version file", func(t *testing.T) {
+		cwd := t.TempDir()
+		writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"npm@10.9.2"}`)
+		writeFile(t, filepath.Join(cwd, "package-lock.json"), "{}\n")
+		writeFile(t, filepath.Join(cwd, ".nvmrc"), "v22.11.0\n")
+		project, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}})
+		if err != nil || project.nodeVersion != "22.11.0" {
+			t.Fatalf("project = %+v, err = %v", project, err)
+		}
+	})
+
+	t.Run("npm missing runtime evidence", func(t *testing.T) {
+		cwd := t.TempDir()
+		writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"npm@10.9.2"}`)
+		writeFile(t, filepath.Join(cwd, "package-lock.json"), "{}\n")
+		if _, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}}); err == nil || !strings.Contains(err.Error(), "--no-workflow") {
+			t.Fatalf("error = %v, want manual workflow guidance", err)
+		}
+	})
+
+	t.Run("rust", func(t *testing.T) {
+		cwd := t.TempDir()
+		writeFile(t, filepath.Join(cwd, "Cargo.lock"), "version = 4\n")
+		project, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageRust}})
+		if err != nil || project.checkCommand != "cargo test --locked --workspace --all-targets --all-features" {
+			t.Fatalf("project = %+v, err = %v", project, err)
+		}
+		rendered, err := renderGitHubWorkflows(workflowOptions{hooversionVersion: "1.1.0", actionRef: knownActionRefs["1.1.0"], project: project})
+		if err != nil || strings.Contains(rendered.ci, "setup-bun") || !strings.Contains(rendered.ci, project.checkCommand) {
+			t.Fatalf("Rust workflow = %q, err=%v", rendered.ci, err)
+		}
+	})
+
+	t.Run("version-file", func(t *testing.T) {
+		cwd := t.TempDir()
+		project, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageVersionFile}})
+		if err != nil || project.installCommand != "" || project.checkCommand != "" {
+			t.Fatalf("project = %+v, err = %v", project, err)
+		}
+	})
+}
+
+func TestWorkflowInferenceRefusesAmbiguousNodeRuntimeEvidence(t *testing.T) {
+	cwd := t.TempDir()
+	writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"npm@10.9.2","engines":{"node":"20"}}`)
+	writeFile(t, filepath.Join(cwd, "package-lock.json"), "{}\n")
+	writeFile(t, filepath.Join(cwd, ".node-version"), "22\n")
+	if _, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}}); err == nil || !strings.Contains(err.Error(), "--no-workflow") {
+		t.Fatalf("error = %v, want manual workflow guidance", err)
+	}
+}
+
+func TestWorkflowInferenceRefusesInvalidNodeRuntimeRanges(t *testing.T) {
+	for _, engine := range []string{">=22 <20", ">=20 garbage"} {
+		t.Run(engine, func(t *testing.T) {
+			cwd := t.TempDir()
+			writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","packageManager":"npm@10.9.2","engines":{"node":"`+engine+`"}}`)
+			writeFile(t, filepath.Join(cwd, "package-lock.json"), "{}\n")
+			if _, err := inferWorkflowProject(cwd, []types.PackageConfig{{Name: "app", Path: ".", Type: types.PackageNode}}); err == nil || !strings.Contains(err.Error(), "--no-workflow") {
+				t.Fatalf("engine %q error = %v, want manual workflow guidance", engine, err)
+			}
+		})
+	}
+}
+
+func TestWorkflowInferenceRefusesPythonAndMixedLayouts(t *testing.T) {
+	for name, packages := range map[string][]types.PackageConfig{
+		"python": {{Name: "app", Path: ".", Type: types.PackagePython}},
+		"mixed":  {{Name: "app", Path: ".", Type: types.PackageNode}, {Name: "lib", Path: ".", Type: types.PackageVersionFile}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := inferWorkflowProject(t.TempDir(), packages)
+			if err == nil || !strings.Contains(err.Error(), "--no-workflow") {
+				t.Fatalf("error = %v, want manual workflow guidance", err)
+			}
+		})
+	}
+}
+
+func TestGeneratedReleaseWorkflowGuardsDispatchAndWorkflowRun(t *testing.T) {
+	rendered, err := renderGitHubWorkflows(workflowOptions{
+		hooversionVersion: "1.1.0",
+		project:           workflowProject{kind: workflowVersionFile},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciRoot := parseWorkflowYAML(t, []byte(rendered.ci))
+	releaseRoot := parseWorkflowYAML(t, []byte(rendered.release))
+	if workflowOptionalMapValue(workflowMapValue(t, ciRoot, "on"), "workflow_dispatch") == nil {
+		t.Fatal("CI workflow must retain its manual dispatch trigger")
+	}
+	if workflowOptionalMapValue(workflowMapValue(t, releaseRoot, "on"), "workflow_dispatch") == nil {
+		t.Fatal("release workflow must retain its manual dispatch trigger")
+	}
+	releaseJob := workflowMapValue(t, workflowMapValue(t, releaseRoot, "jobs"), "release")
+	guard := workflowMapValue(t, releaseJob, "if").Value
+	dispatchRuns := func(eventName, ref string) bool {
+		const dispatchPrefix = "github.event_name == 'workflow_dispatch' && github.ref == '"
+		start := strings.Index(guard, dispatchPrefix)
+		if start < 0 {
+			return false
+		}
+		remainder := guard[start+len(dispatchPrefix):]
+		end := strings.IndexByte(remainder, '\'')
+		return end > 0 && eventName == "workflow_dispatch" && ref == remainder[:end]
+	}
+	for _, tc := range []struct {
+		name      string
+		eventName string
+		ref       string
+		want      bool
+	}{
+		{name: "main dispatch", eventName: "workflow_dispatch", ref: "refs/heads/main", want: true},
+		{name: "feature dispatch", eventName: "workflow_dispatch", ref: "refs/heads/feature", want: false},
+		{name: "tag dispatch", eventName: "workflow_dispatch", ref: "refs/tags/v1.1.0", want: false},
+		{name: "workflow run", eventName: "workflow_run", ref: "refs/heads/main", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dispatchRuns(tc.eventName, tc.ref); got != tc.want {
+				t.Fatalf("%s ref %q runs = %v, want %v; guard = %q", tc.eventName, tc.ref, got, tc.want, guard)
+			}
+		})
+	}
+	for _, clause := range []string{
+		"github.event_name == 'workflow_run'",
+		"github.event.workflow_run.conclusion == 'success'",
+		"github.event.workflow_run.event == 'push'",
+		"github.event.workflow_run.head_branch == 'main'",
+		"github.event.workflow_run.repository.full_name == github.repository",
+	} {
+		if !strings.Contains(guard, clause) {
+			t.Fatalf("release guard = %q, missing %q", guard, clause)
+		}
+	}
+	steps := workflowMapValue(t, releaseJob, "steps")
+	prepareIf := workflowMapValue(t, workflowStep(t, steps, "Prepare protected-branch release"), "if").Value
+	if !strings.Contains(prepareIf, "github.event_name == 'workflow_dispatch'") {
+		t.Fatalf("prepare guard = %q, want manual dispatch path", prepareIf)
+	}
+	finalizeIf := workflowMapValue(t, workflowStep(t, steps, "Finalize protected-branch release"), "if").Value
+	if strings.Contains(finalizeIf, "workflow_dispatch") {
+		t.Fatalf("finalize guard = %q, manual dispatch must not publish", finalizeIf)
+	}
+	if strings.Contains(rendered.ci, "actions/lint@v") {
+		t.Fatalf("mutable action ref in generated CI:\n%s", rendered.ci)
+	}
+	if got, err := resolveActionReference("", defaultActionOwnerRepo, "1.1.0", "v1.1.0"); err == nil || got != "" {
+		t.Fatalf("tag action ref accepted: %q, %v", got, err)
+	}
+}
+
+func TestGeneratedWorkflowSafelySerializesWorkingDirectories(t *testing.T) {
+	for _, packagePath := range []string{
+		"packages/app # prod",
+		"packages/app: prod",
+		`packages/"app`,
+		"packages/app\ncontinue-on-error: true",
+	} {
+		t.Run(packagePath, func(t *testing.T) {
+			cwd := t.TempDir()
+			writeFile(t, filepath.Join(cwd, packagePath, "package.json"), `{"name":"app","packageManager":"bun@1.3.14","scripts":{"check":"echo ok"}}`)
+			writeFile(t, filepath.Join(cwd, packagePath, "bun.lock"), "lockfileVersion: 1\n")
+			paths, err := writeGitHubWorkflows(cwd, workflowOptions{
+				hooversionVersion: "1.1.0",
+				actionRef:         knownActionRefs[defaultActionVersion],
+				packages: []types.PackageConfig{{
+					Name: "app", Path: packagePath, Type: types.PackageNode,
+				}},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ciData, err := os.ReadFile(paths[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseData, err := os.ReadFile(paths[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			ciRoot := parseWorkflowYAML(t, ciData)
+			releaseRoot := parseWorkflowYAML(t, releaseData)
+			build := workflowMapValue(t, workflowMapValue(t, ciRoot, "jobs"), "build")
+			steps := workflowMapValue(t, build, "steps")
+			install := workflowStep(t, steps, "Install dependencies")
+			check := workflowStep(t, steps, "Run checks")
+			assertWorkflowMapKeys(t, install, "name", "working-directory", "run")
+			assertWorkflowMapKeys(t, check, "name", "working-directory", "run")
+			if got := workflowMapValue(t, install, "working-directory").Value; got != packagePath {
+				t.Fatalf("CI install working-directory = %q, want %q", got, packagePath)
+			}
+			if got := workflowMapValue(t, check, "working-directory").Value; got != packagePath {
+				t.Fatalf("CI check working-directory = %q, want %q", got, packagePath)
+			}
+
+			project, err := inferNodeWorkflowProject(cwd, types.PackageConfig{
+				Name: "app", Path: packagePath, Type: types.PackageNode,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			releaseJob := workflowMapValue(t, workflowMapValue(t, releaseRoot, "jobs"), "release")
+			releaseSteps := workflowMapValue(t, releaseJob, "steps")
+			for _, actionName := range []string{"Prepare protected-branch release", "Finalize protected-branch release"} {
+				action := workflowStep(t, releaseSteps, actionName)
+				if workflowOptionalMapValue(action, "working-directory") != nil {
+					t.Fatalf("%s must execute from repository root", actionName)
+				}
+				with := workflowMapValue(t, action, "with")
+				if got := workflowMapValue(t, with, "install-command").Value; got != releaseInstallCommand(project) {
+					t.Fatalf("%s install-command = %q, want %q", actionName, got, releaseInstallCommand(project))
+				}
+			}
+		})
+	}
+}
+
+func TestNestedReleaseActionsExecuteFromRepositoryRoot(t *testing.T) {
+	cwd := newRepo(t)
+	packagePath := filepath.Join(cwd, "packages", "app")
+	writeFile(t, filepath.Join(packagePath, "package.json"), `{"name":"app","version":"1.0.0","packageManager":"npm@10.9.2","engines":{"node":">=20 <22"},"scripts":{"check":"npm run check"}}`)
+	writeFile(t, filepath.Join(packagePath, "package-lock.json"), "{}\n")
+
+	_, stderr, code := runCLI(t, cwd, "dev", "init", "--hooversion-version", "1.1.0")
+	if code != 0 {
+		t.Fatalf("nested Node init failed: %s", stderr)
+	}
+	gitHelper(t, cwd, "add", "--all")
+	gitHelper(t, cwd, "commit", "-m", "chore: initial import")
+	gitHelper(t, cwd, "tag", "v1.0.0")
+	writeFile(t, filepath.Join(packagePath, "src", "index.js"), "export const app = true;\n")
+	gitHelper(t, cwd, "add", "--all")
+	gitHelper(t, cwd, "commit", "-m", "fix: repair app")
+
+	stdout, stderr, code := runCLI(t, cwd, "dev", "release", "--dry-run", "--no-push", "--no-github")
+	if code != 0 {
+		t.Fatalf("root release action equivalent failed to load nested config: %s\n%s", stdout, stderr)
+	}
+	mustContain(t, stdout, "Dry run complete; no files, commits, tags, or releases were created.\n", "stdout")
+}
+
+func TestWorkflowActionVersionIsIndependentFromCLIVersion(t *testing.T) {
+	rendered, err := renderGitHubWorkflows(workflowOptions{
+		hooversionVersion: "1.2.0",
+		cliVersion:        "1.2.0",
+		project:           workflowProject{kind: workflowVersionFile},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered.ci, "HOOVERSION_VERSION: 1.2.0") ||
+		!strings.Contains(rendered.ci, "actions/lint@"+knownActionRefs[defaultActionVersion]+" # v"+defaultActionVersion) ||
+		strings.Contains(rendered.ci, "actions/lint@v1.2.0") {
+		t.Fatalf("CLI version must not select an unpublished action ref:\n%s", rendered.ci)
+	}
+	if !strings.Contains(rendered.release, "actions/release@"+knownActionRefs[defaultActionVersion]+" # v"+defaultActionVersion) {
+		t.Fatalf("release workflow did not use default published action ref:\n%s", rendered.release)
+	}
+}
+
+func TestNodePackageWorkingDirectoryReachesBuildAndReleaseSteps(t *testing.T) {
+	cwd := t.TempDir()
+	packagePath := filepath.Join(cwd, "packages", "app")
+	writeFile(t, filepath.Join(packagePath, "package.json"), `{"name":"app","packageManager":"bun@1.3.14","scripts":{"check":"echo ok"}}`)
+	writeFile(t, filepath.Join(packagePath, "bun.lock"), "lockfileVersion: 1\n")
+	project, err := inferNodeWorkflowProject(cwd, types.PackageConfig{
+		Name: "app", Path: "packages/app", Type: types.PackageNode,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if project.workingDirectory != "packages/app" {
+		t.Fatalf("working directory = %q, want packages/app", project.workingDirectory)
+	}
+	rendered, err := renderGitHubWorkflows(workflowOptions{
+		hooversionVersion: "1.1.0",
+		project:           project,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rendered.ci, "working-directory: \"packages/app\"\n        run: bun install --frozen-lockfile") ||
+		!strings.Contains(rendered.ci, "working-directory: \"packages/app\"\n        run: bun run check") {
+		t.Fatalf("generated CI workflow missing package working directory:\n%s", rendered.ci)
+	}
+	if strings.Contains(rendered.release, "working-directory: packages/app") {
+		t.Fatalf("release actions must run from repository root:\n%s", rendered.release)
+	}
+	if !strings.Contains(rendered.release, "install-command: \"cd -- 'packages/app' \\u0026\\u0026 bun install --frozen-lockfile\"") {
+		t.Fatalf("release install command is not package-scoped:\n%s", rendered.release)
+	}
+}
+
+func TestInitDetectsNestedNodeAndKeepsReleaseRuntimeParity(t *testing.T) {
+	cwd := t.TempDir()
+	packagePath := filepath.Join(cwd, "packages", "app")
+	writeFile(t, filepath.Join(packagePath, "package.json"), `{"name":"app","version":"1.0.0","packageManager":"npm@10.9.2","engines":{"node":">=20 <22"},"scripts":{"check":"npm run check"}}`)
+	writeFile(t, filepath.Join(packagePath, "package-lock.json"), "{}\n")
+
+	_, stderr, code := runCLI(t, cwd, "dev", "init", "--hooversion-version", "1.1.0")
+	if code != 0 {
+		t.Fatalf("nested Node init failed: %s", stderr)
+	}
+	ciData, err := os.ReadFile(filepath.Join(cwd, ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseData, err := os.ReadFile(filepath.Join(cwd, ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	setup := "uses: actions/setup-node@" + setupNodeSha + " # v7\n        with:\n          node-version: 20"
+	ci := string(ciData)
+	release := string(releaseData)
+	if strings.Count(ci, setup) != 1 || strings.Count(release, setup) != 1 {
+		t.Fatalf("Node runtime setup parity missing:\nCI:\n%s\nRelease:\n%s", ci, release)
+	}
+	if !strings.Contains(release, "install-command: \"cd -- 'packages/app' \\u0026\\u0026 npm ci\"") {
+		t.Fatalf("release Node install command is not package-scoped:\n%s", release)
+	}
+	if !strings.Contains(ci, "working-directory: \"packages/app\"\n        run: npm ci") ||
+		strings.Contains(release, "working-directory: packages/app") {
+		t.Fatalf("nested package working directory semantics missing:\nCI:\n%s\nRelease:\n%s", ci, release)
+	}
+	configData, err := os.ReadFile(filepath.Join(cwd, "hooversion.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(configData), `path: "packages/app"`) {
+		t.Fatalf("generated config lost nested package path:\n%s", configData)
+	}
+}
+
+func TestWorkflowGenerationRejectsUnsupportedMultiPackageActionContract(t *testing.T) {
+	cwd := t.TempDir()
+	_, err := writeGitHubWorkflows(cwd, workflowOptions{
+		hooversionVersion: "1.1.0",
+		actionRef:         knownActionRefs[defaultActionVersion],
+		packages: []types.PackageConfig{
+			{Name: "one", Path: "one", Type: types.PackageNode},
+			{Name: "two", Path: "two", Type: types.PackageRust},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "multi-package") || !strings.Contains(err.Error(), "releases-json") {
+		t.Fatalf("error = %v, want explicit releases-json multi-package rejection", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(cwd, ".github", "workflows")); !os.IsNotExist(statErr) {
+		t.Fatalf("rejected generation must not create workflow directory, stat error = %v", statErr)
+	}
+}
+
+func TestUnknownActionVersionCannotUseConsumerOriginTag(t *testing.T) {
+	cwd := newRepo(t)
+	gitHelper(t, cwd, "commit", "--allow-empty", "-m", "test: seed")
+	bare := filepath.Join(t.TempDir(), "consumer.git")
+	gitHelper(t, filepath.Dir(bare), "init", "--bare", bare)
+	gitHelper(t, cwd, "remote", "add", "origin", bare)
+	gitHelper(t, cwd, "tag", "v9.9.9")
+	gitHelper(t, cwd, "push", "origin", "main", "--tags")
+
+	if got, err := resolveActionReference(cwd, defaultActionOwnerRepo, "9.9.9", ""); err == nil || got != "" || !strings.Contains(err.Error(), "--action-ref") {
+		t.Fatalf("consumer-origin tag must not resolve: %q, %v", got, err)
+	}
+}
+
+func TestWorkflowVersionRequiresExplicitReleaseVersionWhenUnavailable(t *testing.T) {
+	if _, err := renderGitHubWorkflows(workflowOptions{project: workflowProject{kind: workflowVersionFile}}); err == nil ||
+		!strings.Contains(err.Error(), "--hooversion-version") {
+		t.Fatalf("missing version error = %v", err)
+	}
+	if got, err := resolveWorkflowVersion("v1.2.3", "dev"); err != nil || got != "1.2.3" {
+		t.Fatalf("explicit version = %q, %v", got, err)
 	}
 }
 

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	"github.com/openhoo/hooversion/internal/app"
@@ -11,7 +12,13 @@ import (
 var version = "dev"
 
 func main() {
-	if err := app.Run(os.Getenv); err != nil {
-		os.Exit(1)
+	os.Exit(run(os.Getenv))
+}
+
+func run(getenv func(string) string) int {
+	if err := app.Run(getenv); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
+	return 0
 }

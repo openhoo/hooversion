@@ -4,7 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -313,6 +316,7 @@ func TestWebhookHandlerMatrix(t *testing.T) {
 		r := secondPayload["repository"].(map[string]any)
 		r["full_name"] = "octo/dup-run"
 		r["clone_url"] = "https://github.com/octo/dup-run.git"
+		secondPayload["workflow_run"].(map[string]any)["head_repository"].(map[string]any)["full_name"] = "octo/dup-run"
 		secondPayload["installation"].(map[string]any)["id"] = 8 // same run key → duplicate run, new delivery
 		second := marshalJSON(t, secondPayload)
 		rec = postWebhook(handler, "workflow_run", "fresh-delivery-b", second, signBody(t, testWebhookSecret, second))
@@ -340,6 +344,62 @@ func TestWebhookHandlerMatrix(t *testing.T) {
 	})
 }
 
+func TestWebhookQueueSaturationReleasesDedupeAndReturnsRetryableStatus(t *testing.T) {
+	stubGitHubFlow(t)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	handlerRunner := func(JobSpec) Outcome {
+		close(started)
+		<-release
+		return Outcome{}
+	}
+	cfg := &AppConfig{
+		AppID:               "123",
+		WebhookSecret:       testWebhookSecret,
+		ApiURL:              "https://api.github.com",
+		ReleaseBranches:     []string{"main"},
+		CIWorkflowNames:     []string{"CI"},
+		WebhookMaxBodyBytes: DefaultWebhookMaxBodyBytes,
+	}
+	queue := NewReleaseTaskQueue(func(error) {}, QueueOptions{MaxPending: 1})
+	deduper := NewWebhookDeduper(0, nil)
+	handler := NewWebhookHandler(cfg, handlerRunner, queue, deduper)
+
+	first := marshalJSON(t, webhookPayloadMap())
+	firstResponse := postWebhook(handler, "workflow_run", "saturated-first", first,
+		signBody(t, testWebhookSecret, first))
+	if firstResponse.Code != http.StatusAccepted {
+		t.Fatalf("first status %d body %s", firstResponse.Code, firstResponse.Body.String())
+	}
+	<-started
+
+	secondPayload := webhookPayloadMap()
+	secondRepo := secondPayload["repository"].(map[string]any)
+	secondRepo["id"] = 43
+	secondRepo["full_name"] = "octo/other"
+	secondRepo["clone_url"] = "https://github.com/octo/other.git"
+	secondPayload["workflow_run"].(map[string]any)["head_repository"].(map[string]any)["full_name"] = "octo/other"
+	second := marshalJSON(t, secondPayload)
+	secondResponse := postWebhook(handler, "workflow_run", "saturated-second", second,
+		signBody(t, testWebhookSecret, second))
+	if secondResponse.Code != http.StatusServiceUnavailable {
+		t.Fatalf("saturated status %d body %s", secondResponse.Code, secondResponse.Body.String())
+	}
+	if got := secondResponse.Header().Get("Retry-After"); got != "1" {
+		t.Fatalf("Retry-After %q, want 1", got)
+	}
+	mustContain(t, secondResponse.Body.String(), "release queue is full")
+	if _, ok := deduper.State("delivery:saturated-second"); ok {
+		t.Fatal("saturated delivery reservation was not released")
+	}
+	if _, ok := deduper.State("workflow_run:octo/other:1001:CI:main"); ok {
+		t.Fatal("saturated workflow reservation was not released")
+	}
+
+	close(release)
+	queue.Wait()
+}
+
 // workflowRunKeyForTest decodes the canonical test payload and renders its
 // workflow-run dedupe key.
 func workflowRunKeyForTest() string {
@@ -348,4 +408,170 @@ func workflowRunKeyForTest() string {
 		panic(errMsg)
 	}
 	return WorkflowRunKey(payload)
+}
+
+func TestWebhookHandlerCompletedAckFailureRetriesCleanupOnly(t *testing.T) {
+	stubGitHubFlow(t)
+	dir := privateSpoolTestDir(t)
+	spool, err := NewWebhookSpool(dir, DefaultWebhookMaxBodyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	queue := NewReleaseTaskQueue(func(error) {}, QueueOptions{})
+	deduper := NewWebhookDeduper(0, nil)
+	cfg := &AppConfig{
+		AppID: "123", WebhookSecret: testWebhookSecret, ApiURL: "https://api.github.com",
+		ReleaseBranches: []string{"main"}, CIWorkflowNames: []string{"CI"},
+		WebhookMaxBodyBytes: DefaultWebhookMaxBodyBytes,
+	}
+	runs := 0
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	originalSync := syncDirectoryFn
+	defer func() { syncDirectoryFn = originalSync }()
+	syncCalls := 0
+	syncDirectoryFn = func(string) error {
+		syncCalls++
+		if syncCalls == 2 {
+			return errors.New("injected completed acknowledgement sync failure")
+		}
+		return nil
+	}
+	handler := NewWebhookHandler(cfg, func(JobSpec) Outcome {
+		runs++
+		startedOnce.Do(func() { close(started) })
+		return Outcome{}
+	}, queue, deduper, spool)
+	body := marshalJSON(t, webhookPayloadMap())
+	if rec := postWebhook(handler, "workflow_run", "ack-completed", body, signBody(t, testWebhookSecret, body)); rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	<-started
+	queue.Wait()
+	if runs != 1 {
+		t.Fatalf("runner executed %d times after acknowledgement failure", runs)
+	}
+	if state, ok := deduper.State("delivery:ack-completed"); !ok || state != dedupeSucceeded {
+		t.Fatalf("delivery dedupe state = %q, %v; want succeeded", state, ok)
+	}
+	if rec := postWebhook(handler, "workflow_run", "ack-completed", body, signBody(t, testWebhookSecret, body)); rec.Code != http.StatusAccepted {
+		t.Fatalf("duplicate status %d body %s", rec.Code, rec.Body.String())
+	}
+	if runs != 1 {
+		t.Fatalf("duplicate redelivery executed runner %d times", runs)
+	}
+}
+
+func TestWebhookHandlerFailedTerminalAckRetainsDedupe(t *testing.T) {
+	stubGitHubFlow(t)
+	dir := privateSpoolTestDir(t)
+	spool, err := NewWebhookSpool(dir, DefaultWebhookMaxBodyBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer spool.Close()
+	queue := NewReleaseTaskQueue(func(error) {}, QueueOptions{})
+	deduper := NewWebhookDeduper(0, nil)
+	cfg := &AppConfig{
+		AppID: "123", WebhookSecret: testWebhookSecret, ApiURL: "https://api.github.com",
+		ReleaseBranches: []string{"main"}, CIWorkflowNames: []string{"CI"},
+		WebhookMaxBodyBytes: DefaultWebhookMaxBodyBytes,
+	}
+	runs := 0
+	started := make(chan struct{})
+	var startedOnce sync.Once
+	originalSync := syncDirectoryFn
+	defer func() { syncDirectoryFn = originalSync }()
+	var syncMu sync.Mutex
+	syncCalls := 0
+	retryEntered := make(chan struct{})
+	allowRetry := make(chan struct{})
+	retryDone := make(chan struct{})
+	claimObserved := false
+	var retryOnce sync.Once
+	syncDirectoryFn = func(string) error {
+		syncMu.Lock()
+		syncCalls++
+		call := syncCalls
+		syncMu.Unlock()
+		switch call {
+		case 2:
+			return errors.New("injected terminal acknowledgement sync failure")
+		case 3:
+			// AckTerminal's failed-marker rollback must be allowed to finish.
+			return nil
+		case 4:
+			claimObserved = spool.claimed[filepath.Join(dir, "00000000000000000000.json")]
+			retryOnce.Do(func() { close(retryEntered) })
+			<-allowRetry
+		case 6:
+			close(retryDone)
+		}
+		return nil
+	}
+	handler := NewWebhookHandler(cfg, func(JobSpec) Outcome {
+		runs++
+		startedOnce.Do(func() { close(started) })
+		return Outcome{Err: errors.New("injected release failure")}
+	}, queue, deduper, spool)
+	body := marshalJSON(t, webhookPayloadMap())
+	if rec := postWebhook(handler, "workflow_run", "ack-failed", body, signBody(t, testWebhookSecret, body)); rec.Code != http.StatusAccepted {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	<-started
+	// Stop the spool producer before waiting: Queue.Wait must not race a
+	// drainer adding business work while the terminal ack retry is pending.
+	spool.Stop()
+	<-retryEntered
+	if !claimObserved {
+		t.Fatal("terminal acknowledgement retry lost the spool record claim")
+	}
+	if runs != 1 {
+		t.Fatalf("runner executed %d times while terminal ack retry was held", runs)
+	}
+	if state, ok := deduper.State("delivery:ack-failed"); !ok || state != dedupeInFlight {
+		t.Fatalf("delivery dedupe state = %q, %v; want in_flight", state, ok)
+	}
+	workflowKey := "workflow_run:" + workflowRunKeyForTest()
+	if state, ok := deduper.State(workflowKey); !ok || state != dedupeInFlight {
+		t.Fatalf("workflow dedupe state = %q, %v; want in_flight", state, ok)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var recordPath string
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".json") {
+			recordPath = filepath.Join(dir, entry.Name())
+			break
+		}
+	}
+	if recordPath == "" {
+		t.Fatal("failed terminal record was removed before acknowledgement retry completed")
+	}
+	if _, err := os.Stat(recordPath + webhookSpoolTerminalSuffix); err != nil {
+		t.Fatalf("terminal acknowledgement marker was not held with record: %v", err)
+	}
+	close(allowRetry)
+	<-retryDone
+	queue.Wait()
+	if runs != 1 {
+		t.Fatalf("runner executed %d times after terminal ack retry", runs)
+	}
+	if _, ok := deduper.State("delivery:ack-failed"); ok {
+		t.Fatal("delivery dedupe key survived terminal ack retry")
+	}
+	if _, ok := deduper.State(workflowKey); ok {
+		t.Fatal("workflow dedupe key survived terminal ack retry")
+	}
+	if entries, err := spool.Pending(); err != nil {
+		t.Fatal(err)
+	} else if len(entries) != 0 {
+		t.Fatalf("pending spool records after terminal ack retry = %d, want 0", len(entries))
+	}
+	if _, err := os.Stat(recordPath); !os.IsNotExist(err) {
+		t.Fatalf("terminal record still exists after retry cleanup: %v", err)
+	}
 }
