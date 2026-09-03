@@ -50,7 +50,7 @@ installation and every repository hook. In particular, do not allow-list
 Alternatively install the app with Go:
 
 ```sh
-go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.0
+go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.1
 versionhoo-app
 ```
 
