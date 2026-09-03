@@ -171,16 +171,7 @@ func (s *WebhookSpool) syncDirectoryLocked() error {
 	if err := syncDirectoryFn(s.dir); err != nil {
 		return err
 	}
-	directory, err := s.root.Open(".")
-	if err != nil {
-		return err
-	}
-	syncErr := directory.Sync()
-	closeErr := directory.Close()
-	if syncErr != nil {
-		return syncErr
-	}
-	return closeErr
+	return syncWebhookSpoolDirectory(s.root)
 }
 
 func (s *WebhookSpool) recount() error {

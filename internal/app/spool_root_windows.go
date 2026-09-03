@@ -516,3 +516,9 @@ func openWindowsSpoolHandle(path string, access, creation, flags uint32) (*os.Fi
 	}
 	return os.NewFile(handle, path), nil
 }
+
+func syncWebhookSpoolDirectory(*os.Root) error {
+	// Windows exposes no supported directory metadata flush equivalent.
+	// Record and marker contents are flushed before their atomic rename.
+	return nil
+}

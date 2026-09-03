@@ -21,6 +21,19 @@ func validateWebhookSpoolOwner(info os.FileInfo) error {
 	}
 	return nil
 }
+
+func syncWebhookSpoolDirectory(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	syncErr := directory.Sync()
+	closeErr := directory.Close()
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
+}
 func validateWebhookSpoolParent(info os.FileInfo) error {
 	if info.Mode().Perm()&0o022 == 0 {
 		return nil
