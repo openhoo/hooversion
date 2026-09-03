@@ -96,6 +96,9 @@ var (
 	windowsUsersSID = [...]byte{
 		1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 33, 2, 0, 0,
 	}
+	windowsAuthenticatedUsersSID = [...]byte{
+		1, 1, 0, 0, 0, 0, 0, 5, 11, 0, 0, 0,
+	}
 )
 
 func validateWebhookSpoolOwner(file *os.File) error {
@@ -301,7 +304,8 @@ func validateWindowsSpoolDACL(dacl, currentSID uintptr) error {
 				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsCreatorOwnerSID[0]))) ||
 				header.AceFlags&aceInheritedFlag != 0 &&
 					(windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsEveryoneSID[0]))) ||
-						windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsUsersSID[0])))) {
+						windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsUsersSID[0]))) ||
+						windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsAuthenticatedUsersSID[0])))) {
 				continue
 			}
 			return fmt.Errorf("webhook spool DACL grants write access to an untrusted SID (ACE %d)", index)
