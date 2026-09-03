@@ -1,5 +1,17 @@
 # @openhoo/hooversion Changelog
 
+## 1.1.1 (2026-09-03)
+
+### Bug Fixes
+
+- **release:** harden automation and webhook delivery (15f35c2)
+
+### Other Changes
+
+- **ci:** update Hoostack tool pins (#33) (1526329)
+- **ci:** update HooNeedsUpdates to v0.3.0 (3153886)
+- **ci:** enable manual CI recovery (#35) (9a87cd8)
+
 ## 1.1.0 (2026-08-31)
 
 ### Features
