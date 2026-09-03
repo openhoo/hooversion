@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"strings"
 
@@ -196,6 +197,14 @@ func Normalize(cwd string, raw *types.Config) (*types.NormalizedConfig, error) {
 		return nil, err
 	}
 
+	outputDir := raw.OutputDir
+	if outputDir != "" {
+		var err error
+		outputDir, err = normalizeRelative(outputDir)
+		if err != nil {
+			return nil, err
+		}
+	}
 	normalized := &types.NormalizedConfig{
 		Branches:             append([]string(nil), branches...),
 		TagFormat:            tagFormat,
@@ -207,7 +216,7 @@ func Normalize(cwd string, raw *types.Config) (*types.NormalizedConfig, error) {
 			AfterRelease:  orEmptySlice(raw.Hooks.AfterRelease),
 		},
 		GitHub:    resolveGitHub(raw.GitHub),
-		OutputDir: raw.OutputDir,
+		OutputDir: outputDir,
 		Push:      raw.Push == nil || *raw.Push,
 	}
 	if normalized.OutputDir == "" {
@@ -373,10 +382,12 @@ func assertValidTagFormat(format string, packages []types.NormalizedPackageConfi
 	return nil
 }
 
-func normalizeRelative(path string) (string, error) {
-	cleaned := filepath.Clean(path)
-	if cleaned == ".." || strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
-		return "", errors.New("Path must stay inside the repository: %s", path)
+func normalizeRelative(rawPath string) (string, error) {
+	normalized := strings.ReplaceAll(rawPath, `\`, "/")
+	cleaned := pathpkg.Clean(normalized)
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") ||
+		pathpkg.IsAbs(cleaned) || len(cleaned) >= 2 && cleaned[1] == ':' {
+		return "", errors.New("Path must stay inside the repository: %s", rawPath)
 	}
 	if cleaned == "" {
 		return ".", nil
@@ -388,7 +399,7 @@ func defaultChangelog(packagePath string) string {
 	if packagePath == "." {
 		return "CHANGELOG.md"
 	}
-	return filepath.Join(packagePath, "CHANGELOG.md")
+	return pathpkg.Join(packagePath, "CHANGELOG.md")
 }
 
 func orEmptySlice(s []string) []string {

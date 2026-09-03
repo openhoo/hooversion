@@ -70,13 +70,18 @@ func DetectPackages(cwd string) ([]types.PackageConfig, error) {
 
 	seen := make(map[string]bool, len(candidates))
 	deduped := candidates[:0]
-	for _, pkg := range candidates {
-		key := fmt.Sprintf("%s:%s", pkg.Type, filepath.Clean(pkg.Path))
+	for index := range candidates {
+		normalizedPath, err := normalizeRelative(candidates[index].Path)
+		if err != nil {
+			return nil, err
+		}
+		candidates[index].Path = normalizedPath
+		key := fmt.Sprintf("%s:%s", candidates[index].Type, normalizedPath)
 		if seen[key] {
 			continue
 		}
 		seen[key] = true
-		deduped = append(deduped, pkg)
+		deduped = append(deduped, candidates[index])
 	}
 	return deduped, nil
 }

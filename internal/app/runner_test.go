@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -82,18 +83,16 @@ func TestGitAuthArtifacts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	tokenInfo, err := os.Stat(auth.tokenPath)
-	if err != nil || tokenInfo.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && (err != nil || tokenInfo.Mode().Perm() != 0o600) {
 		t.Fatalf("token mode %v err %v", tokenInfo.Mode(), err)
 	}
 	content, _ := os.ReadFile(auth.tokenPath)
 	if string(content) != "tok123\n" {
 		t.Fatalf("token content %q", content)
 	}
-
 	askpassInfo, err := os.Stat(auth.askpassPath)
-	if err != nil || askpassInfo.Mode().Perm() != 0o700 {
+	if runtime.GOOS != "windows" && (err != nil || askpassInfo.Mode().Perm() != 0o700) {
 		t.Fatalf("askpass mode %v err %v", askpassInfo.Mode(), err)
 	}
 	script, _ := os.ReadFile(auth.askpassPath)

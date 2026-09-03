@@ -183,15 +183,20 @@ func fakeGH(t *testing.T) string {
 func runRebuildMetadata(t *testing.T, cwd, script string) (string, error) {
 	t.Helper()
 	output := filepath.Join(t.TempDir(), "github-output")
-	cmd := exec.Command("bash", "-c", script)
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatalf("locate bash: %v", err)
+	}
+	cmd := exec.Command(bash, []string{"-s"}...)
 	cmd.Dir = cwd
+	cmd.Stdin = strings.NewReader(script)
 	cmd.Env = append(os.Environ(),
 		"GH_TOKEN=test-token",
 		"REBUILD_TAG=v1.1.0",
 		"GITHUB_OUTPUT="+output,
 		"PATH="+fakeGH(t)+":"+os.Getenv("PATH"),
 	)
-	err := cmd.Run()
+	err = cmd.Run()
 	data, readErr := os.ReadFile(output)
 	if readErr != nil && !os.IsNotExist(readErr) {
 		t.Fatal(readErr)

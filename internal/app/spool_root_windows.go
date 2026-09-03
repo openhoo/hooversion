@@ -112,10 +112,10 @@ func validateWebhookSpoolOwner(file *os.File) error {
 		runtime.KeepAlive(sidBuffer)
 		releaseSID()
 	}()
-	if ownerSID == 0 || !windowsSIDEqual(ownerSID, currentSID) {
+	if !windowsTrustedOwner(ownerSID, currentSID) {
 		return errors.New("webhook spool path has unsafe owner")
 	}
-	if err := validateWindowsSpoolDACL(dacl, currentSID); err != nil {
+	if err := validateWindowsSpoolDACL(dacl, currentSID, ownerSID); err != nil {
 		return err
 	}
 	return nil
@@ -142,10 +142,16 @@ func validateWindowsSpoolPathComponent(path string, final bool) error {
 		runtime.KeepAlive(sidBuffer)
 		releaseSID()
 	}()
-	if final && (ownerSID == 0 || !windowsSIDEqual(ownerSID, currentSID)) {
+	if final && !windowsTrustedOwner(ownerSID, currentSID) {
 		return errors.New("webhook spool path has unsafe owner")
 	}
-	return validateWindowsSpoolDACL(dacl, currentSID)
+	return validateWindowsSpoolDACL(dacl, currentSID, ownerSID)
+}
+
+func windowsTrustedOwner(ownerSID, currentSID uintptr) bool {
+	return windowsSIDEqual(ownerSID, currentSID) ||
+		windowsSIDEqual(ownerSID, uintptr(unsafe.Pointer(&windowsSystemSID[0]))) ||
+		windowsSIDEqual(ownerSID, uintptr(unsafe.Pointer(&windowsAdministratorsSID[0])))
 }
 
 func validateWindowsSpoolHandle(file *os.File) error {
@@ -238,7 +244,7 @@ func windowsCurrentUserSID() (uintptr, []byte, func(), error) {
 	return sid, buffer, release, nil
 }
 
-func validateWindowsSpoolDACL(dacl, currentSID uintptr) error {
+func validateWindowsSpoolDACL(dacl, currentSID, ownerSID uintptr) error {
 	var information windowsACLSizeInformation
 	result, _, callErr := getACLInformation.Call(
 		dacl,
@@ -282,7 +288,8 @@ func validateWindowsSpoolDACL(dacl, currentSID uintptr) error {
 			if windowsSIDEqual(sid, currentSID) ||
 				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsSystemSID[0]))) ||
 				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsAdministratorsSID[0]))) ||
-				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsCreatorOwnerSID[0]))) {
+				windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsCreatorOwnerSID[0]))) ||
+				windowsTrustedOwner(ownerSID, currentSID) && windowsSIDEqual(sid, ownerSID) {
 				continue
 			}
 			return fmt.Errorf("webhook spool DACL grants write access to an untrusted SID (ACE %d)", index)
