@@ -72,11 +72,11 @@ func releaseWebhookSpoolOwner(file *os.File) error {
 		return nil
 	}
 	var overlapped syscall.Overlapped
-	_, _, unlockErr := unlockFileEx.Call(
-		uintptr(file.Fd()), 0, 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
+	result, _, unlockErr := unlockFileEx.Call(
+		uintptr(file.Fd()), 0, 1, 0, uintptr(unsafe.Pointer(&overlapped)))
 	closeErr := file.Close()
-	if unlockErr != syscall.Errno(0) && unlockErr != errorNotLocked {
-		return unlockErr
+	if result == 0 && unlockErr != errorNotLocked {
+		return fmt.Errorf("unlock webhook spool owner: %w", unlockErr)
 	}
 	return closeErr
 }
