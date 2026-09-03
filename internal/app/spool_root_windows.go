@@ -197,6 +197,13 @@ func hardenWindowsSpoolDirectory(path string) error {
 		return err
 	}
 	defer directory.Close()
+	return hardenWindowsSpoolHandle(directory)
+}
+
+func hardenWindowsSpoolHandle(directory *os.File) error {
+	if directory == nil {
+		return errors.New("webhook spool security handle is unavailable")
+	}
 	if err := validateWindowsSpoolHandle(directory); err != nil {
 		return err
 	}

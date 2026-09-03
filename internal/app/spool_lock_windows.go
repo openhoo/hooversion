@@ -27,12 +27,15 @@ func acquireWebhookSpoolOwner(root *os.Root) (*os.File, error) {
 	if root == nil {
 		return nil, errors.New("webhook spool root is unavailable")
 	}
+	created := false
 	info, err := root.Lstat(webhookSpoolOwnerName)
 	if err == nil {
 		if windowsFileInfoIsReparsePoint(info) || !info.Mode().IsRegular() {
 			return nil, errors.New("webhook spool owner path is unsafe")
 		}
-	} else if !os.IsNotExist(err) {
+	} else if os.IsNotExist(err) {
+		created = true
+	} else {
 		return nil, fmt.Errorf("inspect webhook spool owner: %w", err)
 	}
 	file, err := root.OpenFile(webhookSpoolOwnerName, os.O_RDWR|os.O_CREATE, 0o600)
@@ -47,6 +50,12 @@ func acquireWebhookSpoolOwner(root *os.Root) (*os.File, error) {
 	if !info.Mode().IsRegular() {
 		_ = file.Close()
 		return nil, errors.New("webhook spool owner path is unsafe")
+	}
+	if created {
+		if err := hardenWindowsSpoolHandle(file); err != nil {
+			_ = file.Close()
+			return nil, fmt.Errorf("protect webhook spool owner: %w", err)
+		}
 	}
 	if err := validateWebhookSpoolOwner(file); err != nil {
 		_ = file.Close()
