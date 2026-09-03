@@ -73,6 +73,7 @@ var (
 	openProcessToken           = advapi32.NewProc("OpenProcessToken")
 	getTokenInformation        = advapi32.NewProc("GetTokenInformation")
 	equalSID                   = advapi32.NewProc("EqualSid")
+	convertSIDToStringSIDW     = advapi32.NewProc("ConvertSidToStringSidW")
 	localFree                  = kernel32.NewProc("LocalFree")
 	getCurrentProcess          = kernel32.NewProc("GetCurrentProcess")
 	closeHandle                = kernel32.NewProc("CloseHandle")
@@ -308,7 +309,14 @@ func validateWindowsSpoolDACL(dacl, currentSID uintptr) error {
 						windowsSIDEqual(sid, uintptr(unsafe.Pointer(&windowsAuthenticatedUsersSID[0])))) {
 				continue
 			}
-			return fmt.Errorf("webhook spool DACL grants write access to an untrusted SID (ACE %d)", index)
+			return fmt.Errorf(
+				"webhook spool DACL grants write access to untrusted SID %s (ACE %d, type %d, flags %#x, mask %#x)",
+				windowsSIDString(sid),
+				index,
+				header.AceType,
+				header.AceFlags,
+				mask,
+			)
 		default:
 			return fmt.Errorf("webhook spool DACL contains unsupported ACE type %d", header.AceType)
 		}
@@ -348,6 +356,30 @@ func windowsSIDEqual(first, second uintptr) bool {
 	}
 	result, _, _ := equalSID.Call(first, second)
 	return result != 0
+}
+
+func windowsSIDString(sid uintptr) string {
+	if sid == 0 {
+		return "<nil>"
+	}
+	var encoded *uint16
+	result, _, _ := convertSIDToStringSIDW.Call(
+		sid,
+		uintptr(unsafe.Pointer(&encoded)),
+	)
+	if result == 0 || encoded == nil {
+		return "<unavailable>"
+	}
+	defer localFree.Call(uintptr(unsafe.Pointer(encoded)))
+	const maximumSIDStringLength = 184
+	units := unsafe.Slice(encoded, maximumSIDStringLength)
+	for index, unit := range units {
+		if unit == 0 {
+			return syscall.UTF16ToString(units[:index])
+		}
+	}
+	return "<invalid>"
+
 }
 
 func prepareWebhookSpoolDir(path string) error {
