@@ -16,6 +16,7 @@ import (
 const (
 	ownerSecurityInformation           = 0x00000001
 	daclSecurityInformation            = 0x00000004
+	protectedDACLInformation           = 0x80000000
 	seFileObject                       = 1
 	accessAllowedAceType               = 0
 	accessDeniedAceType                = 1
@@ -67,8 +68,11 @@ type windowsACEHeader struct {
 var (
 	advapi32                   = syscall.NewLazyDLL("advapi32.dll")
 	getSecurityInfo            = advapi32.NewProc("GetSecurityInfo")
+	setSecurityInfo            = advapi32.NewProc("SetSecurityInfo")
 	getACLInformation          = advapi32.NewProc("GetAclInformation")
 	getACE                     = advapi32.NewProc("GetAce")
+	initializeACL              = advapi32.NewProc("InitializeAcl")
+	addAccessAllowedACE        = advapi32.NewProc("AddAccessAllowedAce")
 	openProcessToken           = advapi32.NewProc("OpenProcessToken")
 	getTokenInformation        = advapi32.NewProc("GetTokenInformation")
 	equalSID                   = advapi32.NewProc("EqualSid")
@@ -167,6 +171,78 @@ func validateWindowsSpoolHandle(file *os.File) error {
 		return errors.New("webhook spool path contains a reparse point")
 	}
 	return nil
+}
+
+type windowsACLHeader struct {
+	AclRevision uint8
+	Sbz1        uint8
+	AclSize     uint16
+	AceCount    uint16
+	Sbz2        uint16
+}
+
+const windowsACLRevision = 2
+
+func hardenWindowsSpoolDirectory(path string) error {
+	directory, err := openWindowsSpoolHandle(
+		path,
+		syscall.GENERIC_READ|writeDAC,
+		syscall.OPEN_EXISTING,
+		syscall.FILE_FLAG_OPEN_REPARSE_POINT|syscall.FILE_FLAG_BACKUP_SEMANTICS,
+	)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	if err := validateWindowsSpoolHandle(directory); err != nil {
+		return err
+	}
+	currentSID, sidBuffer, releaseSID, err := windowsCurrentUserSID()
+	if err != nil {
+		return err
+	}
+	defer func() {
+		runtime.KeepAlive(sidBuffer)
+		releaseSID()
+	}()
+	sids := []uintptr{
+		currentSID,
+		uintptr(unsafe.Pointer(&windowsSystemSID[0])),
+		uintptr(unsafe.Pointer(&windowsAdministratorsSID[0])),
+	}
+	aclSize := uint32(unsafe.Sizeof(windowsACLHeader{}))
+	for _, sid := range sids {
+		aclSize += uint32(unsafe.Sizeof(windowsACEHeader{})) + 4 + windowsSIDLength(sid)
+	}
+	acl := make([]byte, aclSize)
+	if result, _, callErr := initializeACL.Call(
+		uintptr(unsafe.Pointer(&acl[0])), uintptr(len(acl)), windowsACLRevision,
+	); result == 0 {
+		return fmt.Errorf("initialize webhook spool DACL: %w", callErr)
+	}
+	for _, sid := range sids {
+		if result, _, callErr := addAccessAllowedACE.Call(
+			uintptr(unsafe.Pointer(&acl[0])), windowsACLRevision, genericAll, sid,
+		); result == 0 {
+			return fmt.Errorf("build webhook spool DACL: %w", callErr)
+		}
+	}
+	status, _, _ := setSecurityInfo.Call(
+		uintptr(directory.Fd()), seFileObject,
+		daclSecurityInformation|protectedDACLInformation,
+		0, 0, uintptr(unsafe.Pointer(&acl[0])), 0,
+	)
+	if status != 0 {
+		return fmt.Errorf("protect webhook spool DACL: %w", syscall.Errno(status))
+	}
+	return nil
+}
+
+func windowsSIDLength(sid uintptr) uint32 {
+	if sid == 0 {
+		return 0
+	}
+	return 8 + 4*uint32(*(*uint8)(unsafe.Pointer(sid + 1)))
 }
 
 func windowsSecurityDescriptor(file *os.File) (ownerSID, dacl, descriptor uintptr, err error) {
@@ -360,6 +436,7 @@ func prepareWebhookSpoolDir(path string) error {
 		}
 	}()
 	parts := strings.Split(relative, string(filepath.Separator))
+	finalCreated := false
 	for index, part := range parts {
 		if part == "" || part == "." || part == ".." {
 			return errors.New("webhook spool path contains unsafe component")
@@ -367,6 +444,9 @@ func prepareWebhookSpoolDir(path string) error {
 		mkdirErr := current.Mkdir(part, 0o700)
 		if mkdirErr != nil && !errors.Is(mkdirErr, os.ErrExist) {
 			return fmt.Errorf("create webhook spool directory component: %w", mkdirErr)
+		}
+		if index == len(parts)-1 {
+			finalCreated = mkdirErr == nil
 		}
 		info, statErr := current.Lstat(part)
 		if statErr != nil {
@@ -391,6 +471,13 @@ func prepareWebhookSpoolDir(path string) error {
 		}
 		current = next
 		if index == len(parts)-1 {
+			if finalCreated {
+				if err := hardenWindowsSpoolDirectory(cleaned); err != nil {
+					_ = current.Close()
+					_ = next.Close()
+					return err
+				}
+			}
 			directory, openErr := current.Open(".")
 			if openErr != nil {
 				return fmt.Errorf("open webhook spool directory: %w", openErr)
