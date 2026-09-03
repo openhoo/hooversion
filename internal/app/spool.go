@@ -186,15 +186,14 @@ func (s *WebhookSpool) syncDirectoryLocked() error {
 func (s *WebhookSpool) recount() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	names, err := s.sortedNamesLocked()
-	if err != nil {
+	if _, err := s.sortedNamesLocked(); err != nil {
 		return fmt.Errorf("scan webhook spool: %w", err)
 	}
 	changed, err := s.reconcileTerminalLocked()
 	if err != nil {
 		return err
 	}
-	names, err = s.sortedNamesLocked()
+	names, err := s.sortedNamesLocked()
 	if err != nil {
 		return fmt.Errorf("scan webhook spool: %w", err)
 	}
