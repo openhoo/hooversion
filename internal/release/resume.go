@@ -5,6 +5,7 @@ package release
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/openhoo/hooversion/internal/errors"
@@ -14,6 +15,11 @@ import (
 	"github.com/openhoo/hooversion/internal/semver"
 	"github.com/openhoo/hooversion/internal/types"
 )
+
+// squashMergeSuffix matches the " (#N)" GitHub appends to a squash-merged
+// pull request subject. Protected-branch release commits arrive on main with
+// that suffix; resume derivation strips it before parsing and comparison.
+var squashMergeSuffix = regexp.MustCompile(` \(#\d+\)$`)
 
 // DeriveResumable reconstructs a ReleasePlan from an already-executed release
 // commit (manifest already bumped). The release tag may either already point at
@@ -49,6 +55,7 @@ func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv 
 		return nil, err
 	}
 	subject, body := splitSubjectBody(message)
+	subject = squashMergeSuffix.ReplaceAllString(subject, "")
 	const prefix = "chore(release): "
 	if !strings.HasPrefix(subject, prefix) {
 		return nil, nil
@@ -153,10 +160,21 @@ func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv 
 	if err != nil {
 		return nil, err
 	}
-	if headMessage != CommitMessage(reconstructed) {
+	if !releaseMessageMatches(headMessage, CommitMessage(reconstructed)) {
 		return nil, nil
 	}
 	return reconstructed, nil
+}
+
+// releaseMessageMatches reports whether a HEAD commit message equals the
+// expected release message, tolerating the " (#N)" subject suffix GitHub
+// adds when a protected release pull request is squash-merged.
+func releaseMessageMatches(message, expected string) bool {
+	if message == expected {
+		return true
+	}
+	subject, body := splitSubjectBody(message)
+	return squashMergeSuffix.ReplaceAllString(subject, "")+"\n\n"+body == expected
 }
 
 // inferReleaseTransition probes candidate previous versions (major, minor,
@@ -252,7 +270,7 @@ func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv
 		return false
 	}
 	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
-	if err != nil || message != CommitMessage(effective) {
+	if err != nil || !releaseMessageMatches(message, CommitMessage(effective)) {
 		return false
 	}
 	for _, release := range effective.Releases {
