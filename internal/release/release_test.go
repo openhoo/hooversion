@@ -327,6 +327,134 @@ func TestResumesSquashMergedReleaseCommitAndCreatesMissingTag(t *testing.T) {
 	}
 }
 
+// amendSubjectSuffix rewrites the HEAD commit subject to carry suffix,
+// simulating the " (#N)" GitHub appends when a protected release pull
+// request is squash-merged.
+func amendSubjectSuffix(t *testing.T, cwd, suffix string) {
+	t.Helper()
+	message := gitOut(t, cwd, "log", "-1", "--format=%B")
+	lines := strings.SplitN(message, "\n", 2)
+	lines[0] += suffix
+	gitOut(t, cwd, "commit", "--amend", "-m", strings.Join(lines, "\n"))
+}
+
+func TestResumesSquashMergedReleaseCommitWithPullRequestSuffix(t *testing.T) {
+	cwd := seedAppRepo(t)
+	config := singleAppConfig(false)
+
+	plan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := Execute(cwd, config, plan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil || !first.Published {
+		t.Fatalf("first run: %v %+v", err, first)
+	}
+	gitOut(t, cwd, "tag", "--delete", "v1.0.1")
+	amendSubjectSuffix(t, cwd, " (#106)")
+	releaseHead := gitOut(t, cwd, "rev-parse", "HEAD")
+	commitCount := gitOut(t, cwd, "rev-list", "--count", "HEAD")
+	rerunPlan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := Execute(cwd, config, rerunPlan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.Published || len(run.Plan.Releases) != 1 {
+		t.Fatalf("suffixed resume result wrong: %+v", run)
+	}
+	if got := gitOut(t, cwd, "rev-list", "-n", "1", "v1.0.1"); got != releaseHead {
+		t.Fatalf("recreated tag points to %q, want %q", got, releaseHead)
+	}
+	if got := gitOut(t, cwd, "rev-list", "--count", "HEAD"); got != commitCount {
+		t.Fatalf("resume created extra commits: %s -> %s", commitCount, got)
+	}
+}
+
+func TestResumesMultiPackageReleaseCommitWithPullRequestSuffix(t *testing.T) {
+	cwd := makeRepo(t)
+	writeFile(t, filepath.Join(cwd, "packages", "one", "package.json"), "{\"name\": \"one\", \"version\": \"0.1.0\"}\n")
+	writeFile(t, filepath.Join(cwd, "packages", "two", "package.json"), "{\"name\": \"two\", \"version\": \"0.3.0\"}\n")
+	commitAll(t, cwd, "initial import")
+	gitOut(t, cwd, "tag", "-a", "one@v0.1.0", "-m", "one@v0.1.0")
+	gitOut(t, cwd, "tag", "-a", "two@v0.3.0", "-m", "two@v0.3.0")
+	writeFile(t, filepath.Join(cwd, "packages", "one", "a.ts"), "a\n")
+	writeFile(t, filepath.Join(cwd, "packages", "two", "b.ts"), "b\n")
+	commitAll(t, cwd, "feat: grow both packages")
+
+	config := &types.NormalizedConfig{
+		Branches:             []string{"main"},
+		TagFormat:            "v${version}",
+		IndependentTagFormat: "${name}@v${version}",
+		Packages: []types.NormalizedPackageConfig{
+			nodePkg("one", "packages/one", "packages/one/package.json"),
+			nodePkg("two", "packages/two", "packages/two/package.json"),
+		},
+		GitHub:    types.GitHubSettings{Enabled: false, Releases: true, ApiUrl: "https://api.github.com"},
+		OutputDir: ".hooversion",
+		Push:      false,
+	}
+	plan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := Execute(cwd, config, plan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil || !first.Published {
+		t.Fatalf("first run: %v %+v", err, first)
+	}
+	gitOut(t, cwd, "tag", "--delete", "one@v0.2.0")
+	gitOut(t, cwd, "tag", "--delete", "two@v0.4.0")
+	amendSubjectSuffix(t, cwd, " (#42)")
+	releaseHead := gitOut(t, cwd, "rev-parse", "HEAD")
+	commitCount := gitOut(t, cwd, "rev-list", "--count", "HEAD")
+
+	rerunPlan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := Execute(cwd, config, rerunPlan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run.Published || len(run.Plan.Releases) != 2 {
+		t.Fatalf("suffixed multi-package resume result wrong: %+v", run)
+	}
+	for _, tag := range []string{"one@v0.2.0", "two@v0.4.0"} {
+		if got := gitOut(t, cwd, "rev-list", "-n", "1", tag); got != releaseHead {
+			t.Fatalf("recreated tag %s points to %q, want %q", tag, got, releaseHead)
+		}
+	}
+	if got := gitOut(t, cwd, "rev-list", "--count", "HEAD"); got != commitCount {
+		t.Fatalf("resume created extra commits: %s -> %s", commitCount, got)
+	}
+}
+
+func TestRejectsReleaseCommitWithNonNumericSubjectSuffix(t *testing.T) {
+	cwd := seedAppRepo(t)
+	config := singleAppConfig(false)
+
+	plan, err := CreatePlanForTest(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := Execute(cwd, config, plan, Options{NoPushSet: true, NoGitHubSet: true})
+	if err != nil || !first.Published {
+		t.Fatalf("first run: %v %+v", err, first)
+	}
+	gitOut(t, cwd, "tag", "--delete", "v1.0.1")
+	amendSubjectSuffix(t, cwd, " (alpha)")
+
+	derived, err := DeriveResumable(cwd, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if derived != nil {
+		t.Fatalf("non-numeric suffix must not derive a resumable plan: %+v", derived)
+	}
+}
+
 func TestForeignUntrackedBlocksButManagedOutputsPreserved(t *testing.T) {
 	cwd := seedAppRepo(t)
 	config := singleAppConfig(false)
