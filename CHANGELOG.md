@@ -1,5 +1,16 @@
 # @openhoo/hooversion Changelog
 
+## 1.1.2 (2026-09-18)
+
+### Bug Fixes
+
+- **release:** tolerate squash-merge subject suffix in resume derivation (#43) (9c0eb80)
+
+### Other Changes
+
+- **ci:** adopt Hooversion v1.1.1 (d500d01)
+- **ci:** adopt Hoonarqube v0.3.1 (96783b9)
+
 ## 1.1.1 (2026-09-03)
 
 ### Bug Fixes
