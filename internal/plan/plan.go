@@ -3,6 +3,7 @@
 package plan
 
 import (
+	"context"
 	"path/filepath"
 	"strings"
 	"time"
@@ -51,17 +52,17 @@ func CreatePlan(cwd string, config *types.NormalizedConfig, branch string, polic
 }
 
 // CreatePlanWithEnv derives a plan using the supplied child environment.
-func CreatePlanWithEnv(cwd string, config *types.NormalizedConfig, branch string, policy *types.CommitPolicy, baseEnv []string) (*types.ReleasePlan, error) {
-	sourceSha, err := git.HeadShaWithEnv(cwd, baseEnv)
+func CreatePlanWithEnv(cwd string, config *types.NormalizedConfig, branch string, policy *types.CommitPolicy, baseEnv []string, contexts ...context.Context) (*types.ReleasePlan, error) {
+	sourceSha, err := git.HeadShaWithEnv(cwd, baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
 
 	rules := releaseRules(policy)
 	if len(config.Packages) == 1 {
-		return createSinglePackagePlan(cwd, config, branch, sourceSha, rules, policy, baseEnv)
+		return createSinglePackagePlan(cwd, config, branch, sourceSha, rules, policy, baseEnv, contexts...)
 	}
-	return createIndependentPlan(cwd, config, branch, sourceSha, rules, policy, baseEnv)
+	return createIndependentPlan(cwd, config, branch, sourceSha, rules, policy, baseEnv, contexts...)
 }
 
 func createSinglePackagePlan(
@@ -72,13 +73,14 @@ func createSinglePackagePlan(
 	rules map[string]types.ReleaseType,
 	policy *types.CommitPolicy,
 	baseEnv []string,
+	contexts ...context.Context,
 ) (*types.ReleasePlan, error) {
 	pkg := config.Packages[0]
-	latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg), baseEnv)
+	latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg), baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
-	commits, err := collectCommits(cwd, latestTag, sourceSha, policy, baseEnv)
+	commits, err := collectCommits(cwd, latestTag, sourceSha, policy, baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,6 +109,7 @@ func createIndependentPlan(
 	rules map[string]types.ReleaseType,
 	policy *types.CommitPolicy,
 	baseEnv []string,
+	contexts ...context.Context,
 ) (*types.ReleasePlan, error) {
 	latestTags := make(map[string]string)
 	eligibleByPackage := make(map[string]map[string]bool)
@@ -114,12 +117,12 @@ func createIndependentPlan(
 	candidateCommits := make(map[string]types.ParsedCommit)
 
 	for _, pkg := range config.Packages {
-		latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg), baseEnv)
+		latestTag, err := latestTagOrEmpty(cwd, TagPatternFor(config, pkg), baseEnv, contexts...)
 		if err != nil {
 			return nil, err
 		}
 		latestTags[pkg.Name] = latestTag
-		commits, err := collectCommits(cwd, latestTag, sourceSha, policy, baseEnv)
+		commits, err := collectCommits(cwd, latestTag, sourceSha, policy, baseEnv, contexts...)
 		if err != nil {
 			return nil, err
 		}
@@ -283,8 +286,8 @@ func uniqueCommits(commits []types.ParsedCommit) []types.ParsedCommit {
 
 // latestTagOrEmpty maps the ErrNoTag sentinel to an empty baseline so a
 // first release plans from full reachable history.
-func latestTagOrEmpty(cwd, pattern string, baseEnv []string) (string, error) {
-	tag, err := git.LatestTagWithEnv(cwd, pattern, baseEnv)
+func latestTagOrEmpty(cwd, pattern string, baseEnv []string, contexts ...context.Context) (string, error) {
+	tag, err := git.LatestTagWithEnv(cwd, pattern, baseEnv, contexts...)
 	if err == git.ErrNoTag {
 		return "", nil
 	}
@@ -293,8 +296,8 @@ func latestTagOrEmpty(cwd, pattern string, baseEnv []string) (string, error) {
 
 // collectCommits gathers raw commits since from (whole history when empty),
 // drops ignored subjects, and parses what remains under policy.
-func collectCommits(cwd, from, to string, policy *types.CommitPolicy, baseEnv []string) ([]types.ParsedCommit, error) {
-	raws, err := git.CommitsWithEnv(cwd, from, to, baseEnv)
+func collectCommits(cwd, from, to string, policy *types.CommitPolicy, baseEnv []string, contexts ...context.Context) ([]types.ParsedCommit, error) {
+	raws, err := git.CommitsWithEnv(cwd, from, to, baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}

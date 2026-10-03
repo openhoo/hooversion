@@ -729,6 +729,8 @@ func TestRetriesPublicationAfterPostPushFailureWithoutSecondCommit(t *testing.T)
 				"upload_url": "https://uploads.github.com/repos/owner/repo/releases/1/assets{?name,label}", "html_url": "https://github.example.test/r/v1.0.1",
 				"assets": []any{},
 			})
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/releases/1/assets"):
+			json.NewEncoder(w).Encode([]any{})
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/releases/1/assets"):
 			uploadHits.Add(1)
 			if uploadFail.Load() {

@@ -97,6 +97,12 @@ restarts.
   or fragment.
 - `VERSIONHOO_HOST`: bind host. Defaults to `0.0.0.0`.
 - `VERSIONHOO_PORT`: bind port. Defaults to `3000`.
+- `VERSIONHOO_MAX_CONCURRENT`: positive maximum number of simultaneously
+  executing repositories, default `4` (bounded by the 64-job admission limit).
+  Different branches of one repository share a publication reservation.
+- `VERSIONHOO_JOB_TIMEOUT_SECONDS`: positive job deadline in seconds, default
+  `900`, maximum `86400`. The clock starts after execution capacity is
+  available and covers installation-token minting, planning, and publication.
 - `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES`: positive integer maximum webhook body
   size. Defaults to `1048576` (1 MiB); oversized declared or streamed bodies
   are rejected.
@@ -183,7 +189,9 @@ Webhook bodies are bounded by `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES` before
 signature verification and durable admission. Every validated, handled
 `workflow_run` is written and fsynced as a bounded record in the spool before
 the app returns HTTP 202. The in-memory queue still accepts at most 64 running
-or waiting jobs and serializes jobs per repository/ref; a full queue therefore
+or waiting jobs, preserves FIFO per repository/ref, and serializes publication
+across branches of one repository. A global worker budget limits execution
+to `VERSIONHOO_MAX_CONCURRENT` repositories; a full queue therefore
 leaves the durable record pending rather than returning a lossy `503`.
 
 Spool records are sequence-numbered and drained FIFO for each repository/ref.
@@ -194,3 +202,22 @@ memory for 24 hours and are released after final failure (or an admission
 error), never merely because the bounded execution queue is saturated.
 Malformed, oversized, symlinked, or path-invalid spool entries are ignored or
 quarantined without blocking later records.
+
+### Cancellation and shutdown
+
+App execution uses isolated child environments and working directories, so
+independent repositories can execute concurrently. Git and hook commands
+use a finite five-minute command deadline and capture at most 32 MiB per
+output stream; exceeding that bound fails rather than silently accepting
+truncated output. The App job deadline may expire sooner.
+
+On interrupt or termination, the server stops intake and spool draining,
+cancels cooperative execution and child process trees, and waits for queue
+workers before releasing spool ownership. Jobs interrupted by process
+shutdown retain their durable record for restart replay. A job deadline
+is reported as a business failure, permitting a fresh webhook retry.
+
+Cancellation cannot reverse a remote push or GitHub mutation that was
+already accepted. Resume checks inspect that remote state before publishing
+again. CLI callers can supply execution contexts through the library APIs;
+background-context wrappers remain compatible.

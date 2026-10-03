@@ -181,7 +181,9 @@ Webhook bodies are bounded by `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES` before
 signature verification and durable admission. Every validated handled
 `workflow_run` is fsynced to the bounded file-backed webhook spool before the
 app returns HTTP 202. The execution queue remains bounded at 64 running or
-waiting jobs and serializes each repository/ref; queue saturation leaves the
+waiting jobs, preserves FIFO per repository/ref, and serializes publication
+across branches of each repository. At most four repositories run concurrently
+(`VERSIONHOO_MAX_CONCURRENT`). Queue saturation leaves the
 durable record pending instead of returning a lossy `503`.
 
 `VERSIONHOO_WEBHOOK_SPOOL_DIR` selects the durable backlog directory and
@@ -191,6 +193,12 @@ and retried after restart. Dedupe reservations remain in memory for 24 hours
 and are released after final failure or an admission error, never just because
 the in-memory queue is full. Corrupt, oversized, symlinked, and unsafe-path
 records are quarantined or skipped without blocking later deliveries.
+
+Each App job has a 15-minute deadline (`VERSIONHOO_JOB_TIMEOUT_SECONDS`,
+maximum 86400). Child commands have a five-minute deadline and bounded
+output. Interrupt or termination signals stop intake and backlog scheduling,
+cancel child process trees, and wait for execution to finish before releasing
+spool ownership. Unfinished durable jobs remain available for restart replay.
 
 ## Migration
 
@@ -325,3 +333,13 @@ spool/configuration/filesystem tests. The
 [October 3, 2026 review](docs/review-2026-10-03.md) records reproduced findings,
 compatibility changes, verification evidence, and the remaining architecture
 priorities.
+
+## Reliability and recovery
+
+Release execution uses a durable Git-metadata journal and exclusive repository
+ownership. Local failures restore the tracked/managed baseline; uncertain remote
+publication retains the commit for safe retry. Hook side effects outside those
+files remain the hook author's responsibility. See the
+[architecture report](docs/architecture-hardening-2026-10-03.md) for recovery
+phases and limits, and the [manifest policy](docs/manifest-policy.md) for Cargo
+inheritance and Python constraint behavior.

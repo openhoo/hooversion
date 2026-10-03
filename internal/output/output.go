@@ -26,6 +26,7 @@ type ManagedPaths map[string]bool
 // Store reads and clears the managed release payload for one repository
 // checkout. OutputDir is the cwd-relative configured directory.
 type Store struct {
+	Root      *safefs.Root // pinned release checkout; nil preserves standalone calls
 	Cwd       string
 	OutputDir string
 	BaseEnv   []string // nil inherits; explicit environments isolate GitHub Actions outputs
@@ -57,7 +58,7 @@ func (s Store) Paths() ManagedPaths {
 	if err := safefs.RequireContainedPath(s.Cwd, s.OutputDir); err != nil {
 		return paths
 	}
-	payload, ok := readStalePayload(outputsPath)
+	payload, ok := s.readStalePayload(outputsPath)
 	if !ok {
 		return paths
 	}
@@ -173,7 +174,10 @@ func hasSymlinkParent(root, candidate string) bool {
 // readStalePayload parses outputs.json without following a symlink planted at
 // the path; any failure means the stale output cannot identify note paths.
 func readStalePayload(path string) (stalePayload, bool) {
-	data, err := safefs.ReadRegularFile(path, maxStalePayloadBytes)
+	return (Store{}).readStalePayload(path)
+}
+func (s Store) readStalePayload(path string) (stalePayload, bool) {
+	data, err := s.files().ReadRegularFile(path, maxStalePayloadBytes)
 	if err != nil {
 		return stalePayload{}, false
 	}
@@ -196,7 +200,7 @@ func (s Store) Clear() error {
 		if dirScope {
 			continue
 		}
-		info, err := os.Lstat(path)
+		info, err := s.lstat(path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				continue
@@ -206,7 +210,7 @@ func (s Store) Clear() error {
 		if info.IsDir() {
 			return fmt.Errorf("cannot clear managed output path %s: it is a directory", path)
 		}
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := s.remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -244,14 +248,14 @@ func (s Store) Write(releases []types.PackageRelease, published bool) error {
 		return err
 	}
 	dir := filepath.Join(s.Cwd, s.OutputDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := s.mkdirAll(dir, 0o755); err != nil {
 		return err
 	}
 
 	stored := make([]storedRelease, 0, len(releases))
 	for i, release := range releases {
 		noteName := noteNames[i]
-		if err := safefs.WriteFileAtomic(filepath.Join(dir, noteName), []byte(release.Notes+"\n"), 0o644); err != nil {
+		if err := s.files().WriteFileAtomic(filepath.Join(dir, noteName), []byte(release.Notes+"\n"), 0o644); err != nil {
 			return err
 		}
 		stored = append(stored, storedRelease{
@@ -268,16 +272,16 @@ func (s Store) Write(releases []types.PackageRelease, published bool) error {
 	if err != nil {
 		return err
 	}
-	if err := safefs.WriteFileAtomic(filepath.Join(dir, "outputs.json"), data, 0o644); err != nil {
+	if err := s.files().WriteFileAtomic(filepath.Join(dir, "outputs.json"), data, 0o644); err != nil {
 		return err
 	}
 
 	versionPath := filepath.Join(s.Cwd, ".release-version")
 	if len(releases) == 1 {
-		if err := safefs.WriteFileAtomic(versionPath, []byte(releases[0].NextVersion+"\n"), 0o644); err != nil {
+		if err := s.files().WriteFileAtomic(versionPath, []byte(releases[0].NextVersion+"\n"), 0o644); err != nil {
 			return err
 		}
-	} else if err := removeIfExists(versionPath); err != nil {
+	} else if err := s.removeIfExists(versionPath); err != nil {
 		return err
 	}
 
@@ -304,8 +308,8 @@ func (s Store) Write(releases []types.PackageRelease, published bool) error {
 	return nil
 }
 
-func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+func (s Store) removeIfExists(path string) error {
+	if err := s.remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -388,4 +392,51 @@ func sanitizeFileName(value string) string {
 
 func (s Store) outputsPath() string {
 	return filepath.Join(s.Cwd, s.OutputDir, "outputs.json")
+}
+
+func (s Store) files() safefs.FileSystem {
+	if s.Root != nil {
+		return s.Root
+	}
+	return safefs.Native{}
+}
+func (s Store) lstat(path string) (os.FileInfo, error) {
+	if s.Root != nil {
+		return s.Root.Lstat(path)
+	}
+	return os.Lstat(path)
+}
+func (s Store) remove(path string) error {
+	if s.Root != nil {
+		return s.Root.Remove(path)
+	}
+	return os.Remove(path)
+}
+func (s Store) mkdirAll(path string, perm os.FileMode) error {
+	if s.Root != nil {
+		return s.Root.MkdirAll(path, perm)
+	}
+	return os.MkdirAll(path, perm)
+}
+
+// Destinations enumerates files a payload write owns before the transaction starts.
+func (s Store) Destinations(releases []types.PackageRelease) ([]string, error) {
+	tags := make([]string, len(releases))
+	for i, r := range releases {
+		tags[i] = r.Tag
+	}
+	names, err := deriveNoteNames(tags)
+	if err != nil {
+		return nil, err
+	}
+	paths := []string{filepath.Join(s.Cwd, s.OutputDir, "outputs.json"), filepath.Join(s.Cwd, ".release-version")}
+	for _, name := range names {
+		paths = append(paths, filepath.Join(s.Cwd, s.OutputDir, name))
+	}
+	for path, isDir := range s.Paths() {
+		if !isDir {
+			paths = append(paths, path)
+		}
+	}
+	return paths, nil
 }

@@ -10,6 +10,7 @@ package githubapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -36,6 +37,8 @@ type Client struct {
 	Token string
 	// HTTP is the transport; nil selects http.DefaultClient.
 	HTTP *http.Client
+	// Context cancels all requests for this operation. Nil preserves ordinary callers.
+	Context context.Context
 }
 
 // New returns a Client for baseURL, stripping a single trailing slash like
@@ -45,11 +48,18 @@ func New(baseURL, token string) *Client {
 	return &Client{BaseURL: baseURL, Token: token}
 }
 
+func (c *Client) requestContext() context.Context {
+	if c.Context != nil {
+		return c.Context
+	}
+	return context.Background()
+}
+
 // newRequest builds a request carrying the standard GitHub headers. A
 // non-empty contentType is applied after the defaults, matching the header
 // merge order in githubFetch.
 func (c *Client) newRequest(method, rawURL, contentType string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequest(method, rawURL, body)
+	req, err := http.NewRequestWithContext(c.requestContext(), method, rawURL, body)
 	if err != nil {
 		return nil, err
 	}

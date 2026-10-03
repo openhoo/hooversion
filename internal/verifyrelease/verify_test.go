@@ -405,3 +405,27 @@ func TestTarLicenseCheckValidatesGzipTrailer(t *testing.T) {
 		t.Fatal("invalid gzip checksum passed verification")
 	}
 }
+
+type inventoryGitHub struct {
+	*fakeGitHub
+	inventory    []githubapi.Asset
+	inventoryErr error
+}
+
+func (client *inventoryGitHub) ListReleaseAssets(string, int64) ([]githubapi.Asset, error) {
+	return client.inventory, client.inventoryErr
+}
+
+func TestVerifyUsesCompleteInventory(t *testing.T) {
+	base := releaseFixture(map[string][]byte{"artifact.bin": []byte("artifact")})
+	inventory := append([]githubapi.Asset(nil), base.release.Assets...)
+	base.release.Assets = nil
+	client := &inventoryGitHub{fakeGitHub: base, inventory: inventory}
+	if _, err := Verify(context.Background(), Options{Repository: "openhoo/demo", Tag: "v1.2.3", client: client}); err != nil {
+		t.Fatal(err)
+	}
+	client.inventoryErr = fmt.Errorf("inventory unavailable")
+	if _, err := Verify(context.Background(), Options{Repository: "openhoo/demo", Tag: "v1.2.3", client: client}); err == nil || !strings.Contains(err.Error(), "inventory unavailable") {
+		t.Fatalf("inventory failure=%v", err)
+	}
+}

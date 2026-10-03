@@ -76,7 +76,10 @@ jobs:
           go-version: stable
 
       - name: Test Windows spool and file safety
-        run: go test ./internal/app ./internal/config ./internal/safefs ./internal/manifest ./internal/output -count=1
+        run: go test ./internal/app ./internal/config ./internal/safefs ./internal/manifest ./internal/output ./internal/process -count=1
+
+      - name: Test Windows release journal and ownership
+        run: go test ./internal/release -run 'TestInterruptedCommitAndPartialTagsRecoverThenRelease|TestLinkedWorktreesShareReleaseOwnership|TestRecoveryRefusesUnrelatedCommitAndKeepsJournal|TestRealProcessCrashRecovery' -count=1
 
   policy:
     name: Hoostack policy

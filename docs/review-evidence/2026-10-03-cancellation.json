@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "observedAt": "2026-10-03T18:26:45.319763+00:00",
+  "platform": "darwin",
+  "command": [
+    "hooversion",
+    "release",
+    "--no-push",
+    "--no-github"
+  ],
+  "binarySha256": "8942dea1a1b1b5b54f7b7de59f8c5951c5b004f754379d4ba3a7f2366835c925",
+  "journalVersion": 1,
+  "journalIndexSnapshotPresent": true,
+  "signal": "SIGTERM",
+  "exit": 1,
+  "cancellationSeconds": 0.4,
+  "headPreserved": true,
+  "versionPreserved": true,
+  "indexSnapshotRestored": true,
+  "transactionJournalRemoved": true,
+  "treeClean": true,
+  "descendantStopped": true,
+  "subsequentDryRun": 0,
+  "remotePushSelected": false,
+  "githubPublicationSelected": false
+}

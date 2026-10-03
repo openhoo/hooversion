@@ -22,10 +22,10 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/openhoo/hooversion/internal/githubapi"
+	"github.com/openhoo/hooversion/internal/process"
 )
 
 const (
@@ -174,6 +174,7 @@ func Verify(ctx context.Context, options Options) (Result, error) {
 	if client == nil {
 		github := githubapi.New(options.APIURL, options.Token)
 		github.HTTP = &http.Client{Timeout: 30 * time.Second}
+		github.Context = ctx
 		client = github
 	}
 	runner := options.runner
@@ -200,6 +201,16 @@ func Verify(ctx context.Context, options Options) (Result, error) {
 	}
 	if options.RequireSignedTag && (!resolved.Annotated || !resolved.AllSignaturesVerified) {
 		return Result{}, fmt.Errorf("release tag %s lacks a verified annotated-tag signature", release.TagName)
+	}
+	// Production clients fetch the complete paginated inventory. The optional
+	// interface preserves compatibility with narrow verifier implementations.
+	if inventory, ok := client.(interface {
+		ListReleaseAssets(string, int64) ([]githubapi.Asset, error)
+	}); ok {
+		release.Assets, err = inventory.ListReleaseAssets(options.Repository, release.ID)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 	assets, err := indexAssets(release.Assets)
 	if err != nil {
@@ -733,56 +744,15 @@ func (executableRunner) Run(ctx context.Context, name string, arguments, environ
 	if err != nil {
 		return nil, fmt.Errorf("required verifier %s: %w", name, err)
 	}
-	commandContext, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	command := exec.CommandContext(commandContext, executable, arguments...)
-	command.Env = environment
-	output := &boundedOutput{maximum: maxCommandOutput}
-	command.Stdout = output
-	command.Stderr = output
-	err = command.Run()
-	data, exceeded := output.Result()
-	if exceeded {
-		return nil, fmt.Errorf("%s output exceeds 1 MiB", name)
-	}
-	if err != nil {
-		message := strings.TrimSpace(string(data))
-		if message == "" {
-			return nil, err
+	result := process.Run(ctx, process.Options{Env: environment, Timeout: 2 * time.Minute, OutputLimit: maxCommandOutput}, executable, arguments...)
+	if result.Err != nil {
+		message := strings.TrimSpace(result.Stdout + result.Stderr)
+		if message != "" {
+			return nil, fmt.Errorf("%w: %s", result.Err, message)
 		}
-		return nil, fmt.Errorf("%w: %s", err, message)
+		return nil, result.Err
 	}
-	return data, nil
-}
-
-type boundedOutput struct {
-	mu       sync.Mutex
-	data     []byte
-	maximum  int
-	exceeded bool
-}
-
-func (output *boundedOutput) Write(data []byte) (int, error) {
-	output.mu.Lock()
-	defer output.mu.Unlock()
-	remaining := output.maximum - len(output.data)
-	if remaining > 0 {
-		count := len(data)
-		if count > remaining {
-			count = remaining
-		}
-		output.data = append(output.data, data[:count]...)
-	}
-	if len(data) > remaining {
-		output.exceeded = true
-	}
-	return len(data), nil
-}
-
-func (output *boundedOutput) Result() ([]byte, bool) {
-	output.mu.Lock()
-	defer output.mu.Unlock()
-	return append([]byte(nil), output.data...), output.exceeded
+	return []byte(result.Stdout + result.Stderr), nil
 }
 
 func verificationEnvironment(token string) []string {

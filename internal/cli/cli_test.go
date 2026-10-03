@@ -631,7 +631,7 @@ func TestNestedReleaseActionsExecuteFromRepositoryRoot(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("root release action equivalent failed to load nested config: %s\n%s", stdout, stderr)
 	}
-	mustContain(t, stdout, "Dry run complete; no files, commits, tags, or releases were created.\n", "stdout")
+	mustContain(t, stdout, "Dry run complete; no release files, commits, tags, or releases were created.\n", "stdout")
 }
 
 func TestWorkflowActionVersionIsIndependentFromCLIVersion(t *testing.T) {
@@ -892,7 +892,7 @@ func TestReleaseDryRunPrintsPlanAndCompletionLine(t *testing.T) {
 	}
 	mustContain(t, stdout, "Planned releases:", "stdout")
 	mustContain(t, stdout, "since v1.0.0", "stdout")
-	mustContain(t, stdout, "Dry run complete; no files, commits, tags, or releases were created.\n", "stdout")
+	mustContain(t, stdout, "Dry run complete; no release files, commits, tags, or releases were created.\n", "stdout")
 }
 
 func TestReleaseResumedRunReportsComplete(t *testing.T) {

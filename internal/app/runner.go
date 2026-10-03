@@ -6,17 +6,17 @@
 package app
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/openhoo/hooversion/internal/config"
 	hverr "github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/plan"
+	"github.com/openhoo/hooversion/internal/process"
 	"github.com/openhoo/hooversion/internal/release"
 	"github.com/openhoo/hooversion/internal/types"
 )
@@ -39,6 +39,8 @@ const (
 // runner). RepoDir is a test seam: when set, cloning is skipped and the
 // directory is used as-is without external cleanup.
 type JobSpec struct {
+	Context            context.Context
+	Timeout            time.Duration
 	RepositoryFullName string
 	CloneURL           string
 	Branch             string
@@ -82,10 +84,6 @@ type Outcome struct {
 var Runner = func(spec JobSpec) Outcome {
 	return runVersionhooRelease(spec)
 }
-
-// repositoryEnvironmentMu serializes environment-sensitive child execution
-// globally, mirroring the repositoryEnvironmentTail promise chain.
-var repositoryEnvironmentMu sync.Mutex
 
 func redact(value, secret string) string {
 	if secret == "" {
@@ -248,30 +246,29 @@ func childEnv(spec JobSpec, home string) []string {
 
 // checkedOutput runs command with env, returning trimmed stdout; on failure it
 // renders the verbatim "<command> <args> failed:" error with redaction.
-func checkedOutput(env []string, dir, command string, args []string, secret string) (string, error) {
-	cmd := exec.Command(command, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	runErr := cmd.Run()
-	if runErr != nil {
+func checkedOutput(env []string, dir, command string, args []string, secret string, contexts ...context.Context) (string, error) {
+	result := process.Run(process.Context(contexts), process.Options{Dir: dir, Env: env}, command, args...)
+	if result.Err != nil {
 		rendered := command
 		for _, arg := range args {
 			rendered += " " + redact(arg, secret)
 		}
-		detail := stderr.String()
+		detail := result.Stderr
 		if detail == "" {
-			detail = stdout.String()
+			detail = result.Stdout
 		}
-		return "", hverr.New("%s failed:\n%s", rendered, redact(detail, secret))
+		return "", fmt.Errorf("%s failed: %w\n%s", rendered, result.Err, redact(detail, secret))
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return strings.TrimSpace(result.Stdout), nil
 }
 
 // runVersionhooRelease mirrors runVersionhooRelease.
 func runVersionhooRelease(spec JobSpec) Outcome {
+	ctx, cancel := context.WithTimeout(process.Context([]context.Context{spec.Context}), resolveJobTimeout(spec.Timeout))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return failureOutcome(spec, err)
+	}
 	parent := spec.WorkDir
 	if parent == "" {
 		parent = filepath.Join(os.TempDir(), "versionhoo")
@@ -295,10 +292,6 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			os.RemoveAll(workDir)
 		}
 	}
-
-	// Global serialization of environment-sensitive execution.
-	repositoryEnvironmentMu.Lock()
-	defer repositoryEnvironmentMu.Unlock()
 
 	outcome := func() Outcome {
 		env := childEnv(spec, repositoryHome)
@@ -326,18 +319,21 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			cloneEnv := append(append([]string{}, env...), auth.envToSlice()...)
 			if _, err := checkedOutput(cloneEnv, workDir, "git", []string{
 				"clone", "--branch", spec.Branch, "--no-single-branch", cloneURL, repoDir,
-			}, spec.Token); err != nil {
+			}, spec.Token, ctx); err != nil {
 				return failureOutcome(spec, err)
 			}
 		}
-		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.name", authorName}, spec.Token); err != nil {
+		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.name", authorName}, spec.Token, ctx); err != nil {
 			return failureOutcome(spec, err)
 		}
-		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.email", authorEmail}, spec.Token); err != nil {
+		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.email", authorEmail}, spec.Token, ctx); err != nil {
 			return failureOutcome(spec, err)
 		}
 
-		branchHead, _ := checkedOutput(env, repoDir, "git", []string{"rev-parse", "HEAD"}, spec.Token)
+		branchHead, err := checkedOutput(env, repoDir, "git", []string{"rev-parse", "HEAD"}, spec.Token, ctx)
+		if err != nil {
+			return failureOutcome(spec, err)
+		}
 		if branchHead != spec.HeadSha {
 			return Outcome{
 				RepositoryFullName: spec.RepositoryFullName,
@@ -378,11 +374,12 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			cfg.GitHub.Repository = repoIdentity
 			cfg.GitHub.ApiUrl = trustedApiURL
 		}
-		releasePlan, err := plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env)
+		releasePlan, err := plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env, ctx)
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
 		execution, err := release.Execute(repoDir, cfg, releasePlan, release.Options{
+			Context:     ctx,
 			NoPushSet:   true,
 			Push:        true,
 			NoGitHubSet: true,
@@ -455,6 +452,15 @@ func sortStrings(values []string) {
 // check-run creation (warn-only), runner invocation, check completion, and
 // failure re-raising so the queue can release dedupe reservations.
 func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func(JobSpec) Outcome) error {
+	return ReleaseFromWorkflowRunContext(cfg.Context, payload, cfg, runner)
+}
+
+func ReleaseFromWorkflowRunContext(parent context.Context, payload *WebhookPayload, cfg *AppConfig, runner func(JobSpec) Outcome) error {
+	ctx, cancel := context.WithTimeout(process.Context([]context.Context{parent}), resolveJobTimeout(cfg.JobTimeout))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	decision := ShouldHandleWorkflowRun(payload, cfg)
 	if decision.Status == "ignored" {
 		return nil
@@ -484,7 +490,7 @@ func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func
 	if err != nil {
 		return err
 	}
-	token, err := mintToken(apiURL, cfg.AppID, cfg.PrivateKey, payload.Installation.ID, []int64{payload.Repository.ID})
+	token, err := mintToken(apiURL, cfg.AppID, cfg.PrivateKey, payload.Installation.ID, []int64{payload.Repository.ID}, ctx)
 	if err != nil {
 		return err
 	}
@@ -494,6 +500,9 @@ func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func
 		return err
 	}
 
+	clientCopy := *client
+	client = &clientCopy
+	client.Context = ctx
 	checkRunID, createErr := createReleaseCheckRun(client, fullName, headSha)
 	if createErr != nil {
 		warnf("Could not create Versionhoo Release check: %v", createErr)
@@ -501,6 +510,8 @@ func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func
 	}
 
 	spec := buildJobSpec(payload, cfg, token)
+	spec.Context = ctx
+	spec.Timeout = cfg.JobTimeout
 	result := runner(spec)
 
 	if result.Err != nil {
@@ -545,4 +556,13 @@ var buildJobSpec = func(payload *WebhookPayload, cfg *AppConfig, token string) J
 		GitAuthorEmail:     cfg.GitAuthorEmail,
 		KeepWorkDir:        cfg.KeepWorkDir,
 	}
+}
+
+const DefaultJobTimeout = 15 * time.Minute
+
+func resolveJobTimeout(value time.Duration) time.Duration {
+	if value > 0 {
+		return value
+	}
+	return DefaultJobTimeout
 }

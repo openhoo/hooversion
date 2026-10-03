@@ -1,6 +1,7 @@
 package app
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
@@ -57,7 +58,7 @@ func stubGitHubFlow(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	prevMint, prevClient := mintToken, newCheckRunClient
-	mintToken = func(apiURL, appID string, pemKey string, installationID int64, repoIDs []int64) (string, error) {
+	mintToken = func(apiURL, appID string, pemKey string, installationID int64, repoIDs []int64, contexts ...context.Context) (string, error) {
 		return "TESTTOKEN", nil
 	}
 	newCheckRunClient = func(apiURL, token string, trusted []string) (*githubapi.Client, error) {

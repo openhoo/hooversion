@@ -1,0 +1,76 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "SHA256SUMS",
+      "digest": {
+        "sha256": "a6c5840f03610d934927b26f608abf7b6cc963a589149e573419f72bc4a5d981"
+      }
+    },
+    {
+      "name": "hooversion_1.1.2_darwin_amd64.tar.gz",
+      "digest": {
+        "sha256": "43c86fccedac1502f96efebed3f93ff39d5b5a1c7b0a21d7127e625b8da9e2cc"
+      }
+    },
+    {
+      "name": "hooversion_1.1.2_darwin_arm64.tar.gz",
+      "digest": {
+        "sha256": "1fa9c4b6138c55ca152228f38cbc481a7db163d5f471b54a3ba9d5db9f78e003"
+      }
+    },
+    {
+      "name": "hooversion_1.1.2_linux_amd64.tar.gz",
+      "digest": {
+        "sha256": "15ce60056c23d6e9bcf4f21d493ea3c7b60d8961a440121e76545da6ca1338b5"
+      }
+    },
+    {
+      "name": "hooversion_1.1.2_linux_arm64.tar.gz",
+      "digest": {
+        "sha256": "4a052dc7cfd878343186892b7bf4dcc8a8e29d70279ada59e9f311f66ecd893f"
+      }
+    },
+    {
+      "name": "hooversion_1.1.2_windows_amd64.tar.gz",
+      "digest": {
+        "sha256": "93573b7fb95ee4218c8c6fe9642f86a0ac153db38aa9afe2f11eeb660fdc1f93"
+      }
+    },
+    {
+      "name": "hooversion_v1.1.2.spdx.json",
+      "digest": {
+        "sha256": "b64e2d6abf4c25a9882e33f0736d0f2abd47a0e0649a3fb0474ba5755d47a808"
+      }
+    }
+  ],
+  "predicateType": "https://slsa.dev/verification_summary/v1",
+  "predicate": {
+    "verifier": {
+      "id": "https://openhoo.dev/hooversion/verify-release/v1"
+    },
+    "timeVerified": "2026-10-03T18:24:53.734117Z",
+    "resourceUri": "https://github.com/openhoo/hooversion/releases/tag/v1.1.2",
+    "policy": {
+      "uri": "https://openhoo.dev/hooversion/release-verification/v1",
+      "digest": {
+        "sha256": "c8ab02ab191cadd86ad85f0a37f4f1b895bb4ef51de1e03d75332aa2ba111d61"
+      }
+    },
+    "verificationResult": "PASSED",
+    "verifiedLevels": [],
+    "slsaVersion": "1.2",
+    "https://openhoo.dev/hooversion/release-verification/v1": {
+      "repository": "openhoo/hooversion",
+      "tag": "v1.1.2",
+      "tagCommit": "f0a37cca22997993ca6416010b81ca197a3ac580",
+      "releaseId": 391692171,
+      "checksumsAsset": "SHA256SUMS",
+      "checksumSubjects": 6,
+      "signaturesVerified": 0,
+      "attestationsVerified": 0,
+      "sbomsVerified": 1,
+      "archivesWithLicense": 5
+    }
+  }
+}
