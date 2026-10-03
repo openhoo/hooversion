@@ -201,7 +201,7 @@ func TestMintInstallationTokenHTTPErrorExactString(t *testing.T) {
 
 func TestMintInstallationTokenRejectsInvalidResponses(t *testing.T) {
 	_, pemKey := generateTestAppKey(t)
-	for _, body := range []string{`{}`, `{"token":""}`, `{"token":"valid"} {}`, `{"token":"` + strings.Repeat("x", maxJSONBody) + `"}`} {
+	for _, body := range []string{`{}`, `{"token":""}`, `{"token":"valid"} {}`, fmt.Sprintf(`{"token":%q}`, strings.Repeat("x", maxJSONBody))} {
 		t.Run(fmt.Sprintf("bytes-%d", len(body)), func(t *testing.T) {
 			rec := &recorder{handler: func(w http.ResponseWriter, _ *http.Request, _ int) { fmt.Fprint(w, body) }}
 			useTLSRewrite(t, rec)
