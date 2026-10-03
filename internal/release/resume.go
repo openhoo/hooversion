@@ -237,7 +237,7 @@ func inferReleaseTransition(
 	valid := []types.ReleaseType{types.Major, types.Minor, types.Patch}
 	var matched types.ReleaseType
 	for _, releaseType := range valid {
-		if semver.Bump(parent, releaseType).String() == parsed.String() {
+		if bumped, err := semver.CheckedBump(parent, releaseType); err == nil && bumped.String() == parsed.String() {
 			if matched != "" {
 				return "", "", false
 			}
@@ -248,13 +248,6 @@ func inferReleaseTransition(
 		return "", "", false
 	}
 	return parentVersion, matched, true
-}
-
-// isResumableRelease reports whether HEAD is exactly the release commit of a
-// prior partial run: one commit ahead of plan.SourceSha, carrying the exact
-// release message, with every planned tag either absent or pointing at HEAD.
-func isResumableRelease(cwd string, effective *types.ReleasePlan) bool {
-	return isResumableReleaseWithEnv(cwd, effective, nil)
 }
 
 func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) bool {
@@ -282,45 +275,21 @@ func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv
 	return true
 }
 
-// verifySource blocks when the local checkout moved past the planned source
-// or the remote branch drifted from it. The remote lookup is tri-state:
-// ErrNoRemote skips the check, "" means the branch is missing remotely.
-func verifySource(cwd string, effective *types.ReleasePlan) error {
-	return verifySourceWithEnv(cwd, effective, nil)
-}
-
-func verifySourceWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
+// verifyLocalSource protects the immutable planning baseline across hooks.
+func verifyLocalSource(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
 	head, err := git.HeadShaWithEnv(cwd, baseEnv)
 	if err != nil {
 		return err
 	}
 	if head != effective.SourceSha {
 		return errors.New("Release source changed locally: expected %s, found %s.", effective.SourceSha, head)
-	}
-	remote, err := git.RemoteBranchShaWithEnv(cwd, effective.Branch, baseEnv)
-	if err == git.ErrNoRemote {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if remote != effective.SourceSha {
-		found := remote
-		if found == "" {
-			found = "missing"
-		}
-		return errors.New("Release source changed remotely: expected %s, found %s.", effective.SourceSha, found)
 	}
 	return nil
 }
 
 func verifySourceWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth) error {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
-	if err != nil {
+	if err := verifyLocalSource(cwd, effective, baseEnv); err != nil {
 		return err
-	}
-	if head != effective.SourceSha {
-		return errors.New("Release source changed locally: expected %s, found %s.", effective.SourceSha, head)
 	}
 	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth)
 	if err == git.ErrNoRemote {
@@ -335,34 +304,6 @@ func verifySourceWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv [
 			found = "missing"
 		}
 		return errors.New("Release source changed remotely: expected %s, found %s.", effective.SourceSha, found)
-	}
-	return nil
-}
-
-// verifyResumableRemote accepts a remote sitting at either HEAD (fully pushed)
-// or SourceSha (push failed before anything landed); anything else drifts.
-func verifyResumableRemote(cwd string, effective *types.ReleasePlan) error {
-	return verifyResumableRemoteWithEnv(cwd, effective, nil)
-}
-
-func verifyResumableRemoteWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
-	if err != nil {
-		return err
-	}
-	remote, err := git.RemoteBranchShaWithEnv(cwd, effective.Branch, baseEnv)
-	if err == git.ErrNoRemote {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if remote != head && remote != effective.SourceSha {
-		found := remote
-		if found == "" {
-			found = "missing"
-		}
-		return errors.New("Release resume found remote drift: expected %s, found %s.", head, found)
 	}
 	return nil
 }
@@ -400,14 +341,6 @@ func readManifestVersion(cwd string, pkg types.NormalizedPackageConfig) (string,
 	pkg.Manifest = filepath.Join(cwd, pkg.Manifest)
 	_, version, err := manifest.Read(pkg)
 	return version, err
-}
-
-func gitBranchOf(cwd string) string {
-	branch, err := git.CurrentBranch(cwd)
-	if err != nil {
-		return ""
-	}
-	return branch
 }
 
 func gitBranchOfWithEnv(cwd string, baseEnv []string) string {

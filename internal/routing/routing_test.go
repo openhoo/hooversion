@@ -115,3 +115,13 @@ func keys(m map[string][]types.ParsedCommit) []string {
 	}
 	return out
 }
+
+func TestDotDotPrefixedFilenameBelongsToPackage(t *testing.T) {
+	pkg := types.NormalizedPackageConfig{Name: "app", Path: "packages/app"}
+	if !fileBelongsToPackage("packages/app/..data/file.txt", pkg, []types.NormalizedPackageConfig{pkg}) {
+		t.Fatal("in-package dot-prefixed filename lost ownership")
+	}
+	if fileBelongsToPackage("packages/other/file.txt", pkg, []types.NormalizedPackageConfig{pkg}) {
+		t.Fatal("outside file gained ownership")
+	}
+}

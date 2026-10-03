@@ -246,7 +246,11 @@ func buildRelease(
 	if err != nil {
 		return types.PackageRelease{}, err
 	}
-	nextVersion := semver.Bump(parsedVersion, releaseType).String()
+	next, err := semver.CheckedBump(parsedVersion, releaseType)
+	if err != nil {
+		return types.PackageRelease{}, err
+	}
+	nextVersion := next.String()
 	tag := TagFor(config, pkg, nextVersion)
 	notes := changelog.GenerateNotes(nextVersion, time.Now(), commits)
 	return types.PackageRelease{
@@ -312,6 +316,9 @@ func releaseRules(policy *types.CommitPolicy) map[string]types.ReleaseType {
 	}
 	if policy != nil {
 		for key, value := range policy.ReleaseTypes {
+			if value == types.None {
+				value = ""
+			}
 			rules[key] = value
 		}
 	}

@@ -32,6 +32,16 @@ var errUnsupportedStatMetadata = fmt.Errorf("platform does not expose inode meta
 // realpath containment inside the repository root, and dev/ino/size/mtime
 // stability checked before and during the read.
 func (c *Client) UploadAsset(uploadURLTemplate, name, path string) error {
+	root, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	return c.UploadAssetFrom(root, uploadURLTemplate, name, path)
+}
+
+// UploadAssetFrom anchors asset reads to an explicit repository root without
+// changing process-global state. The same path and identity checks apply.
+func (c *Client) UploadAssetFrom(root, uploadURLTemplate, name, path string) error {
 	if err := assertSafeReleaseAssetPath(path); err != nil {
 		return err
 	}
@@ -39,7 +49,7 @@ func (c *Client) UploadAsset(uploadURLTemplate, name, path string) error {
 	if err != nil {
 		return err
 	}
-	data, err := readValidatedReleaseAsset(path)
+	data, err := readValidatedReleaseAssetFrom(root, path)
 	if err != nil {
 		return err
 	}
@@ -225,17 +235,15 @@ func readExactly(f *os.File, size int64, asset string) ([]byte, error) {
 	return data, nil
 }
 
-// readValidatedReleaseAsset mirrors the descriptor-only validated reader of
-// src/github.ts anchored at the process working directory (the CLI's repo
-// root): lexical containment, O_NOFOLLOW open, regular-file + size checks,
-// path-stability before and after the read, exact-length read, and metadata
-// stability across the read plus one final descriptor check immediately
-// before upload.
-func readValidatedReleaseAsset(asset string) ([]byte, error) {
-	wd, err := os.Getwd()
-	if err != nil {
-		return nil, hverr.New("Could not resolve release asset root: .")
+func readValidatedReleaseAssetFrom(wd, asset string) ([]byte, error) {
+	if err := assertSafeReleaseAssetPath(asset); err != nil {
+		return nil, err
 	}
+	absolute, err := filepath.Abs(wd)
+	if err != nil {
+		return nil, err
+	}
+	wd = absolute
 	root, err := resolveAssetRoot(wd)
 	if err != nil {
 		return nil, err

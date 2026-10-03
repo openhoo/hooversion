@@ -211,3 +211,28 @@ func errorsAs(err error, target *(*hverr.ExitError)) bool {
 	}
 	return ok
 }
+
+func TestHTTPRedirectGuards(t *testing.T) {
+	client := guardedHTTPClient(&http.Client{})
+	if client.Timeout <= 0 {
+		t.Fatal("missing default timeout")
+	}
+	first, _ := http.NewRequest(http.MethodPost, "https://api.github.com/releases", nil)
+	redirected, _ := http.NewRequest(http.MethodGet, "https://api.github.com/other", nil)
+	if err := client.CheckRedirect(redirected, []*http.Request{first}); err == nil {
+		t.Fatal("mutation redirect allowed")
+	}
+	first.Method = http.MethodGet
+	redirected.URL.Host = "assets.api.github.com"
+	redirected.Header.Set("Authorization", "Bearer test-token")
+	if err := client.CheckRedirect(redirected, []*http.Request{first}); err != nil {
+		t.Fatal(err)
+	}
+	if redirected.Header.Get("Authorization") != "" {
+		t.Fatal("credential forwarded to another origin")
+	}
+	redirected.URL.Scheme = "http"
+	if err := client.CheckRedirect(redirected, []*http.Request{first}); err == nil {
+		t.Fatal("HTTPS downgrade allowed")
+	}
+}

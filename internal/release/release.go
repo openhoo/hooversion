@@ -11,11 +11,13 @@ import (
 	"strings"
 
 	"github.com/openhoo/hooversion/internal/changelog"
+	"github.com/openhoo/hooversion/internal/envutil"
 	"github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/git"
 	"github.com/openhoo/hooversion/internal/githubapi"
 	"github.com/openhoo/hooversion/internal/manifest"
 	"github.com/openhoo/hooversion/internal/output"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -71,7 +73,7 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 		return Result{Plan: effective}, nil
 	}
 
-	store := output.Store{Cwd: cwd, OutputDir: config.OutputDir}
+	store := output.Store{Cwd: cwd, OutputDir: config.OutputDir, BaseEnv: o.BaseEnv}
 	if err := git.EnsureCleanWorkingTreeWithEnv(cwd, store.Paths(), o.BaseEnv); err != nil {
 		return Result{}, err
 	}
@@ -88,6 +90,9 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 
 	if !resumable {
 		if err := runHooksWithEnv(cwd, config.Hooks.BeforeRelease, o.BaseEnv); err != nil {
+			return Result{}, err
+		}
+		if err := verifyLocalSource(cwd, effective, o.BaseEnv); err != nil {
 			return Result{}, err
 		}
 		releasedVersions := make(map[string]string, len(effective.Releases))
@@ -112,6 +117,9 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 		}
 
 		if err := runHooksWithEnv(cwd, config.Hooks.AfterVersion, o.BaseEnv); err != nil {
+			return Result{}, err
+		}
+		if err := verifyLocalSource(cwd, effective, o.BaseEnv); err != nil {
 			return Result{}, err
 		}
 
@@ -208,6 +216,17 @@ func Validate(cwd string, config *types.NormalizedConfig, plan *types.ReleasePla
 }
 
 func ValidateWithEnv(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, resumable bool, baseEnv []string) error {
+	// Recheck mutable paths even when callers construct normalized config
+	// directly or hooks/output state changed since configuration loading.
+	paths := []string{config.OutputDir, ".release-version"}
+	for _, pkg := range config.Packages {
+		paths = append(paths, pkg.Manifest, pkg.Changelog)
+	}
+	for _, path := range paths {
+		if err := safefs.RequireContainedPath(cwd, path); err != nil {
+			return err
+		}
+	}
 	tagOwners := make(map[string]string, len(plan.Releases))
 	for _, release := range plan.Releases {
 		if previous, exists := tagOwners[release.Tag]; exists {
@@ -270,10 +289,6 @@ func CommitMessage(plan *types.ReleasePlan) string {
 	return fmt.Sprintf("chore(release): %s\n\n%s", strings.Join(summary, ", "), strings.Join(blocks, "\n\n"))
 }
 
-func runHooks(cwd string, hooks []string) error {
-	return runHooksWithEnv(cwd, hooks, nil)
-}
-
 func runHooksWithEnv(cwd string, hooks []string, baseEnv []string) error {
 	for _, hook := range hooks {
 		result, err := runShellWithEnv(hook, cwd, baseEnv)
@@ -299,21 +314,8 @@ type shellResult struct {
 	stderr string
 }
 
-func runShell(command, cwd string) (shellResult, error) {
-	return runShellWithEnv(command, cwd, nil)
-}
-
 func runShellWithEnv(command, cwd string, baseEnv []string) (shellResult, error) {
-	interpreter := os.Getenv("SHELL")
-	if baseEnv != nil {
-		interpreter = ""
-		for _, entry := range baseEnv {
-			if strings.HasPrefix(entry, "SHELL=") {
-				interpreter = strings.TrimPrefix(entry, "SHELL=")
-				break
-			}
-		}
-	}
+	interpreter := envutil.Get(baseEnv, "SHELL")
 	if interpreter == "" {
 		interpreter = "/bin/sh"
 	}
@@ -372,10 +374,10 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 
 	token := tokenOption
 	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+		token = envutil.Get(baseEnv, "GITHUB_TOKEN")
 	}
 	if token == "" {
-		token = os.Getenv("GH_TOKEN")
+		token = envutil.Get(baseEnv, "GH_TOKEN")
 	}
 	if token == "" {
 		return errors.New("GITHUB_TOKEN or GH_TOKEN is required to create GitHub releases.")
@@ -392,17 +394,6 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 	if repository == "" {
 		return errors.New("Could not determine GitHub repository. Set github.repository in hooversion config.")
 	}
-
-	// The landed asset reader resolves upload paths against the process CWD;
-	// scope it to the repository for the duration of publishing.
-	originalWd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	if err := os.Chdir(cwd); err != nil {
-		return err
-	}
-	defer func() { _ = os.Chdir(originalWd) }()
 
 	client := newGitHubClient(config.GitHub.ApiUrl, token)
 	for _, release := range plan.Releases {
@@ -452,9 +443,8 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 			}
 		}
 		for _, name := range order {
-			// The process CWD is the repository here; upload.go re-roots
-			// uploads at Getwd(), so pass the raw repo-relative asset.
-			if err := client.UploadAsset(response.UploadURL, name, missing[name]); err != nil {
+			// Keep the upload rooted at this checkout without a global chdir.
+			if err := client.UploadAssetFrom(cwd, response.UploadURL, name, missing[name]); err != nil {
 				return err
 			}
 		}

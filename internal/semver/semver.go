@@ -31,11 +31,9 @@ func (v SemVer) String() string {
 	return s
 }
 
-// versionPattern accepts the same inputs as src/semver.ts while additionally
-// capturing the prerelease and build fragments. The optional groups mirror
-// the single non-capturing (?:[-+].*)? suffix: "-", "-pre", "+build" and
-// "-pre+build" are all accepted; anything else is rejected.
-var versionPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:-([^+]*))?(?:\+(.*))?$`)
+// Prerelease and build identifiers follow SemVer syntax. Core leading zeros
+// remain accepted for compatibility with the original implementation.
+var versionPattern = regexp.MustCompile(`^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$`)
 
 // Parse parses a semantic version. Leading and trailing whitespace around the
 // version is tolerated (the error message reports the original input).
@@ -44,12 +42,24 @@ func Parse(s string) (SemVer, error) {
 	if m == nil {
 		return SemVer{}, errors.New("Invalid semantic version: %s", s)
 	}
-	// Digit runs beyond int range cannot occur in practice; strconv.Atoi
-	// saturates and reports ErrRange, which we deliberately ignore like
-	// JavaScript's Number() coercion.
-	major, _ := strconv.Atoi(m[1])
-	minor, _ := strconv.Atoi(m[2])
-	patch, _ := strconv.Atoi(m[3])
+	for _, identifier := range strings.Split(m[4], ".") {
+		numeric := true
+		for _, char := range identifier {
+			if char < '0' || char > '9' {
+				numeric = false
+				break
+			}
+		}
+		if numeric && len(identifier) > 1 && identifier[0] == '0' {
+			return SemVer{}, errors.New("Invalid semantic version: %s", s)
+		}
+	}
+	major, errMajor := strconv.Atoi(m[1])
+	minor, errMinor := strconv.Atoi(m[2])
+	patch, errPatch := strconv.Atoi(m[3])
+	if errMajor != nil || errMinor != nil || errPatch != nil {
+		return SemVer{}, errors.New("Semantic version component exceeds integer range: %s", s)
+	}
 	return SemVer{Major: major, Minor: minor, Patch: patch, Pre: m[4], Build: m[5]}, nil
 }
 
@@ -94,4 +104,19 @@ func Min(current, minimum types.ReleaseType) types.ReleaseType {
 		return h
 	}
 	return minimum
+}
+
+// CheckedBump prevents a release plan from wrapping a component below zero.
+func CheckedBump(v SemVer, t types.ReleaseType) (SemVer, error) {
+	if v.Major < 0 || v.Minor < 0 || v.Patch < 0 {
+		return SemVer{}, errors.New("Invalid semantic version: %s", v.String())
+	}
+	if t != types.Major && t != types.Minor && t != types.Patch {
+		return SemVer{}, errors.New("Invalid release type: %s", t)
+	}
+	next := Bump(v, t)
+	if next.Major < 0 || next.Minor < 0 || next.Patch < 0 {
+		return SemVer{}, errors.New("Semantic version bump exceeds integer range: %s", v.String())
+	}
+	return next, nil
 }

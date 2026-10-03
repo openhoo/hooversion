@@ -3,6 +3,7 @@ package release
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -78,10 +79,6 @@ func writeFile(t *testing.T, path, content string) {
 
 func nodePkg(name, path, manifest string) types.NormalizedPackageConfig {
 	return types.NormalizedPackageConfig{Name: name, Path: path, Type: types.PackageNode, Manifest: manifest, Changelog: "CHANGELOG.md"}
-}
-
-type releaseTestConfig struct {
-	config *types.NormalizedConfig
 }
 
 func singleAppConfig(push bool) *types.NormalizedConfig {
@@ -877,5 +874,71 @@ func assertMissing(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("%s still exists: %v", path, err)
+	}
+}
+
+func TestPublishDoesNotChangeProcessWorkingDirectory(t *testing.T) {
+	cwd := t.TempDir()
+	original, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := singleAppConfig(false)
+	cfg.GitHub = types.GitHubSettings{Enabled: true, Releases: true, Repository: "owner/repo", ApiUrl: "https://api.github.com"}
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		observed, _ := os.Getwd()
+		if observed != original {
+			t.Errorf("publication changed process cwd to %s", observed)
+		}
+		if r.Method == http.MethodGet {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		fmt.Fprint(w, `{"upload_url":"https://uploads.github.com/assets{?name,label}"}`)
+	}))
+	defer srv.Close()
+	old := newGitHubClient
+	newGitHubClient = func(base, token string) *githubapi.Client {
+		c := githubapi.New(base, token)
+		target, _ := url.Parse(srv.URL)
+		c.HTTP = &http.Client{Transport: rewriteTransport{target: target, base: srv.Client().Transport}}
+		return c
+	}
+	defer func() { newGitHubClient = old }()
+	p := &types.ReleasePlan{Releases: []types.PackageRelease{{Package: types.NormalizedPackageConfig{Name: "app"}, Tag: "v1.0.1", NextVersion: "1.0.1"}}}
+	if err := publishGitHubReleases(cwd, cfg, p, "test-token"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestHooksCannotChangePlannedSourceCommit(t *testing.T) {
+	for _, stage := range []string{"beforeRelease", "afterVersion"} {
+		t.Run(stage, func(t *testing.T) {
+			cwd := seedAppRepo(t)
+			cfg := singleAppConfig(false)
+			p, err := CreatePlanForTest(cwd, cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stage == "beforeRelease" {
+				cfg.Hooks.BeforeRelease = []string{"git reset --hard HEAD^"}
+			} else {
+				cfg.Hooks.AfterVersion = []string{"git commit --allow-empty -m 'chore: unexpected hook commit'"}
+			}
+			_, err = Execute(cwd, cfg, p, Options{NoPushSet: true, NoGitHubSet: true})
+			if err == nil || !strings.Contains(err.Error(), "Release source changed locally") {
+				t.Fatalf("hook source drift accepted: %v", err)
+			}
+			exists, err := git.TagExists(cwd, "v1.0.1")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if exists {
+				t.Fatal("source-changing hook produced release tag")
+			}
+			if stage == "beforeRelease" && appManifestVersion(t, cwd) != "1.0.0" {
+				t.Fatal("version changed after beforeRelease source drift")
+			}
+		})
 	}
 }

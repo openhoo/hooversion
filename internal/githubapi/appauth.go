@@ -22,7 +22,7 @@ import (
 const versionhooAppUserAgent = "versionhoo-app"
 
 // installationHTTPClient is a test seam; production uses http.DefaultClient.
-var installationHTTPClient = http.DefaultClient
+var installationHTTPClient = defaultHTTPClient
 
 // MintInstallationToken exchanges a GitHub App JWT for an installation access
 // token scoped to repositoryIDs. The api URL must be an absolute https URL
@@ -61,20 +61,26 @@ func MintInstallationToken(apiURL, appID, privateKeyPEM string, installationID i
 	req.Header.Set("User-Agent", versionhooAppUserAgent)
 	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
 
-	resp, err := installationHTTPClient.Do(req)
+	resp, err := guardedHTTPClient(installationHTTPClient).Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+		if len(body) > maxErrorBody {
+			body = append(body[:maxErrorBody], []byte("...[truncated]")...)
+		}
 		return "", hverr.New("GitHub App installation token request failed (%d %s): %s", resp.StatusCode, http.StatusText(resp.StatusCode), body)
 	}
 	var decoded struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := decodeJSONBody(resp, &decoded); err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(decoded.Token) == "" {
+		return "", hverr.New("GitHub App installation token response contains no token")
 	}
 	return decoded.Token, nil
 }

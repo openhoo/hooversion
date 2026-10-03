@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	hverr "github.com/openhoo/hooversion/internal/errors"
 )
@@ -70,9 +71,9 @@ func (c *Client) newRequest(method, rawURL, contentType string, body io.Reader) 
 func (c *Client) do(req *http.Request, notFoundIsEmpty bool) (*http.Response, error) {
 	client := c.HTTP
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultHTTPClient
 	}
-	resp, err := client.Do(req)
+	resp, err := guardedHTTPClient(client).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +94,7 @@ func (c *Client) do(req *http.Request, notFoundIsEmpty bool) (*http.Response, er
 // drainAndClose discards a fully consumed JSON body so the connection can be
 // reused.
 func drainAndClose(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxJSONBody+1))
 	_ = resp.Body.Close()
 }
 
@@ -143,4 +144,38 @@ func encodeURIComponent(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// Requests have a finite lifetime so a stalled API cannot hold the App queue
+// indefinitely. Explicit test/operator clients keep their configured timeout.
+var defaultHTTPClient = http.DefaultClient
+
+// Do not replay authenticated mutations through redirects. Asset downloads
+// may redirect, but credentials must never leave the exact original origin.
+func guardedHTTPClient(client *http.Client) *http.Client {
+	copy := *client
+	if copy.Timeout == 0 {
+		copy.Timeout = 2 * time.Minute
+	}
+	previous := copy.CheckRedirect
+	copy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many GitHub API redirects")
+		}
+		first := via[0]
+		if first.Method != http.MethodGet && first.Method != http.MethodHead {
+			return fmt.Errorf("GitHub API mutation redirected")
+		}
+		if req.URL.Scheme != first.URL.Scheme || !strings.EqualFold(req.URL.Host, first.URL.Host) {
+			req.Header.Del("Authorization")
+		}
+		if first.URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("GitHub API redirect downgraded HTTPS")
+		}
+		if previous != nil {
+			return previous(req, via)
+		}
+		return nil
+	}
+	return &copy
 }
