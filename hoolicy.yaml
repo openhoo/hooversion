@@ -62,6 +62,8 @@ rules:
       - 'coverage/**'
       - 'dist/**'
       - 'gitleaks-report.json'
+      # In-toto evidence contains repository identities, not build image inputs.
+      - 'docs/review-evidence/*.json'
       - 'node_modules/**'
       - 'target/**'
     spec:
