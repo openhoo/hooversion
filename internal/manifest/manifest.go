@@ -892,9 +892,12 @@ func updateCargoLock(cwd string, released map[string]string) error {
 	if !info.Mode().IsRegular() {
 		return hverrors.New("%s must be a regular file", path)
 	}
-	raw, err := io.ReadAll(f)
+	raw, err := io.ReadAll(io.LimitReader(f, maxManifestBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(raw) > maxManifestBytes {
+		return hverrors.New("%s exceeds %d bytes", path, maxManifestBytes)
 	}
 	lines := splitLines(string(raw))
 	var starts []int
@@ -960,6 +963,10 @@ func updateCargoLock(cwd string, released map[string]string) error {
 	}
 
 	if changed {
+		// Windows requires the inspected destination handle closed before replace.
+		if err := f.Close(); err != nil {
+			return err
+		}
 		return safefs.WriteFileAtomic(path, []byte(strings.Join(lines, "\n")), info.Mode().Perm())
 	}
 	return nil

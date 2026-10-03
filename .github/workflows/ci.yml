@@ -10,6 +10,11 @@ on:
 permissions:
   contents: read
 
+# Superseded pull-request runs share a group; pushes keep their own SHA.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   commitlint:
     name: Lint commits
