@@ -149,6 +149,16 @@ read timeout, 30-second write timeout, 60-second idle timeout, and a 64 KiB
 maximum header size. If a reverse proxy is used, configure its request and
 upstream timeouts no longer than these bounds.
 
+The standalone App binary supports `versionhoo-app --version` and `--help`
+without credentials or a listener. Normal server startup accepts configuration
+through the documented environment variables.
+
+GitHub API calls have a two-minute default timeout. Explicit clients with a
+nonzero timeout retain it. Token responses and API error bodies are bounded;
+missing tokens and trailing response documents are rejected. Authenticated
+mutations refuse redirects. Download redirects strip credentials whenever the
+origin changes and refuse HTTPS downgrades.
+
 ## Release Flow
 
 1. Repository CI completes successfully on a configured release branch.

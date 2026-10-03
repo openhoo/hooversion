@@ -98,3 +98,12 @@ external:
 Hoolicy's `sha256` field pins the VSA bytes. A VSA with
 `verificationResult: FAILED`, a wrong producer, stale timestamp, missing subject,
 or changed file digest fails closed.
+
+## Archive inspection
+
+`--require-license` requires a nonempty regular `LICENSE` entry in every
+supported archive. Inspection continues through the complete archive after
+finding the license. It rejects traversal, absolute Unix/Windows paths, unsafe
+tar link targets, too many entries, excessive uncompressed data, truncated
+content, and gzip/ZIP checksum failures. A ZIP symlink called `LICENSE` does
+not satisfy the policy. These checks inspect archives without extracting them.
