@@ -1,5 +1,11 @@
 # @openhoo/hooversion Changelog
 
+## 1.1.3 (2026-10-03)
+
+### Bug Fixes
+
+- harden release integrity and cross-platform reliability (#46) (ebb57fb)
+
 ## 1.1.2 (2026-09-18)
 
 ### Bug Fixes

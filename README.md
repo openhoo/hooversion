@@ -26,7 +26,7 @@ hooversion app
 Install with Go:
 
 ```sh
-go install github.com/openhoo/hooversion/cmd/hooversion@v1.1.2
+go install github.com/openhoo/hooversion/cmd/hooversion@v1.1.3
 ```
 
 Or download the `hooversion` prebuilt static binary from the
@@ -265,7 +265,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' && !startsWith(github.event.workflow_run.head_commit.message, 'chore(release):'))
         uses: openhoo/hooversion/actions/prepare-release@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
         with:
-          version: 1.1.2
+          version: 1.1.3
           install-command: bun install --frozen-lockfile
           github-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Finalize protected-branch release
@@ -273,7 +273,7 @@ jobs:
         if: github.event_name == 'workflow_run' && startsWith(github.event.workflow_run.head_commit.message, 'chore(release):')
         uses: openhoo/hooversion/actions/release@ac503b23b9b36ebbf39ee6103713c81f1f18b64d # v1.1.1
         with:
-          version: 1.1.2
+          version: 1.1.3
           install-command: bun install --frozen-lockfile
           github-token: ${{ secrets.GITHUB_TOKEN }}
 ```
@@ -307,7 +307,7 @@ The `versionhoo-app` executable name is reserved for the app's Go and
 container routes:
 
 ```sh
-go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.2
+go install github.com/openhoo/hooversion/cmd/versionhoo-app@v1.1.3
 go build -o bin/versionhoo-app ./cmd/versionhoo-app
 ```
 
