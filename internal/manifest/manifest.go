@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -23,10 +22,12 @@ import (
 	"github.com/openhoo/hooversion/internal/types"
 )
 
+const maxManifestBytes = 16 << 20
+
 // Read returns the package name and current version from the package
 // manifest (mirrors readManifest).
 func Read(pkg types.NormalizedPackageConfig) (string, string, error) {
-	data, err := os.ReadFile(pkg.Manifest)
+	data, err := safefs.ReadRegularFile(pkg.Manifest, maxManifestBytes)
 	if err != nil {
 		return "", "", err
 	}
@@ -55,7 +56,7 @@ func UpdateVersion(pkg types.NormalizedPackageConfig, next string) error {
 	path := pkg.Manifest
 	switch pkg.Type {
 	case types.PackageNode:
-		data, err := os.ReadFile(path)
+		data, err := safefs.ReadRegularFile(path, maxManifestBytes)
 		if err != nil {
 			return err
 		}
@@ -64,9 +65,9 @@ func UpdateVersion(pkg types.NormalizedPackageConfig, next string) error {
 			return err
 		}
 		root.set("version", next)
-		return os.WriteFile(path, marshalOrderedJSON(root), 0o644)
+		return safefs.WriteFileAtomic(path, marshalOrderedJSON(root), 0o644)
 	case types.PackageVersionFile:
-		return os.WriteFile(path, []byte(next+"\n"), 0o644)
+		return safefs.WriteFileAtomic(path, []byte(next+"\n"), 0o644)
 	}
 	section := "project"
 	if pkg.Type == types.PackageRust {
@@ -140,6 +141,10 @@ func decodeOrderedJSON(data []byte) (*jsonObject, error) {
 	root, err := decodeJSONValue(dec)
 	if err != nil {
 		return nil, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("manifest must contain exactly one JSON value")
 	}
 	obj, ok := root.(*jsonObject)
 	if !ok {
@@ -416,7 +421,7 @@ func rewriteNodeRequirement(current, version, path, name string) (string, error)
 }
 
 func updateNodeLocalDependencies(path string, owner types.NormalizedPackageConfig, released map[string]string) error {
-	data, err := os.ReadFile(path)
+	data, err := safefs.ReadRegularFile(path, maxManifestBytes)
 	if err != nil {
 		return err
 	}
@@ -461,7 +466,7 @@ func updateNodeLocalDependencies(path string, owner types.NormalizedPackageConfi
 		return err
 	}
 	if changed {
-		return os.WriteFile(path, marshalOrderedJSON(root), 0o644)
+		return safefs.WriteFileAtomic(path, marshalOrderedJSON(root), 0o644)
 	}
 	return nil
 }
@@ -544,7 +549,7 @@ func rewritePythonConstraint(current, version, path, name string) (string, error
 }
 
 func updatePythonLocalDependencies(path string, owner types.NormalizedPackageConfig, released map[string]string) error {
-	data, err := os.ReadFile(path)
+	data, err := safefs.ReadRegularFile(path, maxManifestBytes)
 	if err != nil {
 		return err
 	}
@@ -633,7 +638,7 @@ func updatePythonLocalDependencies(path string, owner types.NormalizedPackageCon
 		return err
 	}
 	if changed {
-		return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+		return safefs.WriteFileAtomic(path, []byte(strings.Join(lines, "\n")), 0o644)
 	}
 	return nil
 }
@@ -708,7 +713,7 @@ func braceDelta(value string) int {
 }
 
 func updateRustDependencyTables(path string, owner *types.NormalizedPackageConfig, released map[string]string, workspaceOnly bool) error {
-	data, err := os.ReadFile(path)
+	data, err := safefs.ReadRegularFile(path, maxManifestBytes)
 	if err != nil {
 		return err
 	}
@@ -828,7 +833,7 @@ func updateRustDependencyTables(path string, owner *types.NormalizedPackageConfi
 		}
 	}
 	if changed {
-		return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+		return safefs.WriteFileAtomic(path, []byte(strings.Join(lines, "\n")), 0o644)
 	}
 	return nil
 }
@@ -955,34 +960,7 @@ func updateCargoLock(cwd string, released map[string]string) error {
 	}
 
 	if changed {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		if err := f.Truncate(0); err != nil {
-			return err
-		}
-		if err := writeFileDescriptor(f, strings.Join(lines, "\n")); err != nil {
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeFileDescriptor(f *os.File, content string) error {
-	data := []byte(content)
-	offset := 0
-	for offset < len(data) {
-		written, err := f.Write(data[offset:])
-		if written <= 0 {
-			return hverrors.New("Failed to write Cargo.lock")
-		}
-		if err != nil {
-			return err
-		}
-		offset += written
+		return safefs.WriteFileAtomic(path, []byte(strings.Join(lines, "\n")), info.Mode().Perm())
 	}
 	return nil
 }
@@ -991,14 +969,6 @@ func writeFileDescriptor(f *os.File, content string) error {
 
 func escapeRegExp(value string) string {
 	return regexp.QuoteMeta(value)
-}
-
-func readPackageJSON(path string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	return readPackageJSONData(path, data)
 }
 
 func readPackageJSONData(path string, data []byte) (string, string, error) {
@@ -1016,14 +986,6 @@ func readPackageJSONData(path string, data []byte) (string, string, error) {
 	return name, version, nil
 }
 
-func readTomlPackage(path, sectionName string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	return readTomlPackageData(path, string(data), sectionName)
-}
-
 func readTomlPackageData(path, text, sectionName string) (string, string, error) {
 	section := getTomlSection(text, sectionName)
 	name, _ := readTomlString(section, "name")
@@ -1032,14 +994,6 @@ func readTomlPackageData(path, text, sectionName string) (string, string, error)
 		return "", "", hverrors.New("%s [%s] must contain name and version", path, sectionName)
 	}
 	return name, version, nil
-}
-
-func readVersionFile(path, name string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	return readVersionFileData(path, name, data)
 }
 
 func readVersionFileData(path, name string, data []byte) (string, string, error) {
@@ -1083,7 +1037,7 @@ func readTomlString(section, key string) (string, bool) {
 }
 
 func updateTomlSectionVersion(path, sectionName, version string) error {
-	data, err := os.ReadFile(path)
+	data, err := safefs.ReadRegularFile(path, maxManifestBytes)
 	if err != nil {
 		return err
 	}
@@ -1106,5 +1060,5 @@ func updateTomlSectionVersion(path, sectionName, version string) error {
 	if !updated {
 		return hverrors.New("%s [%s] does not contain a version field", path, sectionName)
 	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
+	return safefs.WriteFileAtomic(path, []byte(strings.Join(lines, "\n")), 0o644)
 }

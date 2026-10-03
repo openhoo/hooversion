@@ -664,3 +664,93 @@ func TestMigrateFromTSConvertsJSONToNormalizedYAML(t *testing.T) {
 		t.Fatalf("reload = %+v", reloaded)
 	}
 }
+
+func TestLoadRejectsUnknownFieldsAndMultipleDocuments(t *testing.T) {
+	cwd := t.TempDir()
+	writeJSON(t, cwd, "package.json", "app")
+	cases := map[string][]string{
+		"hooversion.yaml": {"packages:\n  - type: node\n    assetsTypo: []\n", "packages:\n  - type: node\npuhs: false\n", "packages:\n  - type: node\n---\npush: false\n"},
+		"hooversion.json": {`{"packages":[{"type":"node","assetsTypo":[]}]}`, `{"packages":[{"type":"node"}],"puhs":false}`, `{"packages":[{"type":"node"}]} {"push":false}`},
+	}
+	for name, documents := range cases {
+		for _, document := range documents {
+			if err := os.WriteFile(filepath.Join(cwd, name), []byte(document), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(cwd, name); err == nil {
+				t.Errorf("accepted %s: %s", name, document)
+			}
+		}
+	}
+}
+
+func TestNormalizeRejectsUnsafeReleaseContracts(t *testing.T) {
+	cwd := t.TempDir()
+	writeJSON(t, cwd, "package.json", "app")
+	if err := os.WriteFile(filepath.Join(cwd, "pyproject.toml"), []byte("[project]\nname='app'\nversion='1.0.0'\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*types.Config)
+	}{
+		{"unknown type", func(c *types.Config) { c.Packages[0].Type = "pyhton"; c.Packages[0].Manifest = "pyproject.toml" }},
+		{"constant tag", func(c *types.Config) { c.TagFormat = "release" }},
+		{"unknown placeholder", func(c *types.Config) { c.TagFormat = "${channel}/v${version}" }},
+		{"repeated version", func(c *types.Config) { c.TagFormat = "v${version}-${version}" }},
+		{"root output", func(c *types.Config) { c.OutputDir = "." }},
+		{"git output", func(c *types.Config) { c.OutputDir = ".git/generated" }},
+		{"manifest changelog collision", func(c *types.Config) { c.Packages[0].Changelog = "package.json" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			c := &types.Config{Packages: []types.PackageConfig{{Type: types.PackageNode}}}
+			test.mutate(c)
+			if _, err := Normalize(cwd, c); err == nil {
+				t.Fatal("unsafe configuration accepted")
+			}
+		})
+	}
+}
+
+func TestMigrateLegacyGitHubFalseRoundTrips(t *testing.T) {
+	oldLook, oldRun := bunLookPath, bunRun
+	defer func() { bunLookPath, bunRun = oldLook, oldRun }()
+	bunLookPath = func(string) (string, error) { return "bun", nil }
+	bunRun = func(string, string, []string) ([]byte, error) {
+		return []byte(`{"packages":[{"name":"app","type":"node"}],"github":false}`), nil
+	}
+	cwd := t.TempDir()
+	writeJSON(t, cwd, "package.json", "app")
+	cfg, path, err := MigrateFromTS(cwd, "hooversion.config.ts")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.GitHub.Enabled {
+		t.Fatal("migration enabled GitHub")
+	}
+	reloaded, err := Load(cwd, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.GitHub.Enabled {
+		t.Fatal("saved config enabled GitHub")
+	}
+}
+
+func TestAssetContractsAreValidatedBeforeRelease(t *testing.T) {
+	cwd := t.TempDir()
+	writeJSON(t, cwd, "package.json", "app")
+	for _, assets := range [][]string{{"../outside"}, {"/outside"}, {"dist/one/file.zip", "dist/two/file.zip"}, {""}} {
+		if _, err := Normalize(cwd, &types.Config{Packages: []types.PackageConfig{{Type: types.PackageNode, Assets: assets}}}); err == nil {
+			t.Errorf("accepted unsafe asset set %q", assets)
+		}
+	}
+	cfg, err := Normalize(cwd, &types.Config{Packages: []types.PackageConfig{{Type: types.PackageNode, Assets: []string{"dist/generated.tar.gz"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Packages[0].Assets) != 1 {
+		t.Fatal("missing generated asset contract")
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/openhoo/hooversion/internal/envutil"
 	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
@@ -27,7 +28,10 @@ type ManagedPaths map[string]bool
 type Store struct {
 	Cwd       string
 	OutputDir string
+	BaseEnv   []string // nil inherits; explicit environments isolate GitHub Actions outputs
 }
+
+const maxStalePayloadBytes = 1 << 20
 
 type stalePayload struct {
 	Releases []struct {
@@ -50,6 +54,9 @@ func (s Store) Paths() ManagedPaths {
 		paths[dir] = true
 	}
 
+	if err := safefs.RequireContainedPath(s.Cwd, s.OutputDir); err != nil {
+		return paths
+	}
 	payload, ok := readStalePayload(outputsPath)
 	if !ok {
 		return paths
@@ -166,27 +173,12 @@ func hasSymlinkParent(root, candidate string) bool {
 // readStalePayload parses outputs.json without following a symlink planted at
 // the path; any failure means the stale output cannot identify note paths.
 func readStalePayload(path string) (stalePayload, bool) {
-	file, err := safefs.OpenReadNoFollow(path)
+	data, err := safefs.ReadRegularFile(path, maxStalePayloadBytes)
 	if err != nil {
 		return stalePayload{}, false
 	}
-	defer file.Close()
-
 	var payload stalePayload
-	info, err := file.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return payload, false
-	}
-	data := make([]byte, info.Size())
-	read := 0
-	for read < len(data) {
-		n, err := file.Read(data[read:])
-		read += n
-		if err != nil {
-			break
-		}
-	}
-	if err := json.Unmarshal(data[:read], &payload); err != nil {
+	if err := json.Unmarshal(data, &payload); err != nil {
 		return stalePayload{}, false
 	}
 	return payload, true
@@ -197,6 +189,9 @@ func readStalePayload(path string) (stalePayload, bool) {
 // The advisory stale-payload parse never follows symlinks, so a symlinked
 // outputs.json is unlinked itself and its target survives.
 func (s Store) Clear() error {
+	if err := safefs.RequireContainedPath(s.Cwd, s.OutputDir); err != nil {
+		return err
+	}
 	for path, dirScope := range s.Paths() {
 		if dirScope {
 			continue
@@ -256,7 +251,7 @@ func (s Store) Write(releases []types.PackageRelease, published bool) error {
 	stored := make([]storedRelease, 0, len(releases))
 	for i, release := range releases {
 		noteName := noteNames[i]
-		if err := os.WriteFile(filepath.Join(dir, noteName), []byte(release.Notes+"\n"), 0o644); err != nil {
+		if err := safefs.WriteFileAtomic(filepath.Join(dir, noteName), []byte(release.Notes+"\n"), 0o644); err != nil {
 			return err
 		}
 		stored = append(stored, storedRelease{
@@ -273,20 +268,20 @@ func (s Store) Write(releases []types.PackageRelease, published bool) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dir, "outputs.json"), data, 0o644); err != nil {
+	if err := safefs.WriteFileAtomic(filepath.Join(dir, "outputs.json"), data, 0o644); err != nil {
 		return err
 	}
 
 	versionPath := filepath.Join(s.Cwd, ".release-version")
 	if len(releases) == 1 {
-		if err := os.WriteFile(versionPath, []byte(releases[0].NextVersion+"\n"), 0o644); err != nil {
+		if err := safefs.WriteFileAtomic(versionPath, []byte(releases[0].NextVersion+"\n"), 0o644); err != nil {
 			return err
 		}
 	} else if err := removeIfExists(versionPath); err != nil {
 		return err
 	}
 
-	if githubOutput := os.Getenv("GITHUB_OUTPUT"); githubOutput != "" {
+	if githubOutput := envutil.Get(s.BaseEnv, "GITHUB_OUTPUT"); githubOutput != "" {
 		lines := []string{
 			fmt.Sprintf("published=%t", payloadPublished),
 			"releases_json=" + marshalJSONCompact(stored),

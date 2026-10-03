@@ -5,8 +5,10 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/git"
 	"github.com/openhoo/hooversion/internal/manifest"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 	"gopkg.in/yaml.v3"
 )
@@ -85,7 +88,10 @@ func FindPath(cwd string) (string, error) {
 func Load(cwd, explicitPath string) (*types.NormalizedConfig, error) {
 	configPath := ""
 	if explicitPath != "" {
-		configPath = filepath.Join(cwd, explicitPath)
+		configPath = explicitPath
+		if !filepath.IsAbs(configPath) {
+			configPath = filepath.Join(cwd, configPath)
+		}
 	} else {
 		found, err := FindPath(cwd)
 		if err != nil {
@@ -97,7 +103,7 @@ func Load(cwd, explicitPath string) (*types.NormalizedConfig, error) {
 		configPath = found
 	}
 
-	data, err := os.ReadFile(configPath)
+	data, err := safefs.ReadRegularFile(configPath, 1<<20)
 	if err != nil {
 		return nil, err
 	}
@@ -105,12 +111,24 @@ func Load(cwd, explicitPath string) (*types.NormalizedConfig, error) {
 	var raw types.Config
 	switch ext := filepath.Ext(configPath); ext {
 	case ".json":
-		if err := json.Unmarshal(data, &raw); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(data))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&raw); err != nil {
 			return nil, errors.New("Failed to parse config %s: %v", configPath, err)
 		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil, errors.New("Config %s must contain exactly one JSON document", configPath)
+		}
 	case ".yaml", ".yml":
-		if err := yaml.Unmarshal(data, &raw); err != nil {
+		decoder := yaml.NewDecoder(bytes.NewReader(data))
+		decoder.KnownFields(true)
+		if err := decoder.Decode(&raw); err != nil {
 			return nil, errors.New("Failed to parse config %s: %v", configPath, err)
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil, errors.New("Config %s must contain exactly one YAML document", configPath)
 		}
 	default:
 		return nil, errors.New("Unsupported config file type: %s", configPath)
@@ -222,6 +240,12 @@ func Normalize(cwd string, raw *types.Config) (*types.NormalizedConfig, error) {
 	if normalized.OutputDir == "" {
 		normalized.OutputDir = defaultOutputDir
 	}
+	if err := safefs.RequireContainedPath(cwd, normalized.OutputDir); err != nil {
+		return nil, err
+	}
+	if err := validateManagedPaths(normalized); err != nil {
+		return nil, err
+	}
 	return normalized, nil
 }
 
@@ -247,6 +271,11 @@ func resolveGitHub(raw *types.GitHubConfig) types.GitHubSettings {
 }
 
 func normalizePackage(cwd string, pkg types.PackageConfig) (types.NormalizedPackageConfig, error) {
+	switch pkg.Type {
+	case types.PackageNode, types.PackageRust, types.PackagePython, types.PackageVersionFile:
+	default:
+		return types.NormalizedPackageConfig{}, errors.New("Unsupported package type: %q", pkg.Type)
+	}
 	packagePath, err := normalizeRelative(pkg.Path)
 	if err != nil {
 		return types.NormalizedPackageConfig{}, err
@@ -269,6 +298,12 @@ func normalizePackage(cwd string, pkg types.PackageConfig) (types.NormalizedPack
 		return types.NormalizedPackageConfig{}, err
 	}
 
+	if err := safefs.RequireContainedPath(cwd, manifestRel); err != nil {
+		return types.NormalizedPackageConfig{}, err
+	}
+	if err := safefs.RequireContainedPath(cwd, changelog); err != nil {
+		return types.NormalizedPackageConfig{}, err
+	}
 	// internal/manifest.Read receives an absolute manifest path because its
 	// locked signature has no cwd parameter; the returned config keeps the
 	// cwd-relative form (agreed convention with the manifest package owner).
@@ -291,6 +326,9 @@ func normalizePackage(cwd string, pkg types.PackageConfig) (types.NormalizedPack
 		name = strings.TrimSpace(infoName)
 	}
 
+	if name == "" || strings.ContainsAny(name, " ,\t\r\n\x00") {
+		return types.NormalizedPackageConfig{}, errors.New("Invalid package name: %q", name)
+	}
 	scopes := []string{name}
 	seenScopes := map[string]bool{name: true}
 	for _, scope := range pkg.Scopes {
@@ -299,6 +337,24 @@ func normalizePackage(cwd string, pkg types.PackageConfig) (types.NormalizedPack
 		}
 		seenScopes[scope] = true
 		scopes = append(scopes, scope)
+	}
+
+	assets := make([]string, 0, len(pkg.Assets))
+	assetNames := map[string]bool{}
+	for _, asset := range pkg.Assets {
+		normalized, err := normalizeRelative(asset)
+		if err != nil {
+			return types.NormalizedPackageConfig{}, err
+		}
+		if normalized == "." {
+			return types.NormalizedPackageConfig{}, errors.New("Release asset must name a repository-relative file: %q", asset)
+		}
+		base := pathpkg.Base(normalized)
+		if assetNames[base] {
+			return types.NormalizedPackageConfig{}, errors.New("Package %s has duplicate release asset name: %s", name, base)
+		}
+		assetNames[base] = true
+		assets = append(assets, normalized)
 	}
 
 	dependencies := make([]string, 0, len(pkg.Dependencies))
@@ -314,7 +370,7 @@ func normalizePackage(cwd string, pkg types.PackageConfig) (types.NormalizedPack
 		Changelog:    changelog,
 		Scopes:       scopes,
 		Dependencies: dependencies,
-		Assets:       orEmptySlice(pkg.Assets),
+		Assets:       assets,
 	}, nil
 }
 
@@ -372,6 +428,13 @@ func assertAcyclicPackageGraph(packages []types.NormalizedPackageConfig, graph m
 // assertValidTagFormat substitutes ${name} per package and ${version} with
 // 0.0.0, then validates the candidate through assertValidGitRef semantics.
 func assertValidTagFormat(format string, packages []types.NormalizedPackageConfig) error {
+	if strings.Count(format, "${version}") != 1 {
+		return errors.New("Tag format must contain exactly one ${version}: %s", format)
+	}
+	remaining := strings.ReplaceAll(strings.ReplaceAll(format, "${name}", ""), "${version}", "")
+	if strings.ContainsAny(remaining, "${}") {
+		return errors.New("Unknown placeholder in tag format: %s", format)
+	}
 	for _, pkg := range packages {
 		candidate := strings.ReplaceAll(format, "${name}", pkg.Name)
 		candidate = strings.ReplaceAll(candidate, "${version}", "0.0.0")
@@ -383,6 +446,9 @@ func assertValidTagFormat(format string, packages []types.NormalizedPackageConfi
 }
 
 func normalizeRelative(rawPath string) (string, error) {
+	if strings.ContainsRune(rawPath, '\x00') {
+		return "", errors.New("Path contains a NUL byte")
+	}
 	normalized := strings.ReplaceAll(rawPath, `\`, "/")
 	cleaned := pathpkg.Clean(normalized)
 	if cleaned == ".." || strings.HasPrefix(cleaned, "../") ||
@@ -407,4 +473,26 @@ func orEmptySlice(s []string) []string {
 		return []string{}
 	}
 	return s
+}
+
+// Managed outputs may never share a path with release inputs or Git metadata.
+func validateManagedPaths(cfg *types.NormalizedConfig) error {
+	if cfg.OutputDir == "." || cfg.OutputDir == ".git" || strings.HasPrefix(cfg.OutputDir, ".git/") {
+		return errors.New("outputDir must be a dedicated directory outside Git metadata: %s", cfg.OutputDir)
+	}
+	owners := map[string]string{}
+	for _, pkg := range cfg.Packages {
+		for _, entry := range []struct{ path, role string }{{pkg.Manifest, "manifest"}, {pkg.Changelog, "changelog"}} {
+			path := entry.path
+			if path == "." || path == ".git" || strings.HasPrefix(path, ".git/") || path == ".release-version" ||
+				path == cfg.OutputDir || strings.HasPrefix(path, cfg.OutputDir+"/") {
+				return errors.New("Package %s %s overlaps a managed or reserved path: %s", pkg.Name, entry.role, path)
+			}
+			if previous, ok := owners[path]; ok {
+				return errors.New("Release file %s is shared by %s and %s %s", path, previous, pkg.Name, entry.role)
+			}
+			owners[path] = pkg.Name + " " + entry.role
+		}
+	}
+	return nil
 }

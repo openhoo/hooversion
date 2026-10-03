@@ -4,6 +4,7 @@
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"path/filepath"
 
 	"github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -59,6 +61,19 @@ func MigrateFromTS(cwd, tsPath string) (*types.NormalizedConfig, string, error) 
 		return nil, "", errors.New("Migrating %s failed: %v", tsPath, err)
 	}
 
+	// The discontinued JS config accepted a boolean github:false section.
+	// Translate it before decoding the current structured configuration.
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(out, &document); err != nil {
+		return nil, "", errors.New("Migrating %s produced invalid JSON: %v", tsPath, err)
+	}
+	if bytes.Equal(bytes.TrimSpace(document["github"]), []byte("false")) {
+		document["github"] = json.RawMessage(`{"enabled":false}`)
+		out, err = json.Marshal(document)
+		if err != nil {
+			return nil, "", err
+		}
+	}
 	var raw types.Config
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return nil, "", errors.New("Migrating %s produced invalid JSON: %v", tsPath, err)
@@ -70,7 +85,7 @@ func MigrateFromTS(cwd, tsPath string) (*types.NormalizedConfig, string, error) 
 	}
 
 	yamlPath := filepath.Join(cwd, "hooversion.yaml")
-	if err := os.WriteFile(yamlPath, renderYAML(cfg), 0o644); err != nil {
+	if err := safefs.WriteFileAtomic(yamlPath, renderYAML(cfg), 0o644); err != nil {
 		return nil, "", err
 	}
 	return cfg, yamlPath, nil
