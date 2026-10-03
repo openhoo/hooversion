@@ -43,7 +43,9 @@ func TestAppFreshCheckoutResumesPublicationAfterSuccessfulPush(t *testing.T) {
 	bare := filepath.Join(dir, "origin.git")
 	runGit(t, dir, "init", "-q", "--bare", "-b", "main", bare)
 	first := filepath.Join(dir, "first")
-	runGit(t, dir, "clone", "-q", bare, first)
+	// Match the runner's isolated clone settings rather than the host's global
+	// line-ending policy (Git for Windows commonly enables autocrlf).
+	runGit(t, dir, "clone", "-c", "core.autocrlf=false", "-q", bare, first)
 	runGit(t, first, "checkout", "-q", "-b", "main")
 	runGit(t, first, "config", "user.email", "test@example.com")
 	runGit(t, first, "config", "user.name", "Test")
@@ -77,7 +79,7 @@ func TestAppFreshCheckoutResumesPublicationAfterSuccessfulPush(t *testing.T) {
 	// A webhook retry gets a new checkout: no local journal survives, but the
 	// remote release commit and its exact source parent identify pending work.
 	second := filepath.Join(dir, "second")
-	runGit(t, dir, "clone", "-q", bare, second)
+	runGit(t, dir, "clone", "-c", "core.autocrlf=false", "-q", bare, second)
 	spec.RepoDir = second
 	result = runVersionhooRelease(spec)
 	if result.Err != nil || !result.Published || result.Outcome != "published" {
