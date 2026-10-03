@@ -1,7 +1,4 @@
-// Detection of releasable packages in a working tree; mirrors the
-// detectPackages/detectCargoPackages/readJsonName/readToml* helpers of
-// src/config.ts. TOML reading is hand-rolled exactly like the TS
-// readTomlSection/readTomlString/readTomlArray helpers — no TOML dependency.
+// Detection of releasable packages from validated JSON and TOML manifests.
 package config
 
 import (
@@ -11,11 +8,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"regexp"
-	"strings"
 
+	"github.com/openhoo/hooversion/internal/cargoworkspace"
 	"github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/safefs"
+	"github.com/openhoo/hooversion/internal/tomledit"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -62,6 +59,12 @@ func DetectPackages(cwd string) ([]types.PackageConfig, error) {
 		}
 		candidates = append(candidates, types.PackageConfig{Type: types.PackagePython, Path: ".", Name: name})
 	}
+
+	nestedPython, err := detectNestedPythonPackages(cwd)
+	if err != nil {
+		return nil, err
+	}
+	candidates = append(candidates, nestedPython...)
 
 	versionFile := filepath.Join(cwd, "version")
 	if fileExists(versionFile) {
@@ -155,38 +158,87 @@ func DefaultManifestPath(t types.PackageType, pkgPath string) string {
 
 func detectCargoPackages(cwd string) ([]types.PackageConfig, error) {
 	root := filepath.Join(cwd, "Cargo.toml")
-	text, err := os.ReadFile(root)
+	data, err := safefs.ReadRegularFile(root, maxPackageJSONBytes)
 	if err != nil {
 		return nil, err
 	}
-	content := string(text)
-
+	d, err := tomledit.Parse(data)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", root, err)
+	}
 	var packages []types.PackageConfig
-	if strings.Contains(content, "[package]") {
-		name, err := readTomlName(root, "package")
-		if err != nil {
-			return nil, err
+	if d.Get("package") != nil {
+		name, ok := d.Text("package", "name")
+		if !ok || name == "" {
+			return nil, fmt.Errorf("%s [package] must contain a name", root)
 		}
 		packages = append(packages, types.PackageConfig{Type: types.PackageRust, Path: ".", Name: name})
 	}
-
-	members := readTomlArray(content, "workspace", "members")
-	for _, member := range members {
-		manifest := filepath.Join(cwd, member, "Cargo.toml")
-		if !fileExists(manifest) {
-			continue
-		}
-		name, err := readTomlName(manifest, "package")
+	members, err := tomlStringArray(d.Get("workspace", "members"))
+	if err != nil {
+		return nil, fmt.Errorf("%s workspace.members: %w", root, err)
+	}
+	excludes, err := tomlStringArray(d.Get("workspace", "exclude"))
+	if err != nil {
+		return nil, fmt.Errorf("%s workspace.exclude: %w", root, err)
+	}
+	excluded := map[string]bool{}
+	for _, pattern := range excludes {
+		paths, err := cargoMemberPaths(cwd, pattern)
 		if err != nil {
 			return nil, err
 		}
-		path, err := normalizeRelative(member)
+		for _, p := range paths {
+			excluded[p] = true
+		}
+	}
+	seen := map[string]bool{}
+	for _, pattern := range members {
+		paths, err := cargoMemberPaths(cwd, pattern)
 		if err != nil {
 			return nil, err
 		}
-		packages = append(packages, types.PackageConfig{Type: types.PackageRust, Path: path, Name: name})
+		if len(paths) == 0 {
+			return nil, fmt.Errorf("cargo workspace member %q matched no directories", pattern)
+		}
+		for _, path := range paths {
+			if excluded[path] || seen[path] {
+				continue
+			}
+			seen[path] = true
+			manifest := filepath.Join(cwd, path, "Cargo.toml")
+			if err := safefs.RequireContainedPath(cwd, filepath.Join(path, "Cargo.toml")); err != nil {
+				return nil, err
+			}
+			name, err := readTomlName(manifest, "package")
+			if err != nil {
+				return nil, err
+			}
+			packages = append(packages, types.PackageConfig{Type: types.PackageRust, Path: path, Name: name})
+		}
 	}
 	return packages, nil
+}
+func tomlStringArray(value any) ([]string, error) {
+	if value == nil {
+		return nil, nil
+	}
+	array, ok := value.([]any)
+	if !ok {
+		return nil, fmt.Errorf("must be a string array")
+	}
+	result := make([]string, 0, len(array))
+	for _, entry := range array {
+		s, ok := entry.(string)
+		if !ok {
+			return nil, fmt.Errorf("must be a string array")
+		}
+		result = append(result, s)
+	}
+	return result, nil
+}
+func cargoMemberPaths(cwd, pattern string) ([]string, error) {
+	return cargoworkspace.Expand(cwd, pattern)
 }
 
 func fileExists(path string) bool {
@@ -231,85 +283,70 @@ func readJSONName(path string) (string, error) {
 	return doc.Name, nil
 }
 
-func readTomlName(path, sectionName string) (string, error) {
-	data, err := os.ReadFile(path)
+func readTomlName(path, section string) (string, error) {
+	data, err := safefs.ReadRegularFile(path, maxPackageJSONBytes)
 	if err != nil {
 		return "", err
 	}
-	section := readTomlSection(string(data), sectionName)
-	name := readTomlString(section, "name")
-	if name == "" {
-		return "", errors.New("%s [%s] must contain a name", path, sectionName)
+	d, err := tomledit.Parse(data)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", path, err)
+	}
+	name, ok := d.Text(section, "name")
+	if section == "project" && !ok {
+		name, ok = d.Text("tool", "poetry", "name")
+	}
+	if !ok || name == "" {
+		return "", fmt.Errorf("%s [%s] must contain a name", path, section)
 	}
 	return name, nil
 }
 
-// readTomlSection collects the lines of `[sectionName]` up to the next
-// heading, mirroring src/config.ts readTomlSection.
-func readTomlSection(text, sectionName string) string {
-	var section []string
-	inSection := false
-	for _, line := range strings.Split(text, "\n") {
-		line = strings.TrimSuffix(line, "\r")
-		heading := tomlHeadingRE.FindStringSubmatch(line)
-		if heading != nil {
-			if inSection {
-				break
+func detectNestedPythonPackages(cwd string) ([]types.PackageConfig, error) {
+	var packages []types.PackageConfig
+	err := filepath.WalkDir(cwd, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if path != cwd {
+				if _, ignored := ignoredNodePackageDirs[entry.Name()]; ignored {
+					return fs.SkipDir
+				}
+				switch entry.Name() {
+				case ".venv", "venv", "__pycache__", ".tox", ".nox":
+					return fs.SkipDir
+				}
 			}
-			inSection = heading[1] == sectionName
-			continue
+			return nil
 		}
-		if inSection {
-			section = append(section, line)
+		if entry.Name() != "pyproject.toml" || filepath.Dir(path) == cwd || !fileExists(path) {
+			return nil
 		}
-	}
-	return strings.Join(section, "\n")
-}
-
-var tomlHeadingRE = regexp.MustCompile(`^\s*\[([^\]]+)\]\s*$`)
-
-func readTomlString(section, key string) string {
-	re := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(key) + `\s*=\s*["']([^"']+)["']`)
-	m := re.FindStringSubmatch(section)
-	if m == nil {
-		return ""
-	}
-	return m[1]
-}
-
-// readTomlArray reads a possibly multiline string array, mirroring
-// src/config.ts readTomlArray including its single-line fast path.
-func readTomlArray(text, sectionName, key string) []string {
-	section := readTomlSection(text, sectionName)
-
-	oneLineRE := regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(key) + `\s*=\s*\[([^\]]*)\]`)
-	if m := oneLineRE.FindStringSubmatch(section); m != nil {
-		return quotedStrings(m[1])
-	}
-
-	var result []string
-	inArray := false
-	entryRE := regexp.MustCompile(`^\s*` + regexp.QuoteMeta(key) + `\s*=\s*\[`)
-	for _, line := range strings.Split(section, "\n") {
-		if !inArray && entryRE.MatchString(line) {
-			inArray = true
+		data, err := safefs.ReadRegularFile(path, maxPackageJSONBytes)
+		if err != nil {
+			return err
 		}
-		if inArray {
-			result = append(result, quotedStrings(line)...)
-			if strings.Contains(line, "]") {
-				break
-			}
+		d, err := tomledit.Parse(data)
+		if err != nil {
+			return fmt.Errorf("%s: %w", path, err)
 		}
-	}
-	return result
-}
-
-var quotedStringRE = regexp.MustCompile(`["']([^"']+)["']`)
-
-func quotedStrings(s string) []string {
-	var out []string
-	for _, m := range quotedStringRE.FindAllStringSubmatch(s, -1) {
-		out = append(out, m[1])
-	}
-	return out
+		name, ok := d.Text("project", "name")
+		if !ok {
+			name, ok = d.Text("tool", "poetry", "name")
+		}
+		if !ok {
+			return nil
+		}
+		if name == "" {
+			return fmt.Errorf("%s must contain a project name", path)
+		}
+		rel, err := filepath.Rel(cwd, filepath.Dir(path))
+		if err != nil {
+			return err
+		}
+		packages = append(packages, types.PackageConfig{Type: types.PackagePython, Path: filepath.ToSlash(rel), Name: name})
+		return nil
+	})
+	return packages, err
 }

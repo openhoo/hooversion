@@ -3,7 +3,7 @@
 Hooversion is a single static binary for Conventional Commit linting and
 semantic release automation. It is designed to replace separate `commitlint`,
 `semantic-release`, changelog, release-note, tag, and GitHub release glue —
-with no runtime dependencies: no Node, no Bun, no npm packages.
+without a language runtime: no Node, no Bun, no npm packages for normal use.
 
 ## Commands
 
@@ -34,6 +34,13 @@ Or download the `hooversion` prebuilt static binary from the
 it on your `PATH`. Start the GitHub App server from that release binary with
 `hooversion app`; release archives do not contain a standalone `versionhoo-app`
 executable. The same releases power the GitHub Actions integration below.
+
+### Prerequisites
+
+Prebuilt binaries need no Go runtime. Git must be on `PATH` for history
+linting, planning, and releases. Building or installing from source requires
+Go 1.25 or newer. Optional signature verification needs `cosign`, artifact
+attestation verification needs `gh`, and legacy JS/TS migration needs Bun.
 
 ## Quickstart
 
@@ -71,7 +78,9 @@ hooversion doctor           # sanity-check config, git, tokens
 Hooversion reads its configuration from the current directory: `hooversion.yaml`,
 `.hooversion.yaml`, `hooversion.yml`, `.hooversion.yml`, `hooversion.config.json`,
 or `hooversion.json`, in that order. An explicit path passed via `--config`
-takes precedence.
+takes precedence. Package roots, manifests, changelogs, assets, and output
+paths remain relative to the working directory where Hooversion runs; selecting
+an explicit configuration file does not change that repository root.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -80,7 +89,7 @@ takes precedence.
 | `independentTagFormat` | `string` | `${name}@v${version}` | Tag template used when more than one package is configured. |
 | `packages` | list | required, non-empty | One entry per releasable package. |
 | `packages[].name` | `string` | manifest name | Falls back to the name read from the manifest. |
-| `packages[].path` | `string` | `.` | Package root relative to the config directory. |
+| `packages[].path` | `string` | `.` | Package root relative to the working directory. |
 | `packages[].type` | `string` | required | One of `node`, `rust`, `python`, `version-file`. |
 | `packages[].manifest` | `string` | per type | Defaults to `<path>/package.json` (`node`), `<path>/Cargo.toml` (`rust`), `<path>/pyproject.toml` (`python`), `<path>/version` (`version-file`). |
 | `packages[].changelog` | `string` | `<path>/CHANGELOG.md` | Changelog file updated on release. |
@@ -97,9 +106,15 @@ takes precedence.
 | `outputDir` | `string` | `.hooversion` | Directory for managed release outputs. |
 | `push` | `bool` | `true` | Push the release commit and tags. |
 
-Validation is fail-closed: duplicate package names, unknown or self
-`dependencies`, dependency cycles, invalid tag formats, and invalid branch or
-package names are rejected before anything runs. See `examples/` for a
+Validation rejects unknown YAML/JSON fields, additional documents, unsupported
+package types, duplicate package names, unknown or self `dependencies`, and
+dependency cycles. Tag templates must contain exactly one `${version}` and may
+use `${name}`; unknown placeholders are rejected. Manifest and changelog files
+must have distinct paths and cannot overlap managed outputs or Git metadata.
+`outputDir` must be a dedicated directory, and configured release paths must
+not traverse symlinks inside the checkout. Assets must be repository-relative
+files with unique basenames within each package; generated assets may be absent
+when loading the configuration. See `examples/` for a
 single-package Node setup and an independent Rust workspace setup. Packages can
 use `node`, `rust`, `python`, or `version-file` manifests. The `version-file`
 type reads and writes a plain text file containing only the semantic version,
@@ -117,11 +132,24 @@ such as `transports/version`.
 - Commits route to packages through changed paths and Conventional Commit scopes.
 - Local dependents can release automatically through `dependencies` in config.
 
+Version components must fit the platform integer range, and release planning
+rejects a bump that would overflow. Prerelease and build identifiers are
+validated; legacy leading zeros in the core version remain accepted.
+
 Each release plan is bound to its checked-out source SHA. On the initial,
 non-resumable attempt, Hooversion requires local `HEAD` and the remote release
 branch to still match that SHA. It updates manifests and changelogs, runs
 configured hooks, creates a release commit and tags, and pushes the branch and
-all tags in one atomic Git push.
+all tags in one atomic Git push. Local `HEAD` is checked again after
+`beforeRelease` and `afterVersion` hooks; a hook that moves or commits `HEAD`
+cannot publish a release based on a different source.
+
+Manifests, local dependency updates, Cargo.lock, and managed output files are
+written to synced temporary siblings before replacing their destinations.
+Existing file permissions are preserved. This protects individual file writes;
+it does not make the entire release a transaction. A failed hook or later
+pre-push step can leave intentional local changes that need inspection before
+retrying.
 
 If GitHub publishing fails after that push, rerun the release from the exact
 release commit and tags: Hooversion rejects remote drift, reuses only a matching
@@ -153,7 +181,9 @@ Webhook bodies are bounded by `VERSIONHOO_WEBHOOK_MAX_BODY_BYTES` before
 signature verification and durable admission. Every validated handled
 `workflow_run` is fsynced to the bounded file-backed webhook spool before the
 app returns HTTP 202. The execution queue remains bounded at 64 running or
-waiting jobs and serializes each repository/ref; queue saturation leaves the
+waiting jobs, preserves FIFO per repository/ref, and serializes publication
+across branches of each repository. At most four repositories run concurrently
+(`VERSIONHOO_MAX_CONCURRENT`). Queue saturation leaves the
 durable record pending instead of returning a lossy `503`.
 
 `VERSIONHOO_WEBHOOK_SPOOL_DIR` selects the durable backlog directory and
@@ -163,6 +193,12 @@ and retried after restart. Dedupe reservations remain in memory for 24 hours
 and are released after final failure or an admission error, never just because
 the in-memory queue is full. Corrupt, oversized, symlinked, and unsafe-path
 records are quarantined or skipped without blocking later deliveries.
+
+Each App job has a 15-minute deadline (`VERSIONHOO_JOB_TIMEOUT_SECONDS`,
+maximum 86400). Child commands have a five-minute deadline and bounded
+output. Interrupt or termination signals stop intake and backlog scheduling,
+cancel child process trees, and wait for execution to finish before releasing
+spool ownership. Unfinished durable jobs remain available for restart replay.
 
 ## Migration
 
@@ -288,3 +324,22 @@ permissions, webhook settings, ruleset bypass setup, and runtime environment.
 The App runner deliberately rejects repository dependency installation and all
 repository hooks. Hooversion itself has a release hook, so it must not be put
 in a `versionhoo-app` allow-list; use the workflow action for this repository.
+
+## Development and review
+
+See [Contributing](CONTRIBUTING.md) for checks and release conventions. CI runs
+the declared Go version on Linux, race tests on macOS with stable Go, and Windows
+spool/configuration/filesystem tests. The
+[October 3, 2026 review](docs/review-2026-10-03.md) records reproduced findings,
+compatibility changes, verification evidence, and the remaining architecture
+priorities.
+
+## Reliability and recovery
+
+Release execution uses a durable Git-metadata journal and exclusive repository
+ownership. Local failures restore the tracked/managed baseline; uncertain remote
+publication retains the commit for safe retry. Hook side effects outside those
+files remain the hook author's responsibility. See the
+[architecture report](docs/architecture-hardening-2026-10-03.md) for recovery
+phases and limits, and the [manifest policy](docs/manifest-policy.md) for Cargo
+inheritance and Python constraint behavior.

@@ -504,3 +504,69 @@ func assertMissing(t *testing.T, path string) {
 		t.Fatalf("%s still exists: %v", path, err)
 	}
 }
+
+func TestOversizedStalePayloadIsAdvisoryOnly(t *testing.T) {
+	store, cwd := newStore(t)
+	dir := filepath.Join(cwd, store.OutputDir)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "outputs.json")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(2 << 20); err != nil {
+		t.Fatal(err)
+	}
+	file.Close()
+	if _, ok := readStalePayload(path); ok {
+		t.Fatal("accepted oversized state")
+	}
+	if err := store.Clear(); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, path)
+}
+
+func TestStoreRejectsSymlinkedOutputDirectory(t *testing.T) {
+	store, cwd := newStore(t)
+	outside := t.TempDir()
+	target := filepath.Join(outside, "outputs.json")
+	original := `{"releases":[]}`
+	if err := os.WriteFile(target, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(cwd, store.OutputDir)); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := store.Clear(); err == nil {
+		t.Error("cleared through symlinked output root")
+	}
+	if err := store.Write([]types.PackageRelease{singleRelease()}, true); err == nil {
+		t.Error("wrote through symlinked output root")
+	}
+	if got := mustRead(t, target); got != original {
+		t.Fatalf("outside state changed: %q", got)
+	}
+}
+
+func TestExplicitEnvironmentDoesNotWriteParentGitHubOutput(t *testing.T) {
+	store, cwd := newStore(t)
+	parent := filepath.Join(cwd, "parent-output")
+	child := filepath.Join(cwd, "child-output")
+	t.Setenv("GITHUB_OUTPUT", parent)
+	store.BaseEnv = []string{}
+	if err := store.Write(nil, false); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, parent)
+	store.BaseEnv = []string{"GITHUB_OUTPUT=" + child}
+	if err := store.Write(nil, false); err != nil {
+		t.Fatal(err)
+	}
+	assertMissing(t, parent)
+	if !strings.Contains(mustRead(t, child), "published=false") {
+		t.Fatal("explicit output missing")
+	}
+}

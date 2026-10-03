@@ -3,6 +3,7 @@
 package release
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -32,12 +33,12 @@ func DeriveResumable(cwd string, config *types.NormalizedConfig) (*types.Release
 	return DeriveResumableWithEnv(cwd, config, nil)
 }
 
-func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv []string) (*types.ReleasePlan, error) {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
+func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv []string, contexts ...context.Context) (*types.ReleasePlan, error) {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
-	sourceSha, err := git.RefShaWithEnv(cwd, "HEAD^", baseEnv)
+	sourceSha, err := git.RefShaWithEnv(cwd, "HEAD^", baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +51,7 @@ func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv 
 		nextVersion string
 		tag         string
 	}
-	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
+	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +108,7 @@ func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv 
 	}
 
 	for _, entry := range selected {
-		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+entry.tag, baseEnv)
+		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+entry.tag, baseEnv, contexts...)
 		if err != nil {
 			return nil, err
 		}
@@ -119,7 +120,7 @@ func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv 
 
 	releases := make([]types.PackageRelease, 0, len(selected))
 	for _, entry := range selected {
-		currentVersion, releaseType, ok := inferReleaseTransition(cwd, config, entry.pkg, entry.nextVersion, baseEnv)
+		currentVersion, releaseType, ok := inferReleaseTransition(cwd, config, entry.pkg, entry.nextVersion, baseEnv, contexts...)
 		if !ok {
 			return nil, nil
 		}
@@ -151,12 +152,12 @@ func DeriveResumableWithEnv(cwd string, config *types.NormalizedConfig, baseEnv 
 	}
 
 	reconstructed := &types.ReleasePlan{
-		Branch:      gitBranchOfWithEnv(cwd, baseEnv),
+		Branch:      gitBranchOfWithEnv(cwd, baseEnv, contexts...),
 		SourceSha:   sourceSha,
 		Independent: len(config.Packages) > 1,
 		Releases:    releases,
 	}
-	headMessage, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
+	headMessage, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv, contexts...)
 	if err != nil {
 		return nil, err
 	}
@@ -185,6 +186,7 @@ func inferReleaseTransition(
 	pkg types.NormalizedPackageConfig,
 	nextVersion string,
 	baseEnv []string,
+	contexts ...context.Context,
 ) (string, types.ReleaseType, bool) {
 	parsed, err := semver.Parse(nextVersion)
 	if err != nil {
@@ -214,7 +216,7 @@ func inferReleaseTransition(
 			}
 		}
 		tag := plan.TagFor(config, pkg, candidate.currentVersion)
-		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+tag, baseEnv)
+		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+tag, baseEnv, contexts...)
 		if err != nil {
 			return "", "", false
 		}
@@ -222,11 +224,7 @@ func inferReleaseTransition(
 			return candidate.currentVersion, candidate.releaseType, true
 		}
 	}
-	parentData, err := git.FileAtRefWithEnv(cwd, "HEAD^", pkg.Manifest, baseEnv)
-	if err != nil {
-		return "", "", false
-	}
-	parentName, parentVersion, err := manifest.ReadData(pkg, parentData)
+	parentName, parentVersion, err := manifest.ReadAtRef(cwd, pkg, "HEAD^", baseEnv, contexts...)
 	if err != nil || parentName != pkg.Name {
 		return "", "", false
 	}
@@ -237,7 +235,7 @@ func inferReleaseTransition(
 	valid := []types.ReleaseType{types.Major, types.Minor, types.Patch}
 	var matched types.ReleaseType
 	for _, releaseType := range valid {
-		if semver.Bump(parent, releaseType).String() == parsed.String() {
+		if bumped, err := semver.CheckedBump(parent, releaseType); err == nil && bumped.String() == parsed.String() {
 			if matched != "" {
 				return "", "", false
 			}
@@ -250,31 +248,24 @@ func inferReleaseTransition(
 	return parentVersion, matched, true
 }
 
-// isResumableRelease reports whether HEAD is exactly the release commit of a
-// prior partial run: one commit ahead of plan.SourceSha, carrying the exact
-// release message, with every planned tag either absent or pointing at HEAD.
-func isResumableRelease(cwd string, effective *types.ReleasePlan) bool {
-	return isResumableReleaseWithEnv(cwd, effective, nil)
-}
-
-func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) bool {
+func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, contexts ...context.Context) bool {
 	if len(effective.Releases) == 0 {
 		return false
 	}
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
+	head, err := git.HeadShaWithEnv(cwd, baseEnv, contexts...)
 	if err != nil || head == effective.SourceSha {
 		return false
 	}
-	parent, err := git.RefShaWithEnv(cwd, "HEAD^", baseEnv)
+	parent, err := git.RefShaWithEnv(cwd, "HEAD^", baseEnv, contexts...)
 	if err != nil || parent != effective.SourceSha {
 		return false
 	}
-	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv)
+	message, err := git.CommitMessageWithEnv(cwd, "HEAD", baseEnv, contexts...)
 	if err != nil || !releaseMessageMatches(message, CommitMessage(effective)) {
 		return false
 	}
 	for _, release := range effective.Releases {
-		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+release.Tag, baseEnv)
+		ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+release.Tag, baseEnv, contexts...)
 		if err != nil || (ref != "" && ref != head) {
 			return false
 		}
@@ -282,22 +273,23 @@ func isResumableReleaseWithEnv(cwd string, effective *types.ReleasePlan, baseEnv
 	return true
 }
 
-// verifySource blocks when the local checkout moved past the planned source
-// or the remote branch drifted from it. The remote lookup is tri-state:
-// ErrNoRemote skips the check, "" means the branch is missing remotely.
-func verifySource(cwd string, effective *types.ReleasePlan) error {
-	return verifySourceWithEnv(cwd, effective, nil)
-}
-
-func verifySourceWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
+// verifyLocalSource protects the immutable planning baseline across hooks.
+func verifyLocalSource(cwd string, effective *types.ReleasePlan, baseEnv []string, contexts ...context.Context) error {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv, contexts...)
 	if err != nil {
 		return err
 	}
 	if head != effective.SourceSha {
 		return errors.New("Release source changed locally: expected %s, found %s.", effective.SourceSha, head)
 	}
-	remote, err := git.RemoteBranchShaWithEnv(cwd, effective.Branch, baseEnv)
+	return nil
+}
+
+func verifySourceWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth, contexts ...context.Context) error {
+	if err := verifyLocalSource(cwd, effective, baseEnv, contexts...); err != nil {
+		return err
+	}
+	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth, contexts...)
 	if err == git.ErrNoRemote {
 		return nil
 	}
@@ -310,59 +302,6 @@ func verifySourceWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []str
 			found = "missing"
 		}
 		return errors.New("Release source changed remotely: expected %s, found %s.", effective.SourceSha, found)
-	}
-	return nil
-}
-
-func verifySourceWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth) error {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
-	if err != nil {
-		return err
-	}
-	if head != effective.SourceSha {
-		return errors.New("Release source changed locally: expected %s, found %s.", effective.SourceSha, head)
-	}
-	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth)
-	if err == git.ErrNoRemote {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if remote != effective.SourceSha {
-		found := remote
-		if found == "" {
-			found = "missing"
-		}
-		return errors.New("Release source changed remotely: expected %s, found %s.", effective.SourceSha, found)
-	}
-	return nil
-}
-
-// verifyResumableRemote accepts a remote sitting at either HEAD (fully pushed)
-// or SourceSha (push failed before anything landed); anything else drifts.
-func verifyResumableRemote(cwd string, effective *types.ReleasePlan) error {
-	return verifyResumableRemoteWithEnv(cwd, effective, nil)
-}
-
-func verifyResumableRemoteWithEnv(cwd string, effective *types.ReleasePlan, baseEnv []string) error {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
-	if err != nil {
-		return err
-	}
-	remote, err := git.RemoteBranchShaWithEnv(cwd, effective.Branch, baseEnv)
-	if err == git.ErrNoRemote {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if remote != head && remote != effective.SourceSha {
-		found := remote
-		if found == "" {
-			found = "missing"
-		}
-		return errors.New("Release resume found remote drift: expected %s, found %s.", head, found)
 	}
 	return nil
 }
@@ -375,12 +314,12 @@ func splitSubjectBody(message string) (string, string) {
 	return message[:separator], strings.TrimSpace(message[separator:])
 }
 
-func verifyResumableRemoteWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth) error {
-	head, err := git.HeadShaWithEnv(cwd, baseEnv)
+func verifyResumableRemoteWithAuthEnv(cwd string, effective *types.ReleasePlan, baseEnv []string, auth types.GitAuth, contexts ...context.Context) error {
+	head, err := git.HeadShaWithEnv(cwd, baseEnv, contexts...)
 	if err != nil {
 		return err
 	}
-	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth)
+	remote, err := git.RemoteBranchShaWithAuthEnv(cwd, effective.Branch, baseEnv, auth, contexts...)
 	if err == git.ErrNoRemote {
 		return nil
 	}
@@ -402,16 +341,8 @@ func readManifestVersion(cwd string, pkg types.NormalizedPackageConfig) (string,
 	return version, err
 }
 
-func gitBranchOf(cwd string) string {
-	branch, err := git.CurrentBranch(cwd)
-	if err != nil {
-		return ""
-	}
-	return branch
-}
-
-func gitBranchOfWithEnv(cwd string, baseEnv []string) string {
-	branch, err := git.CurrentBranchWithEnv(cwd, baseEnv)
+func gitBranchOfWithEnv(cwd string, baseEnv []string, contexts ...context.Context) string {
+	branch, err := git.CurrentBranchWithEnv(cwd, baseEnv, contexts...)
 	if err != nil {
 		return ""
 	}

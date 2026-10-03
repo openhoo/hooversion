@@ -452,3 +452,36 @@ func TestReadTomlRejectsMultilineQuotedValues(t *testing.T) {
 		})
 	}
 }
+
+func TestReadRejectsTrailingJSON(t *testing.T) {
+	pkg := types.NormalizedPackageConfig{Type: types.PackageNode, Manifest: "package.json"}
+	for _, data := range []string{`{"name":"app","version":"1.0.0"} {}`, `{"name":"app","version":"1.0.0"} garbage`} {
+		if _, _, err := ReadData(pkg, []byte(data)); err == nil {
+			t.Errorf("accepted trailing data %q", data)
+		}
+	}
+}
+
+func TestUpdateVersionRefusesSymlinkAndPreservesTarget(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.json")
+	link := filepath.Join(root, "link.json")
+	original := `{"name":"app","version":"1.0.0"}`
+	if err := os.WriteFile(target, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	pkg := types.NormalizedPackageConfig{Type: types.PackageNode, Manifest: link}
+	if err := UpdateVersion(pkg, "1.0.1"); err == nil {
+		t.Fatal("updated through symlink")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != original {
+		t.Fatalf("target changed: %s", data)
+	}
+}

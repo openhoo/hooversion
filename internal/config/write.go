@@ -4,7 +4,7 @@ package config
 
 import (
 	"fmt"
-	"os"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"path/filepath"
 	"strings"
 
@@ -31,7 +31,7 @@ func WriteDefault(cwd string) (string, error) {
 
 	body := renderYAML(cfg)
 	path := filepath.Join(cwd, "hooversion.yaml")
-	if err := os.WriteFile(path, body, 0o644); err != nil {
+	if err := safefs.WriteFileAtomic(path, body, 0o644); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -79,7 +79,7 @@ func renderYAML(cfg *types.NormalizedConfig) []byte {
 			fmt.Fprintf(&b, "  apiUrl: %q\n", cfg.GitHub.ApiUrl)
 		}
 	} else {
-		b.WriteString("github: false\n")
+		b.WriteString("github:\n  enabled: false\n")
 	}
 
 	fmt.Fprintf(&b, "outputDir: %q\n", cfg.OutputDir)

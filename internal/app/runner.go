@@ -6,17 +6,18 @@
 package app
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
+	"time"
 
 	"github.com/openhoo/hooversion/internal/config"
 	hverr "github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/git"
 	"github.com/openhoo/hooversion/internal/plan"
+	"github.com/openhoo/hooversion/internal/process"
 	"github.com/openhoo/hooversion/internal/release"
 	"github.com/openhoo/hooversion/internal/types"
 )
@@ -39,6 +40,8 @@ const (
 // runner). RepoDir is a test seam: when set, cloning is skipped and the
 // directory is used as-is without external cleanup.
 type JobSpec struct {
+	Context            context.Context
+	Timeout            time.Duration
 	RepositoryFullName string
 	CloneURL           string
 	Branch             string
@@ -82,10 +85,6 @@ type Outcome struct {
 var Runner = func(spec JobSpec) Outcome {
 	return runVersionhooRelease(spec)
 }
-
-// repositoryEnvironmentMu serializes environment-sensitive child execution
-// globally, mirroring the repositoryEnvironmentTail promise chain.
-var repositoryEnvironmentMu sync.Mutex
 
 func redact(value, secret string) string {
 	if secret == "" {
@@ -248,125 +247,29 @@ func childEnv(spec JobSpec, home string) []string {
 
 // checkedOutput runs command with env, returning trimmed stdout; on failure it
 // renders the verbatim "<command> <args> failed:" error with redaction.
-func checkedOutput(env []string, dir, command string, args []string, secret string) (string, error) {
-	cmd := exec.Command(command, args...)
-	cmd.Dir = dir
-	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	runErr := cmd.Run()
-	if runErr != nil {
+func checkedOutput(env []string, dir, command string, args []string, secret string, contexts ...context.Context) (string, error) {
+	result := process.Run(process.Context(contexts), process.Options{Dir: dir, Env: env}, command, args...)
+	if result.Err != nil {
 		rendered := command
 		for _, arg := range args {
 			rendered += " " + redact(arg, secret)
 		}
-		detail := stderr.String()
+		detail := result.Stderr
 		if detail == "" {
-			detail = stdout.String()
+			detail = result.Stdout
 		}
-		return "", hverr.New("%s failed:\n%s", rendered, redact(detail, secret))
+		return "", fmt.Errorf("%s failed: %w\n%s", rendered, result.Err, redact(detail, secret))
 	}
-	return strings.TrimSpace(stdout.String()), nil
-}
-
-// installProjectDependencies runs a configured executable without invoking a
-// command shell. The command string is tokenized into an executable and
-// explicit arguments; shell metacharacters are rejected.
-func installProjectDependencies(repoDir string, configuredCommand, secret string, env []string) error {
-	command := configuredCommand
-	if command == "" {
-		if _, err := os.Stat(filepath.Join(repoDir, "bun.lock")); err == nil {
-			command = "bun install --frozen-lockfile"
-		}
-	}
-	if command == "" {
-		return nil
-	}
-	parts, err := splitCommand(command)
-	if err != nil {
-		return hverr.New("Install command rejected: %s", redact(err.Error(), secret))
-	}
-	executable, err := exec.LookPath(parts[0])
-	if err != nil {
-		return hverr.New("Install executable is unavailable: %s", redact(parts[0], secret))
-	}
-	cmd := exec.Command(executable, parts[1:]...)
-	cmd.Dir = repoDir
-	cmd.Env = env
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		detail := stderr.String()
-		if detail == "" {
-			detail = stdout.String()
-		}
-		return hverr.New("Install command failed: %s\n%s", redact(command, secret), redact(detail, secret))
-	}
-	return nil
-}
-
-func splitCommand(command string) ([]string, error) {
-	var parts []string
-	var current strings.Builder
-	var quote byte
-	escaped, token := false, false
-	flush := func() {
-		if token {
-			parts = append(parts, current.String())
-			current.Reset()
-			token = false
-		}
-	}
-	for index := range len(command) {
-		char := command[index]
-		if char == 0 {
-			return nil, hverr.New("command contains a NUL byte")
-		}
-		if escaped {
-			current.WriteByte(char)
-			token = true
-			escaped = false
-			continue
-		}
-		if quote != 0 {
-			if char == quote {
-				quote = 0
-			} else {
-				current.WriteByte(char)
-				token = true
-			}
-			continue
-		}
-		switch char {
-		case '\\':
-			escaped = true
-			token = true
-		case '\'', '"':
-			quote = char
-			token = true
-		case ';', '&', '|', '<', '>', '`', '$', '\n', '\r':
-			return nil, hverr.New("command contains shell syntax")
-		case ' ', '\t':
-			flush()
-		default:
-			current.WriteByte(char)
-			token = true
-		}
-	}
-	if escaped || quote != 0 {
-		return nil, hverr.New("command contains an unterminated escape or quote")
-	}
-	flush()
-	if len(parts) == 0 {
-		return nil, hverr.New("command is empty")
-	}
-	return parts, nil
+	return strings.TrimSpace(result.Stdout), nil
 }
 
 // runVersionhooRelease mirrors runVersionhooRelease.
 func runVersionhooRelease(spec JobSpec) Outcome {
+	ctx, cancel := context.WithTimeout(process.Context([]context.Context{spec.Context}), resolveJobTimeout(spec.Timeout))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return failureOutcome(spec, err)
+	}
 	parent := spec.WorkDir
 	if parent == "" {
 		parent = filepath.Join(os.TempDir(), "versionhoo")
@@ -390,10 +293,6 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			os.RemoveAll(workDir)
 		}
 	}
-
-	// Global serialization of environment-sensitive execution.
-	repositoryEnvironmentMu.Lock()
-	defer repositoryEnvironmentMu.Unlock()
 
 	outcome := func() Outcome {
 		env := childEnv(spec, repositoryHome)
@@ -421,19 +320,22 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			cloneEnv := append(append([]string{}, env...), auth.envToSlice()...)
 			if _, err := checkedOutput(cloneEnv, workDir, "git", []string{
 				"clone", "--branch", spec.Branch, "--no-single-branch", cloneURL, repoDir,
-			}, spec.Token); err != nil {
+			}, spec.Token, ctx); err != nil {
 				return failureOutcome(spec, err)
 			}
 		}
-		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.name", authorName}, spec.Token); err != nil {
+		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.name", authorName}, spec.Token, ctx); err != nil {
 			return failureOutcome(spec, err)
 		}
-		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.email", authorEmail}, spec.Token); err != nil {
+		if _, err := checkedOutput(env, repoDir, "git", []string{"config", "user.email", authorEmail}, spec.Token, ctx); err != nil {
 			return failureOutcome(spec, err)
 		}
 
-		branchHead, _ := checkedOutput(env, repoDir, "git", []string{"rev-parse", "HEAD"}, spec.Token)
-		if branchHead != spec.HeadSha {
+		branchHead, err := checkedOutput(env, repoDir, "git", []string{"rev-parse", "HEAD"}, spec.Token, ctx)
+		if err != nil {
+			return failureOutcome(spec, err)
+		}
+		staleResult := func() Outcome {
 			return Outcome{
 				RepositoryFullName: spec.RepositoryFullName,
 				Branch:             spec.Branch,
@@ -447,11 +349,22 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 				Releases: []ReleaseRef{},
 			}
 		}
+		if branchHead != spec.HeadSha {
+			message, err := git.CommitMessageWithEnv(repoDir, "HEAD", env, ctx)
+			if err != nil {
+				return failureOutcome(spec, err)
+			}
+			// Ordinary newer commits stay stale even if they have no release config.
+			// Only a possible release commit proceeds to validated resume derivation.
+			if !strings.HasPrefix(message, "chore(release): ") {
+				return staleResult()
+			}
+		}
 		if spec.InstallCommand != "" {
-			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects dependency installation; use a hook-free, preinstalled repository release"))
+			return failureOutcome(spec, fmt.Errorf("versionhoo App mode rejects dependency installation; use a hook-free, preinstalled repository release"))
 		}
 		if _, err := os.Stat(filepath.Join(repoDir, "bun.lock")); err == nil {
-			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects implicit dependency installation from bun.lock; use a hook-free, preinstalled repository release"))
+			return failureOutcome(spec, fmt.Errorf("versionhoo App mode rejects implicit dependency installation from bun.lock; use a hook-free, preinstalled repository release"))
 		}
 
 		cfg, err := config.Load(repoDir, spec.ConfigPath)
@@ -459,25 +372,40 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 			return failureOutcome(spec, err)
 		}
 		if len(cfg.Hooks.BeforeRelease) > 0 || len(cfg.Hooks.AfterVersion) > 0 || len(cfg.Hooks.AfterRelease) > 0 {
-			return failureOutcome(spec, fmt.Errorf("Versionhoo App mode rejects repository hooks; use a hook-free repository release"))
+			return failureOutcome(spec, fmt.Errorf("versionhoo App mode rejects repository hooks; use a hook-free repository release"))
 		}
 		trustedApiURL, err := ValidateGitHubApiURL(orDefault(spec.ApiURL, "https://api.github.com"), spec.TrustedAPIURLs)
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
-		if cfg.GitHub.Enabled {
-			repoIdentity, err := ValidateRepositoryFullName(spec.RepositoryFullName)
-			if err != nil {
-				return failureOutcome(spec, err)
-			}
-			cfg.GitHub.Repository = repoIdentity
-			cfg.GitHub.ApiUrl = trustedApiURL
-		}
-		releasePlan, err := plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env)
+		repoIdentity, err := ValidateRepositoryFullName(spec.RepositoryFullName)
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
+		if cfg.GitHub.Enabled {
+			cfg.GitHub.Repository = repoIdentity
+			cfg.GitHub.ApiUrl = trustedApiURL
+		}
+		var releasePlan *types.ReleasePlan
+		if branchHead != spec.HeadSha {
+			resumed, err := release.DeriveResumableWithEnv(repoDir, cfg, env, ctx)
+			if err != nil {
+				return failureOutcome(spec, err)
+			}
+			// A prior App attempt may already have pushed this release before its
+			// publication failed. A fresh clone can resume only that exact CI source.
+			if resumed == nil || resumed.SourceSha != spec.HeadSha || resumed.Branch != spec.Branch {
+				return staleResult()
+			}
+			releasePlan = resumed
+		} else {
+			releasePlan, err = plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env, ctx)
+			if err != nil {
+				return failureOutcome(spec, err)
+			}
+		}
 		execution, err := release.Execute(repoDir, cfg, releasePlan, release.Options{
+			Context:     ctx,
 			NoPushSet:   true,
 			Push:        true,
 			NoGitHubSet: true,
@@ -550,6 +478,15 @@ func sortStrings(values []string) {
 // check-run creation (warn-only), runner invocation, check completion, and
 // failure re-raising so the queue can release dedupe reservations.
 func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func(JobSpec) Outcome) error {
+	return ReleaseFromWorkflowRunContext(cfg.Context, payload, cfg, runner)
+}
+
+func ReleaseFromWorkflowRunContext(parent context.Context, payload *WebhookPayload, cfg *AppConfig, runner func(JobSpec) Outcome) error {
+	ctx, cancel := context.WithTimeout(process.Context([]context.Context{parent}), resolveJobTimeout(cfg.JobTimeout))
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	decision := ShouldHandleWorkflowRun(payload, cfg)
 	if decision.Status == "ignored" {
 		return nil
@@ -579,7 +516,7 @@ func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func
 	if err != nil {
 		return err
 	}
-	token, err := mintToken(apiURL, cfg.AppID, cfg.PrivateKey, payload.Installation.ID, []int64{payload.Repository.ID})
+	token, err := mintToken(apiURL, cfg.AppID, cfg.PrivateKey, payload.Installation.ID, []int64{payload.Repository.ID}, ctx)
 	if err != nil {
 		return err
 	}
@@ -589,6 +526,9 @@ func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func
 		return err
 	}
 
+	clientCopy := *client
+	client = &clientCopy
+	client.Context = ctx
 	checkRunID, createErr := createReleaseCheckRun(client, fullName, headSha)
 	if createErr != nil {
 		warnf("Could not create Versionhoo Release check: %v", createErr)
@@ -596,6 +536,8 @@ func ReleaseFromWorkflowRun(payload *WebhookPayload, cfg *AppConfig, runner func
 	}
 
 	spec := buildJobSpec(payload, cfg, token)
+	spec.Context = ctx
+	spec.Timeout = cfg.JobTimeout
 	result := runner(spec)
 
 	if result.Err != nil {
@@ -640,4 +582,13 @@ var buildJobSpec = func(payload *WebhookPayload, cfg *AppConfig, token string) J
 		GitAuthorEmail:     cfg.GitAuthorEmail,
 		KeepWorkDir:        cfg.KeepWorkDir,
 	}
+}
+
+const DefaultJobTimeout = 15 * time.Minute
+
+func resolveJobTimeout(value time.Duration) time.Duration {
+	if value > 0 {
+		return value
+	}
+	return DefaultJobTimeout
 }

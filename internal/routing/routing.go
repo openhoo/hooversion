@@ -81,7 +81,7 @@ func isInside(file, packagePath string) bool {
 	if err != nil {
 		return false
 	}
-	return rel == "" || (!strings.HasPrefix(rel, "..") && rel != ".")
+	return rel == "" || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".")
 }
 
 func containsString(values []string, want string) bool {

@@ -14,8 +14,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/openhoo/hooversion/internal/commit"
 	"github.com/openhoo/hooversion/internal/config"
@@ -441,16 +443,19 @@ func planCommand(cwd string, flags *cliFlags) error {
 }
 
 func releaseCommand(cwd string, flags *cliFlags) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	cfg, err := config.Load(cwd, flags.value("config"))
 	if err != nil {
 		return err
 	}
-	p, err := buildPlan(cwd, cfg)
+	p, err := buildPlanWithContext(ctx, cwd, cfg)
 	if err != nil {
 		return err
 	}
 	dryRun := flags.boolean("dry-run")
 	execution, err := release.Execute(cwd, cfg, p, release.Options{
+		Context:     ctx,
 		DryRun:      dryRun,
 		NoPushSet:   flags.boolean("no-push"),
 		Push:        false,
@@ -463,7 +468,7 @@ func releaseCommand(cwd string, flags *cliFlags) error {
 	printPlan(execution.Plan)
 	switch {
 	case dryRun:
-		fmt.Fprintln(os.Stdout, "Dry run complete; no files, commits, tags, or releases were created.")
+		fmt.Fprintln(os.Stdout, "Dry run complete; no release files, commits, tags, or releases were created.")
 	case execution.Published:
 		fmt.Fprintln(os.Stdout, "Release complete.")
 	default:
@@ -613,11 +618,15 @@ func migrateCommand(cwd string, flags *cliFlags) error {
 
 // buildPlan loads the current branch and derives the release plan.
 func buildPlan(cwd string, cfg *types.NormalizedConfig) (*types.ReleasePlan, error) {
-	branch, err := git.CurrentBranch(cwd)
+	return buildPlanWithContext(context.Background(), cwd, cfg)
+}
+
+func buildPlanWithContext(ctx context.Context, cwd string, cfg *types.NormalizedConfig) (*types.ReleasePlan, error) {
+	branch, err := git.CurrentBranchWithEnv(cwd, nil, ctx)
 	if err != nil {
 		return nil, err
 	}
-	return plan.CreatePlan(cwd, cfg, branch, nil)
+	return plan.CreatePlanWithEnv(cwd, cfg, branch, nil, nil, ctx)
 }
 
 // printPlan renders the plan layout asserted by tests and scripts.

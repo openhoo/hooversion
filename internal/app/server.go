@@ -6,6 +6,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,9 +15,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	hverr "github.com/openhoo/hooversion/internal/errors"
@@ -35,6 +38,9 @@ const (
 
 // AppConfig mirrors VersionhooAppConfig.
 type AppConfig struct {
+	Context              context.Context
+	JobTimeout           time.Duration
+	MaxConcurrent        int
 	AppID                string
 	PrivateKey           string
 	WebhookSecret        string
@@ -147,12 +153,24 @@ func LoadAppConfigFromEnv(getenv func(string) string) (*AppConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	maxConcurrent, err := positiveIntEnv(getenv, [2]string{"VERSIONHOO_MAX_CONCURRENT", "HOOVERSION_MAX_CONCURRENT"}, DefaultQueueMaxConcurrent, "VERSIONHOO_MAX_CONCURRENT must be a positive integer.")
+	if err != nil {
+		return nil, err
+	}
+	jobTimeoutSeconds, err := positiveIntEnv(getenv, [2]string{"VERSIONHOO_JOB_TIMEOUT_SECONDS", "HOOVERSION_JOB_TIMEOUT_SECONDS"}, int(DefaultJobTimeout/time.Second), "VERSIONHOO_JOB_TIMEOUT_SECONDS must be a positive integer.")
+	if err != nil {
+		return nil, err
+	}
+	if jobTimeoutSeconds > int((24*time.Hour)/time.Second) {
+		return nil, fmt.Errorf("VERSIONHOO_JOB_TIMEOUT_SECONDS must not exceed 86400")
+	}
 	privateKey, err := ReadGitHubAppPrivateKey(getenv)
 	if err != nil {
 		return nil, err
 	}
 
 	return &AppConfig{
+		MaxConcurrent: maxConcurrent, JobTimeout: time.Duration(jobTimeoutSeconds) * time.Second,
 		AppID:                appID,
 		PrivateKey:           privateKey,
 		WebhookSecret:        webhookSecret,
@@ -197,16 +215,29 @@ func newWebhookServer(handler http.Handler) *http.Server {
 }
 
 func Run(getenv func(string) string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return RunContext(ctx, getenv)
+}
+
+// RunContext stops intake and drains canceled execution before spool ownership
+// is released. Unfinished durable entries are replayed by the next process.
+func RunContext(ctx context.Context, getenv func(string) string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	cfg, err := LoadAppConfigFromEnv(getenv)
 	if err != nil {
 		return err
 	}
+	cfg.Context = ctx
 	spool, err := NewWebhookSpool(resolveWebhookSpoolDir(cfg), cfg.WebhookMaxBodyBytes, cfg.WebhookSpoolMaxBytes)
 	if err != nil {
 		return err
 	}
 	defer spool.Close()
-	queue := NewReleaseTaskQueue(nil, QueueOptions{})
+	queue := NewReleaseTaskQueue(nil, QueueOptions{Context: ctx, MaxConcurrent: cfg.MaxConcurrent})
+	defer queue.Cancel()
 	deduper := NewWebhookDeduper(0, nil)
 	handler := NewWebhookHandler(cfg, Runner, queue, deduper, spool)
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
@@ -216,7 +247,40 @@ func Run(getenv func(string) string) error {
 	}
 	log.Printf("versionhoo app listening on http://%s:%d", cfg.Host, cfg.Port)
 	server := newWebhookServer(rootRoutes(handler))
-	return server.Serve(listener)
+	return serveApp(ctx, server, listener, queue, spool)
+}
+
+func serveApp(ctx context.Context, server *http.Server, listener net.Listener, queue *ReleaseTaskQueue, spool *WebhookSpool) error {
+	done := make(chan error, 1)
+	go func() { done <- server.Serve(listener) }()
+	select {
+	case err := <-done:
+		spool.Stop()
+		queue.Cancel()
+		queue.Wait()
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	case <-ctx.Done():
+		spool.Stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := server.Shutdown(shutdownCtx)
+		cancel()
+		if err != nil {
+			_ = server.Close()
+		}
+		queue.Cancel()
+		queue.Wait()
+		serveErr := <-done
+		if err != nil {
+			return err
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return serveErr
+		}
+		return nil
+	}
 }
 
 func resolveWebhookSpoolDir(cfg *AppConfig) string {
@@ -404,7 +468,7 @@ func NewWebhookHandler(
 				if validationError != "" {
 					return errors.New(validationError)
 				}
-				if err := ReleaseFromWorkflowRun(payload, cfg, runner); err != nil {
+				if err := ReleaseFromWorkflowRunContext(queue.Context(), payload, cfg, runner); err != nil {
 					return err
 				}
 				businessComplete = true
@@ -416,6 +480,12 @@ func NewWebhookHandler(
 				return nil
 			}
 			onFinalFailure := func(error) {
+				if queue.Context().Err() != nil && !businessComplete {
+					spool.unclaim(entry.Path)
+					deduper.Release(entry.Record.DeliveryKey)
+					deduper.Release(entry.Record.WorkflowKey)
+					return
+				}
 				if businessComplete {
 					if err := acknowledge(webhookSpoolStatusCompleted); err == nil {
 						deduper.Succeed(entry.Record.DeliveryKey)
@@ -529,7 +599,7 @@ func NewWebhookHandler(
 			}
 			spool.Wake()
 		} else if !queue.Enqueue(queueKey, func() error {
-			err := ReleaseFromWorkflowRun(payload, cfg, runner)
+			err := ReleaseFromWorkflowRunContext(queue.Context(), payload, cfg, runner)
 			if err != nil {
 				return err
 			}

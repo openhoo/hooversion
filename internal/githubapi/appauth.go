@@ -6,6 +6,7 @@ package githubapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,18 +18,19 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	hverr "github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/process"
 )
 
 const versionhooAppUserAgent = "versionhoo-app"
 
 // installationHTTPClient is a test seam; production uses http.DefaultClient.
-var installationHTTPClient = http.DefaultClient
+var installationHTTPClient = defaultHTTPClient
 
 // MintInstallationToken exchanges a GitHub App JWT for an installation access
 // token scoped to repositoryIDs. The api URL must be an absolute https URL
 // without userinfo, port, query, or fragment; host trust is the caller's
 // concern (the app layer validates against its trusted API URLs).
-func MintInstallationToken(apiURL, appID, privateKeyPEM string, installationID int64, repositoryIDs []int64) (string, error) {
+func MintInstallationToken(apiURL, appID, privateKeyPEM string, installationID int64, repositoryIDs []int64, contexts ...context.Context) (string, error) {
 	if installationID <= 0 {
 		return "", hverr.New("GitHub App installation id must be a positive integer.")
 	}
@@ -51,7 +53,7 @@ func MintInstallationToken(apiURL, appID, privateKeyPEM string, installationID i
 	if err != nil {
 		return "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, api+"/app/installations/"+fmt.Sprintf("%d", installationID)+"/access_tokens", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(process.Context(contexts), http.MethodPost, api+"/app/installations/"+fmt.Sprintf("%d", installationID)+"/access_tokens", bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
@@ -61,20 +63,26 @@ func MintInstallationToken(apiURL, appID, privateKeyPEM string, installationID i
 	req.Header.Set("User-Agent", versionhooAppUserAgent)
 	req.Header.Set("X-GitHub-Api-Version", githubAPIVersion)
 
-	resp, err := installationHTTPClient.Do(req)
+	resp, err := guardedHTTPClient(installationHTTPClient).Do(req)
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+		if len(body) > maxErrorBody {
+			body = append(body[:maxErrorBody], []byte("...[truncated]")...)
+		}
 		return "", hverr.New("GitHub App installation token request failed (%d %s): %s", resp.StatusCode, http.StatusText(resp.StatusCode), body)
 	}
 	var decoded struct {
 		Token string `json:"token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := decodeJSONBody(resp, &decoded); err != nil {
 		return "", err
+	}
+	if strings.TrimSpace(decoded.Token) == "" {
+		return "", hverr.New("GitHub App installation token response contains no token")
 	}
 	return decoded.Token, nil
 }

@@ -22,10 +22,10 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/openhoo/hooversion/internal/githubapi"
+	"github.com/openhoo/hooversion/internal/process"
 )
 
 const (
@@ -174,6 +174,7 @@ func Verify(ctx context.Context, options Options) (Result, error) {
 	if client == nil {
 		github := githubapi.New(options.APIURL, options.Token)
 		github.HTTP = &http.Client{Timeout: 30 * time.Second}
+		github.Context = ctx
 		client = github
 	}
 	runner := options.runner
@@ -200,6 +201,16 @@ func Verify(ctx context.Context, options Options) (Result, error) {
 	}
 	if options.RequireSignedTag && (!resolved.Annotated || !resolved.AllSignaturesVerified) {
 		return Result{}, fmt.Errorf("release tag %s lacks a verified annotated-tag signature", release.TagName)
+	}
+	// Production clients fetch the complete paginated inventory. The optional
+	// interface preserves compatibility with narrow verifier implementations.
+	if inventory, ok := client.(interface {
+		ListReleaseAssets(string, int64) ([]githubapi.Asset, error)
+	}); ok {
+		release.Assets, err = inventory.ListReleaseAssets(options.Repository, release.ID)
+		if err != nil {
+			return Result{}, err
+		}
 	}
 	assets, err := indexAssets(release.Assets)
 	if err != nil {
@@ -608,9 +619,12 @@ func tarContainsLicense(path, name string) error {
 		return fmt.Errorf("inspect %s: %w", name, err)
 	}
 	defer gz.Close()
-	reader := tar.NewReader(gz)
+	// Bound actual decompressed bytes too, including padding and extensions.
+	limited := &io.LimitedReader{R: gz, N: maxArchiveBytes + 1}
+	reader := tar.NewReader(limited)
+	found := false
 	var total int64
-	for entries := 0; entries < 10000; entries++ {
+	for entries := 0; ; entries++ {
 		header, err := reader.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -618,22 +632,48 @@ func tarContainsLicense(path, name string) error {
 		if err != nil {
 			return fmt.Errorf("inspect %s: %w", name, err)
 		}
+		if entries >= maxArchiveEntries {
+			return fmt.Errorf("inspect %s: archive has too many entries", name)
+		}
 		if err := safeArchivePath(header.Name); err != nil {
 			return fmt.Errorf("inspect %s: %w", name, err)
 		}
-		total += header.Size
-		if header.Size < 0 || total > 512<<20 {
+		if header.Size < 0 || header.Size > maxArchiveBytes-total {
 			return fmt.Errorf("inspect %s: uncompressed archive exceeds 512 MiB", name)
+		}
+		total += header.Size
+		if header.Typeflag == tar.TypeSymlink || header.Typeflag == tar.TypeLink {
+			if err := safeArchivePath(header.Linkname); err != nil {
+				return fmt.Errorf("inspect %s: unsafe archive link: %w", name, err)
+			}
 		}
 		if header.Typeflag == tar.TypeReg && strings.EqualFold(filepath.Base(header.Name), "LICENSE") {
 			if header.Size <= 0 || header.Size > 1<<20 {
 				return fmt.Errorf("inspect %s: LICENSE has invalid size", name)
 			}
-			return nil
+			found = true
+		}
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			return fmt.Errorf("inspect %s: %w", name, err)
 		}
 	}
-	return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	// Reaching tar EOF does not yet validate the gzip trailer/CRC.
+	if _, err := io.Copy(io.Discard, limited); err != nil {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("inspect %s: uncompressed archive exceeds 512 MiB", name)
+	}
+	if !found {
+		return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	}
+	return nil
 }
+
+const (
+	maxArchiveBytes   = int64(512 << 20)
+	maxArchiveEntries = 10000
+)
 
 func zipContainsLicense(path, name string) error {
 	reader, err := zip.OpenReader(path)
@@ -641,32 +681,58 @@ func zipContainsLicense(path, name string) error {
 		return fmt.Errorf("inspect %s: %w", name, err)
 	}
 	defer reader.Close()
-	if len(reader.File) > 10000 {
+	if len(reader.File) > maxArchiveEntries {
 		return fmt.Errorf("inspect %s: archive has too many entries", name)
 	}
+	found := false
 	var total uint64
 	for _, entry := range reader.File {
 		if err := safeArchivePath(entry.Name); err != nil {
 			return fmt.Errorf("inspect %s: %w", name, err)
 		}
-		total += entry.UncompressedSize64
-		if total > 512<<20 {
+		if entry.UncompressedSize64 > uint64(maxArchiveBytes)-total {
 			return fmt.Errorf("inspect %s: uncompressed archive exceeds 512 MiB", name)
 		}
-		if !entry.FileInfo().IsDir() && strings.EqualFold(filepath.Base(entry.Name), "LICENSE") {
+		total += entry.UncompressedSize64
+		if entry.Mode().IsRegular() && strings.EqualFold(filepath.Base(entry.Name), "LICENSE") {
 			if entry.UncompressedSize64 == 0 || entry.UncompressedSize64 > 1<<20 {
 				return fmt.Errorf("inspect %s: LICENSE has invalid size", name)
 			}
-			return nil
+			found = true
+		}
+		content, err := entry.Open()
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", name, err)
+		}
+		read, readErr := io.Copy(io.Discard, io.LimitReader(content, int64(entry.UncompressedSize64)+1))
+		closeErr := content.Close()
+		if readErr != nil {
+			return fmt.Errorf("inspect %s: %w", name, readErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if uint64(read) != entry.UncompressedSize64 {
+			return fmt.Errorf("inspect %s: entry size mismatch", name)
 		}
 	}
-	return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	if !found {
+		return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	}
+	return nil
 }
 
 func safeArchivePath(name string) error {
-	clean := filepath.Clean(filepath.FromSlash(strings.ReplaceAll(name, `\`, "/")))
-	if name == "" || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	normalized := strings.ReplaceAll(name, `\`, "/")
+	clean := filepath.Clean(filepath.FromSlash(normalized))
+	if name == "" || strings.ContainsRune(name, '\x00') || strings.HasPrefix(normalized, "/") ||
+		(len(normalized) >= 2 && normalized[1] == ':') || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("unsafe archive path %q", name)
+	}
+	for _, part := range strings.Split(normalized, "/") {
+		if part == ".." {
+			return fmt.Errorf("unsafe archive path %q", name)
+		}
 	}
 	return nil
 }
@@ -678,56 +744,15 @@ func (executableRunner) Run(ctx context.Context, name string, arguments, environ
 	if err != nil {
 		return nil, fmt.Errorf("required verifier %s: %w", name, err)
 	}
-	commandContext, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	command := exec.CommandContext(commandContext, executable, arguments...)
-	command.Env = environment
-	output := &boundedOutput{maximum: maxCommandOutput}
-	command.Stdout = output
-	command.Stderr = output
-	err = command.Run()
-	data, exceeded := output.Result()
-	if exceeded {
-		return nil, fmt.Errorf("%s output exceeds 1 MiB", name)
-	}
-	if err != nil {
-		message := strings.TrimSpace(string(data))
-		if message == "" {
-			return nil, err
+	result := process.Run(ctx, process.Options{Env: environment, Timeout: 2 * time.Minute, OutputLimit: maxCommandOutput}, executable, arguments...)
+	if result.Err != nil {
+		message := strings.TrimSpace(result.Stdout + result.Stderr)
+		if message != "" {
+			return nil, fmt.Errorf("%w: %s", result.Err, message)
 		}
-		return nil, fmt.Errorf("%w: %s", err, message)
+		return nil, result.Err
 	}
-	return data, nil
-}
-
-type boundedOutput struct {
-	mu       sync.Mutex
-	data     []byte
-	maximum  int
-	exceeded bool
-}
-
-func (output *boundedOutput) Write(data []byte) (int, error) {
-	output.mu.Lock()
-	defer output.mu.Unlock()
-	remaining := output.maximum - len(output.data)
-	if remaining > 0 {
-		count := len(data)
-		if count > remaining {
-			count = remaining
-		}
-		output.data = append(output.data, data[:count]...)
-	}
-	if len(data) > remaining {
-		output.exceeded = true
-	}
-	return len(data), nil
-}
-
-func (output *boundedOutput) Result() ([]byte, bool) {
-	output.mu.Lock()
-	defer output.mu.Unlock()
-	return append([]byte(nil), output.data...), output.exceeded
+	return []byte(result.Stdout + result.Stderr), nil
 }
 
 func verificationEnvironment(token string) []string {

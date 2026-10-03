@@ -4,18 +4,22 @@
 package release
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/openhoo/hooversion/internal/changelog"
+	"github.com/openhoo/hooversion/internal/envutil"
 	"github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/git"
 	"github.com/openhoo/hooversion/internal/githubapi"
 	"github.com/openhoo/hooversion/internal/manifest"
 	"github.com/openhoo/hooversion/internal/output"
+	releaseplan "github.com/openhoo/hooversion/internal/plan"
+	"github.com/openhoo/hooversion/internal/process"
+	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
 
@@ -24,6 +28,7 @@ import (
 // wins over config.Push; otherwise config.Push applies. The GitHub pair works
 // the same way against a default of true.
 type Options struct {
+	Context     context.Context
 	DryRun      bool
 	NoPushSet   bool
 	Push        bool
@@ -46,24 +51,61 @@ type Result struct {
 // Execute runs the pipeline in the exact src/release.ts step order: resume
 // derivation, drift checks, validation, dry-run exit, clean-tree gate with
 // managed-output exemption, mutations, atomic push, GitHub publish, outputs.
-func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, o Options) (Result, error) {
-	effective := plan
-	if derived, err := DeriveResumableWithEnv(cwd, config, o.BaseEnv); err != nil {
-		return Result{}, err
-	} else if derived != nil {
-		effective = derived
+func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, o Options) (result Result, returnErr error) {
+	ctx := o.Context
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	resumable := isResumableReleaseWithEnv(cwd, effective, o.BaseEnv)
-
-	if resumable {
-		if err := verifyResumableRemoteWithAuthEnv(cwd, effective, o.BaseEnv, o.GitAuth); err != nil {
+	txn, owner, err := openTransaction(ctx, cwd, o.BaseEnv)
+	if err != nil {
+		return Result{}, err
+	}
+	defer owner.Close()
+	defer txn.close()
+	existing, err := txn.load(config)
+	if err != nil {
+		return Result{}, err
+	}
+	recovered := false
+	if existing {
+		if o.DryRun {
+			return Result{}, fmt.Errorf("release recovery is pending; run release without --dry-run to recover or resume")
+		}
+		recovered, err = txn.recover(ctx)
+		if err != nil {
 			return Result{}, err
 		}
-	} else if err := verifySourceWithAuthEnv(cwd, effective, o.BaseEnv, o.GitAuth); err != nil {
+		if !recovered {
+			plan = txn.state.Plan
+		}
+	}
+	if recovered {
+		plan, err = releaseplan.CreatePlanWithEnv(cwd, config, plan.Branch, nil, o.BaseEnv, ctx)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+	effective := plan
+	if derived, err := DeriveResumableWithEnv(cwd, config, o.BaseEnv, ctx); err != nil {
+		return Result{}, err
+	} else if derived != nil && (!existing || recovered) {
+		effective = derived
+	}
+	resumable := isResumableReleaseWithEnv(cwd, effective, o.BaseEnv, ctx)
+
+	if resumable {
+		if err := verifyResumableRemoteWithAuthEnv(cwd, effective, o.BaseEnv, o.GitAuth, ctx); err != nil {
+			return Result{}, err
+		}
+	} else if err := verifySourceWithAuthEnv(cwd, effective, o.BaseEnv, o.GitAuth, ctx); err != nil {
 		return Result{}, err
 	}
 
-	if err := ValidateWithEnv(cwd, config, effective, resumable, o.BaseEnv); err != nil {
+	if err := ValidateWithEnv(cwd, config, effective, resumable, o.BaseEnv, ctx); err != nil {
+		return Result{}, err
+	}
+
+	if err := manifest.ValidateVersionUpdatesWithFS(cwd, effective.Releases, config.Packages, txn.files); err != nil {
 		return Result{}, err
 	}
 
@@ -71,10 +113,32 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 		return Result{Plan: effective}, nil
 	}
 
-	store := output.Store{Cwd: cwd, OutputDir: config.OutputDir}
-	if err := git.EnsureCleanWorkingTreeWithEnv(cwd, store.Paths(), o.BaseEnv); err != nil {
+	store := output.Store{Cwd: cwd, OutputDir: config.OutputDir, BaseEnv: o.BaseEnv, Root: txn.files}
+	if err := git.EnsureCleanWorkingTreeWithEnv(cwd, store.Paths(), o.BaseEnv, ctx); err != nil {
 		return Result{}, err
 	}
+	if !existing || recovered {
+		paths, err := manifest.ManagedPathsWithFS(cwd, config.Packages, txn.files)
+		if err != nil {
+			return Result{}, err
+		}
+		for _, pkg := range config.Packages {
+			paths = append(paths, pkg.Changelog)
+		}
+		destinations, err := store.Destinations(effective.Releases)
+		if err != nil {
+			return Result{}, err
+		}
+		paths = append(paths, destinations...)
+		if err := txn.snapshot(ctx, config, effective, paths); err != nil {
+			return Result{}, err
+		}
+	}
+	defer func() {
+		if returnErr != nil {
+			returnErr = txn.abort(returnErr)
+		}
+	}()
 	if err := store.Clear(); err != nil {
 		return Result{}, err
 	}
@@ -83,11 +147,20 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 		if err := store.Write(effective.Releases, false); err != nil {
 			return Result{}, err
 		}
+		if err := txn.finish(); err != nil {
+			return Result{}, err
+		}
 		return Result{Plan: effective}, nil
 	}
 
 	if !resumable {
-		if err := runHooksWithEnv(cwd, config.Hooks.BeforeRelease, o.BaseEnv); err != nil {
+		if err := txn.advance("mutating"); err != nil {
+			return Result{}, err
+		}
+		if err := runHooksWithEnv(cwd, config.Hooks.BeforeRelease, o.BaseEnv, ctx); err != nil {
+			return Result{}, err
+		}
+		if err := verifyLocalSource(cwd, effective, o.BaseEnv, ctx); err != nil {
 			return Result{}, err
 		}
 		releasedVersions := make(map[string]string, len(effective.Releases))
@@ -95,44 +168,65 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 			releasedVersions[release.Package.Name] = release.NextVersion
 			pkg := release.Package
 			pkg.Manifest = filepath.Join(cwd, pkg.Manifest)
-			if err := manifest.UpdateVersion(pkg, release.NextVersion); err != nil {
+			if err := manifest.UpdateVersionWithFS(pkg, release.NextVersion, txn.files); err != nil {
 				return Result{}, err
 			}
 		}
 		for _, pkg := range config.Packages {
-			if err := manifest.UpdateLocalDependencyVersions(cwd, pkg, releasedVersions); err != nil {
+			if err := manifest.UpdateLocalDependencyVersionsWithFS(cwd, pkg, releasedVersions, txn.files); err != nil {
 				return Result{}, err
 			}
 		}
 		for _, release := range effective.Releases {
 			changelogPath := filepath.Join(cwd, release.Package.Changelog)
-			if err := changelog.Update(changelogPath, release.Notes, release.Package.Name); err != nil {
+			if err := changelog.UpdateWithFS(changelogPath, release.Notes, release.Package.Name, txn.files); err != nil {
 				return Result{}, err
 			}
 		}
 
-		if err := runHooksWithEnv(cwd, config.Hooks.AfterVersion, o.BaseEnv); err != nil {
+		if err := runHooksWithEnv(cwd, config.Hooks.AfterVersion, o.BaseEnv, ctx); err != nil {
+			return Result{}, err
+		}
+		if err := verifyLocalSource(cwd, effective, o.BaseEnv, ctx); err != nil {
 			return Result{}, err
 		}
 
-		if err := git.CreateReleaseCommitWithEnv(cwd, CommitMessage(effective), o.BaseEnv); err != nil {
+		if err := txn.checkIdentity(); err != nil {
+			return Result{}, err
+		}
+		if err := txn.advance("committing"); err != nil {
+			return Result{}, err
+		}
+		if err := git.CreateReleaseCommitWithEnv(cwd, CommitMessage(effective), o.BaseEnv, ctx); err != nil {
+			return Result{}, err
+		}
+		if err := txn.releaseHead(ctx); err != nil {
+			return Result{}, err
+		}
+		if err := txn.advance("tagging"); err != nil {
 			return Result{}, err
 		}
 		for _, release := range effective.Releases {
+			if err := txn.checkIdentity(); err != nil {
+				return Result{}, err
+			}
 			message := fmt.Sprintf("%s %s", release.Package.Name, release.NextVersion)
-			if err := git.CreateAnnotatedTagWithEnv(cwd, release.Tag, message, o.BaseEnv); err != nil {
+			if err := git.CreateAnnotatedTagWithEnv(cwd, release.Tag, message, o.BaseEnv, ctx); err != nil {
 				return Result{}, err
 			}
 		}
 	} else {
+		if err := txn.checkIdentity(); err != nil {
+			return Result{}, err
+		}
 		for _, release := range effective.Releases {
-			ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+release.Tag, o.BaseEnv)
+			ref, err := git.RefShaWithEnv(cwd, "refs/tags/"+release.Tag, o.BaseEnv, ctx)
 			if err != nil {
 				return Result{}, err
 			}
 			if ref == "" {
 				message := fmt.Sprintf("%s %s", release.Package.Name, release.NextVersion)
-				if err := git.CreateAnnotatedTagWithEnv(cwd, release.Tag, message, o.BaseEnv); err != nil {
+				if err := git.CreateAnnotatedTagWithEnv(cwd, release.Tag, message, o.BaseEnv, ctx); err != nil {
 					return Result{}, err
 				}
 			}
@@ -144,16 +238,22 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 		shouldPush = o.Push
 	}
 	if shouldPush {
+		if err := txn.checkIdentity(); err != nil {
+			return Result{}, err
+		}
+		if err := txn.advance("external"); err != nil {
+			return Result{}, err
+		}
 		tags := make([]string, 0, len(effective.Releases))
 		for _, release := range effective.Releases {
 			tags = append(tags, release.Tag)
 		}
-		if err := git.PushReleaseWithEnv(cwd, effective.Branch, tags, o.GitAuth, o.BaseEnv); err != nil {
+		if err := git.PushReleaseWithEnv(cwd, effective.Branch, tags, o.GitAuth, o.BaseEnv, ctx); err != nil {
 			return Result{}, err
 		}
 	}
 
-	if err := os.MkdirAll(filepath.Join(cwd, config.OutputDir), 0o755); err != nil {
+	if err := txn.files.MkdirAll(config.OutputDir, 0o755); err != nil {
 		return Result{}, err
 	}
 
@@ -163,12 +263,12 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 	}
 	shouldPublishGitHub := shouldGitHub && config.GitHub.Enabled && config.GitHub.Releases
 	if shouldPublishGitHub && !shouldPush {
-		head, err := git.HeadShaWithEnv(cwd, o.BaseEnv)
+		head, err := git.HeadShaWithEnv(cwd, o.BaseEnv, ctx)
 		if err != nil {
 			return Result{}, err
 		}
 		for _, release := range effective.Releases {
-			remote, err := git.RemoteTagShaWithAuthEnv(cwd, release.Tag, o.BaseEnv, o.GitAuth)
+			remote, err := git.RemoteTagShaWithAuthEnv(cwd, release.Tag, o.BaseEnv, o.GitAuth, ctx)
 			if err != nil {
 				return Result{}, errors.New(
 					"GitHub publication with --no-push requires tag %s to resolve remotely; push the tag first or disable GitHub publication: %v",
@@ -186,7 +286,10 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 		}
 	}
 	if shouldPublishGitHub {
-		if err := publishGitHubReleasesWithEnv(cwd, config, effective, o.GitHubToken, o.BaseEnv); err != nil {
+		if err := txn.advance("external"); err != nil {
+			return Result{}, err
+		}
+		if err := publishGitHubReleasesWithEnv(cwd, config, effective, o.GitHubToken, o.BaseEnv, ctx); err != nil {
 			return Result{}, err
 		}
 	}
@@ -194,7 +297,13 @@ func Execute(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan
 	if err := store.Write(effective.Releases, true); err != nil {
 		return Result{}, err
 	}
-	if err := runHooksWithEnv(cwd, config.Hooks.AfterRelease, o.BaseEnv); err != nil {
+	if err := txn.advance("published"); err != nil {
+		return Result{}, err
+	}
+	if err := runHooksWithEnv(cwd, config.Hooks.AfterRelease, o.BaseEnv, ctx); err != nil {
+		return Result{}, err
+	}
+	if err := txn.finish(); err != nil {
 		return Result{}, err
 	}
 	return Result{Published: true, Plan: effective}, nil
@@ -207,7 +316,18 @@ func Validate(cwd string, config *types.NormalizedConfig, plan *types.ReleasePla
 	return ValidateWithEnv(cwd, config, plan, resumable, nil)
 }
 
-func ValidateWithEnv(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, resumable bool, baseEnv []string) error {
+func ValidateWithEnv(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, resumable bool, baseEnv []string, contexts ...context.Context) error {
+	// Recheck mutable paths even when callers construct normalized config
+	// directly or hooks/output state changed since configuration loading.
+	paths := []string{config.OutputDir, ".release-version"}
+	for _, pkg := range config.Packages {
+		paths = append(paths, pkg.Manifest, pkg.Changelog)
+	}
+	for _, path := range paths {
+		if err := safefs.RequireContainedPath(cwd, path); err != nil {
+			return err
+		}
+	}
 	tagOwners := make(map[string]string, len(plan.Releases))
 	for _, release := range plan.Releases {
 		if previous, exists := tagOwners[release.Tag]; exists {
@@ -241,7 +361,7 @@ func ValidateWithEnv(cwd string, config *types.NormalizedConfig, plan *types.Rel
 
 	if !resumable {
 		for _, release := range plan.Releases {
-			exists, err := git.TagExistsWithEnv(cwd, release.Tag, baseEnv)
+			exists, err := git.TagExistsWithEnv(cwd, release.Tag, baseEnv, contexts...)
 			if err != nil {
 				return err
 			}
@@ -270,13 +390,9 @@ func CommitMessage(plan *types.ReleasePlan) string {
 	return fmt.Sprintf("chore(release): %s\n\n%s", strings.Join(summary, ", "), strings.Join(blocks, "\n\n"))
 }
 
-func runHooks(cwd string, hooks []string) error {
-	return runHooksWithEnv(cwd, hooks, nil)
-}
-
-func runHooksWithEnv(cwd string, hooks []string, baseEnv []string) error {
+func runHooksWithEnv(cwd string, hooks []string, baseEnv []string, contexts ...context.Context) error {
 	for _, hook := range hooks {
-		result, err := runShellWithEnv(hook, cwd, baseEnv)
+		result, err := runShellWithEnv(hook, cwd, baseEnv, contexts...)
 		if err != nil {
 			return err
 		}
@@ -299,43 +415,19 @@ type shellResult struct {
 	stderr string
 }
 
-func runShell(command, cwd string) (shellResult, error) {
-	return runShellWithEnv(command, cwd, nil)
-}
-
-func runShellWithEnv(command, cwd string, baseEnv []string) (shellResult, error) {
-	interpreter := os.Getenv("SHELL")
-	if baseEnv != nil {
-		interpreter = ""
-		for _, entry := range baseEnv {
-			if strings.HasPrefix(entry, "SHELL=") {
-				interpreter = strings.TrimPrefix(entry, "SHELL=")
-				break
-			}
-		}
-	}
+func runShellWithEnv(command, cwd string, baseEnv []string, contexts ...context.Context) (shellResult, error) {
+	interpreter := envutil.Get(baseEnv, "SHELL")
 	if interpreter == "" {
 		interpreter = "/bin/sh"
 	}
-	cmd := exec.Command(interpreter, "-c", command)
-	cmd.Dir = cwd
-	if baseEnv != nil {
-		cmd.Env = append([]string{}, baseEnv...)
-	}
-	var stdout, stderr strings.Builder
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	code := 0
-	if err != nil {
+	result := process.Run(process.Context(contexts), process.Options{Dir: cwd, Env: baseEnv}, interpreter, "-c", command)
+	if result.Err != nil {
 		var exitErr *exec.ExitError
-		if ok := asExitError(err, &exitErr); ok {
-			code = exitErr.ExitCode()
-		} else {
-			code = 1
+		if !asExitError(result.Err, &exitErr) {
+			return shellResult{}, result.Err
 		}
 	}
-	return shellResult{code: code, stdout: stdout.String(), stderr: stderr.String()}, nil
+	return shellResult{code: result.Code, stdout: result.Stdout, stderr: result.Stderr}, nil
 }
 
 func asExitError(err error, target **exec.ExitError) bool {
@@ -365,17 +457,17 @@ func publishGitHubReleases(cwd string, config *types.NormalizedConfig, plan *typ
 
 // publishGitHubReleasesWithEnv publishes using the supplied child environment
 // for repository-origin lookups.
-func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, tokenOption string, baseEnv []string) error {
+func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, plan *types.ReleasePlan, tokenOption string, baseEnv []string, contexts ...context.Context) error {
 	if !config.GitHub.Enabled || !config.GitHub.Releases {
 		return nil
 	}
 
 	token := tokenOption
 	if token == "" {
-		token = os.Getenv("GITHUB_TOKEN")
+		token = envutil.Get(baseEnv, "GITHUB_TOKEN")
 	}
 	if token == "" {
-		token = os.Getenv("GH_TOKEN")
+		token = envutil.Get(baseEnv, "GH_TOKEN")
 	}
 	if token == "" {
 		return errors.New("GITHUB_TOKEN or GH_TOKEN is required to create GitHub releases.")
@@ -383,7 +475,7 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 
 	repository := config.GitHub.Repository
 	if repository == "" {
-		origin, err := git.OriginRepositoryWithEnv(cwd, baseEnv)
+		origin, err := git.OriginRepositoryWithEnv(cwd, baseEnv, contexts...)
 		if err != nil {
 			return err
 		}
@@ -393,18 +485,8 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 		return errors.New("Could not determine GitHub repository. Set github.repository in hooversion config.")
 	}
 
-	// The landed asset reader resolves upload paths against the process CWD;
-	// scope it to the repository for the duration of publishing.
-	originalWd, err := os.Getwd()
-	if err != nil {
-		return err
-	}
-	if err := os.Chdir(cwd); err != nil {
-		return err
-	}
-	defer func() { _ = os.Chdir(originalWd) }()
-
 	client := newGitHubClient(config.GitHub.ApiUrl, token)
+	client.Context = process.Context(contexts)
 	for _, release := range plan.Releases {
 		releaseName := fmt.Sprintf("%s %s", release.Package.Name, release.NextVersion)
 		existing, err := client.ReleaseByTag(repository, release.Tag)
@@ -413,7 +495,7 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 		}
 
 		response := existing
-		existingAssetNames := make(map[string]bool)
+		existingAssets := make(map[string]githubapi.Asset)
 		if existing != nil {
 			matches := existing.TagName == release.Tag &&
 				existing.Name == releaseName &&
@@ -424,8 +506,12 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 				return errors.New(
 					"GitHub release already exists for tag %s with different metadata.", release.Tag)
 			}
-			for _, asset := range existing.Assets {
-				existingAssetNames[asset.Name] = true
+			inventory, err := client.ListReleaseAssets(repository, existing.ID)
+			if err != nil {
+				return err
+			}
+			for _, asset := range inventory {
+				existingAssets[asset.Name] = asset
 			}
 		} else {
 			created, err := client.CreateRelease(repository, githubapi.ReleaseInput{
@@ -443,7 +529,10 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 		var order []string
 		for _, asset := range release.Package.Assets {
 			name := filepath.Base(asset)
-			if existingAssetNames[name] {
+			if existingAsset, present := existingAssets[name]; present {
+				if err := client.VerifyExistingAssetFrom(cwd, repository, existingAsset, asset); err != nil {
+					return err
+				}
 				continue
 			}
 			if _, seen := missing[name]; !seen {
@@ -452,9 +541,8 @@ func publishGitHubReleasesWithEnv(cwd string, config *types.NormalizedConfig, pl
 			}
 		}
 		for _, name := range order {
-			// The process CWD is the repository here; upload.go re-roots
-			// uploads at Getwd(), so pass the raw repo-relative asset.
-			if err := client.UploadAsset(response.UploadURL, name, missing[name]); err != nil {
+			// Keep the upload rooted at this checkout without a global chdir.
+			if err := client.UploadAssetFrom(cwd, response.UploadURL, name, missing[name]); err != nil {
 				return err
 			}
 		}

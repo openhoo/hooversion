@@ -109,3 +109,34 @@ func TestMin(t *testing.T) {
 		t.Fatalf("Min(empty, empty) = %q", got)
 	}
 }
+
+func TestParseRejectsIntegerOverflow(t *testing.T) {
+	for _, version := range []string{"999999999999999999999999.1.0", "1.999999999999999999999999.0", "1.0.999999999999999999999999"} {
+		if _, err := semver.Parse(version); err == nil {
+			t.Errorf("accepted overflow %q", version)
+		}
+	}
+}
+
+func TestCheckedBumpRejectsOverflowAndUnknownTypes(t *testing.T) {
+	maximum := int(^uint(0) >> 1)
+	for _, test := range []struct {
+		version semver.SemVer
+		kind    types.ReleaseType
+	}{{semver.SemVer{Major: maximum}, types.Major}, {semver.SemVer{Minor: maximum}, types.Minor}, {semver.SemVer{Patch: maximum}, types.Patch}, {semver.SemVer{}, types.None}, {semver.SemVer{}, "invalid"}} {
+		if _, err := semver.CheckedBump(test.version, test.kind); err == nil {
+			t.Errorf("accepted %+v %s", test.version, test.kind)
+		}
+	}
+	if got, err := semver.CheckedBump(semver.SemVer{Major: 1, Minor: 2, Patch: 3}, types.Patch); err != nil || got.String() != "1.2.4" {
+		t.Fatalf("bump=%s err=%v", got, err)
+	}
+}
+
+func TestParseRejectsMalformedIdentifiers(t *testing.T) {
+	for _, version := range []string{"1.2.3-", "1.2.3+", "1.2.3-alpha..1", "1.2.3+build..1", "1.2.3-pre release", "1.2.3-pre\nrelease", "1.2.3-01"} {
+		if _, err := semver.Parse(version); err == nil {
+			t.Errorf("invalid version accepted: %q", version)
+		}
+	}
+}

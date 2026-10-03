@@ -425,10 +425,10 @@ func TestCommitsCollection(t *testing.T) {
 		t.Fatalf("range from..HEAD picked wrong commits: %+v", sinceFirst)
 	}
 
-	// Unknown range: rev-list runs with allowFailure, so result is empty, no error.
+	// Unknown ranges must fail closed rather than masquerading as empty history.
 	unknown, err := Commits(f.dir, "ffffffffffffffffffffffffffffffffffffffff", "HEAD")
-	if err != nil || len(unknown) != 0 {
-		t.Fatalf("bad range must yield empty slice without error, got (%v, %v)", unknown, err)
+	if err == nil || len(unknown) != 0 {
+		t.Fatalf("bad range must yield an error, got (%v, %v)", unknown, err)
 	}
 }
 
@@ -773,5 +773,107 @@ func TestCreateReleaseCommit(t *testing.T) {
 	msg, _ := CommitMessage(f.dir, "HEAD")
 	if msg != "chore(release): pkg 1.2.3" {
 		t.Fatalf("release commit message = %q", msg)
+	}
+}
+
+func TestCommitCollectionRejectsInvalidRanges(t *testing.T) {
+	f := initRepo(t, 1)
+	for _, collect := range []func(string, string, string) ([]types.RawCommit, error){Commits, func(cwd, from, to string) ([]types.RawCommit, error) {
+		return CommitsWithEnv(cwd, from, to, os.Environ())
+	}} {
+		for _, refs := range [][2]string{{"missing", "HEAD"}, {"", "missing"}, {"", "--all"}} {
+			if commits, err := collect(f.dir, refs[0], refs[1]); err == nil {
+				t.Errorf("range %q: returned %d commits without an error", refs, len(commits))
+			}
+		}
+	}
+}
+
+func TestCommitPathsPreserveGitFilenames(t *testing.T) {
+	f := initRepo(t, 1)
+	paths := []string{"packages/über/file.txt", "packages/space / file .txt", "packages/line\nbreak/file.txt", "packages/tab\t/file.txt"}
+	if os.PathSeparator == '\\' {
+		paths = paths[:2]
+	}
+	sha := f.addCommit(t, "fix: unusual paths", paths...)
+	last, err := LastCommit(f.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(files []string) {
+		t.Helper()
+		for _, path := range paths {
+			found := false
+			for _, file := range files {
+				if file == path {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("lost %q in %q", path, files)
+			}
+		}
+	}
+	check(last.Files)
+	for _, collect := range []func(string, string, string) ([]types.RawCommit, error){Commits, func(cwd, from, to string) ([]types.RawCommit, error) {
+		return CommitsWithEnv(cwd, from, to, os.Environ())
+	}} {
+		commits, err := collect(f.dir, f.commits[0], sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(commits) != 1 {
+			t.Fatalf("commits=%d", len(commits))
+		}
+		check(commits[0].Files)
+	}
+}
+
+func TestManagedPathsPreserveGitFilenames(t *testing.T) {
+	f := initRepo(t, 1)
+	path := "generated/über notes.json"
+	writeFile(t, filepath.Join(f.dir, path), "managed")
+	for _, check := range []func(string, map[string]bool) error{EnsureCleanWorkingTree, func(cwd string, managed map[string]bool) error {
+		return EnsureCleanWorkingTreeWithEnv(cwd, managed, os.Environ())
+	}} {
+		if err := check(f.dir, map[string]bool{path: false}); err != nil {
+			t.Errorf("managed file rejected: %v", err)
+		}
+	}
+}
+
+func TestDetachedBranchUsesExplicitEnvironment(t *testing.T) {
+	f := initRepo(t, 1)
+	runRepoCmd(t, f.dir, "checkout", "--detach", "HEAD")
+	t.Setenv("GITHUB_HEAD_REF", "parent-branch")
+	env := append(os.Environ(), "GITHUB_HEAD_REF=", "GITHUB_REF_TYPE=branch", "GITHUB_REF_NAME=child-branch")
+	branch, err := CurrentBranchWithEnv(f.dir, env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if branch != "child-branch" {
+		t.Fatalf("branch=%q", branch)
+	}
+}
+
+func TestRemoteProbeErrorsAreNotMissingRefs(t *testing.T) {
+	f := initRepo(t, 1)
+	runRepoCmd(t, f.dir, "remote", "add", "origin", filepath.Join(t.TempDir(), "does-not-exist.git"))
+	checks := []func() (string, error){func() (string, error) { return RemoteBranchSha(f.dir, "main") }, func() (string, error) { return RemoteBranchShaWithEnv(f.dir, "main", os.Environ()) }, func() (string, error) { return RemoteBranchShaWithAuthEnv(f.dir, "main", os.Environ(), nil) }, func() (string, error) { return RemoteTagSha(f.dir, "v1.0.0") }, func() (string, error) { return RemoteTagShaWithAuthEnv(f.dir, "v1.0.0", os.Environ(), nil) }}
+	for _, check := range checks {
+		if sha, err := check(); err == nil {
+			t.Errorf("unreachable remote returned %q without error", sha)
+		}
+	}
+}
+
+func TestRenameCannotHideUnmanagedSource(t *testing.T) {
+	f := initRepo(t, 1)
+	runRepoCmd(t, f.dir, "mv", "base.txt", "managed.txt")
+	if err := EnsureCleanWorkingTree(f.dir, map[string]bool{"managed.txt": false}); err == nil {
+		t.Fatal("managed destination hid user-owned source rename")
+	}
+	if err := EnsureCleanWorkingTree(f.dir, map[string]bool{"managed.txt": false, "base.txt": false}); err != nil {
+		t.Fatal(err)
 	}
 }

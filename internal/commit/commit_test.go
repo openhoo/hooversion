@@ -239,3 +239,14 @@ func TestFormat(t *testing.T) {
 		t.Fatalf("Format footer-breaking = %q", got)
 	}
 }
+
+func TestLintHeaderLimitCountsUnicodeCharacters(t *testing.T) {
+	short := commit.Parse(types.RawCommit{Subject: "fix: " + strings.Repeat("ü", 90)}, nil)
+	if issues := commit.Lint(short, nil); len(issues) != 0 {
+		t.Fatalf("Unicode header below 100 characters rejected: %+v", issues)
+	}
+	long := commit.Parse(types.RawCommit{Subject: "fix: " + strings.Repeat("ü", 96)}, nil)
+	if issues := commit.Lint(long, nil); len(issues) != 1 {
+		t.Fatalf("header above 100 characters not rejected: %+v", issues)
+	}
+}

@@ -10,11 +10,13 @@ package githubapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	hverr "github.com/openhoo/hooversion/internal/errors"
 )
@@ -35,6 +37,8 @@ type Client struct {
 	Token string
 	// HTTP is the transport; nil selects http.DefaultClient.
 	HTTP *http.Client
+	// Context cancels all requests for this operation. Nil preserves ordinary callers.
+	Context context.Context
 }
 
 // New returns a Client for baseURL, stripping a single trailing slash like
@@ -44,11 +48,18 @@ func New(baseURL, token string) *Client {
 	return &Client{BaseURL: baseURL, Token: token}
 }
 
+func (c *Client) requestContext() context.Context {
+	if c.Context != nil {
+		return c.Context
+	}
+	return context.Background()
+}
+
 // newRequest builds a request carrying the standard GitHub headers. A
 // non-empty contentType is applied after the defaults, matching the header
 // merge order in githubFetch.
 func (c *Client) newRequest(method, rawURL, contentType string, body io.Reader) (*http.Request, error) {
-	req, err := http.NewRequest(method, rawURL, body)
+	req, err := http.NewRequestWithContext(c.requestContext(), method, rawURL, body)
 	if err != nil {
 		return nil, err
 	}
@@ -70,9 +81,9 @@ func (c *Client) newRequest(method, rawURL, contentType string, body io.Reader) 
 func (c *Client) do(req *http.Request, notFoundIsEmpty bool) (*http.Response, error) {
 	client := c.HTTP
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultHTTPClient
 	}
-	resp, err := client.Do(req)
+	resp, err := guardedHTTPClient(client).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +104,7 @@ func (c *Client) do(req *http.Request, notFoundIsEmpty bool) (*http.Response, er
 // drainAndClose discards a fully consumed JSON body so the connection can be
 // reused.
 func drainAndClose(resp *http.Response) {
-	_, _ = io.Copy(io.Discard, resp.Body)
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxJSONBody+1))
 	_ = resp.Body.Close()
 }
 
@@ -143,4 +154,38 @@ func encodeURIComponent(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// Requests have a finite lifetime so a stalled API cannot hold the App queue
+// indefinitely. Explicit test/operator clients keep their configured timeout.
+var defaultHTTPClient = http.DefaultClient
+
+// Do not replay authenticated mutations through redirects. Asset downloads
+// may redirect, but credentials must never leave the exact original origin.
+func guardedHTTPClient(client *http.Client) *http.Client {
+	copy := *client
+	if copy.Timeout == 0 {
+		copy.Timeout = 2 * time.Minute
+	}
+	previous := copy.CheckRedirect
+	copy.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 10 {
+			return fmt.Errorf("too many GitHub API redirects")
+		}
+		first := via[0]
+		if first.Method != http.MethodGet && first.Method != http.MethodHead {
+			return fmt.Errorf("GitHub API mutation redirected")
+		}
+		if req.URL.Scheme != first.URL.Scheme || !strings.EqualFold(req.URL.Host, first.URL.Host) {
+			req.Header.Del("Authorization")
+		}
+		if first.URL.Scheme == "https" && req.URL.Scheme != "https" {
+			return fmt.Errorf("GitHub API redirect downgraded HTTPS")
+		}
+		if previous != nil {
+			return previous(req, via)
+		}
+		return nil
+	}
+	return &copy
 }

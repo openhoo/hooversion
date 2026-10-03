@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -195,5 +196,18 @@ func TestMintInstallationTokenHTTPErrorExactString(t *testing.T) {
 	const want = "GitHub App installation token request failed (500 Internal Server Error): oops\n"
 	if err == nil || err.Error() != want {
 		t.Fatalf("err = %v, want %q", err, want)
+	}
+}
+
+func TestMintInstallationTokenRejectsInvalidResponses(t *testing.T) {
+	_, pemKey := generateTestAppKey(t)
+	for _, body := range []string{`{}`, `{"token":""}`, `{"token":"valid"} {}`, fmt.Sprintf(`{"token":%q}`, strings.Repeat("x", maxJSONBody))} {
+		t.Run(fmt.Sprintf("bytes-%d", len(body)), func(t *testing.T) {
+			rec := &recorder{handler: func(w http.ResponseWriter, _ *http.Request, _ int) { fmt.Fprint(w, body) }}
+			useTLSRewrite(t, rec)
+			if _, err := MintInstallationToken("https://api.github.com", "1", pemKey, 42, nil); err == nil {
+				t.Fatal("invalid token response accepted")
+			}
+		})
 	}
 }

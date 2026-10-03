@@ -345,3 +345,20 @@ func TestPolicyOverridesBumpMap(t *testing.T) {
 		t.Fatalf("default rules should ignore docs commits: %+v", defaultPlan.Releases)
 	}
 }
+
+func TestNoneReleaseRuleSuppressesIndependentBump(t *testing.T) {
+	cwd := makeRepo(t)
+	writeFile(t, filepath.Join(cwd, "a/package.json"), `{"name":"a","version":"1.0.0"}`)
+	writeFile(t, filepath.Join(cwd, "b/package.json"), `{"name":"b","version":"1.0.0"}`)
+	commitAll(t, cwd, "initial import")
+	writeFile(t, filepath.Join(cwd, "a/fix.txt"), "fix")
+	commitAll(t, cwd, "fix: change without release")
+	cfg := baseConfig(nodePkg("a", "a", "a/package.json"), nodePkg("b", "b", "b/package.json"))
+	result, err := CreatePlan(cwd, cfg, "main", &types.CommitPolicy{ReleaseTypes: map[string]types.ReleaseType{"fix": types.None}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Releases) != 0 || len(result.UnmatchedCommits) != 0 {
+		t.Fatalf("none rule released: %+v", result)
+	}
+}

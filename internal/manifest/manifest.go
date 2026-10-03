@@ -1,7 +1,7 @@
 // Package manifest reads and rewrites package manifests (package.json,
 // Cargo.toml, pyproject.toml, version files) including local dependency
-// edges and Cargo.lock. Behavior mirrors src/manifest.ts 1:1; manifest
-// paths are opened exactly as given on pkg.Manifest.
+// edges and Cargo.lock. TOML edits preserve unrelated source text; filesystem
+// operations may be pinned to a repository root for release execution.
 package manifest
 
 import (
@@ -11,24 +11,46 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
-	"unicode"
 
 	hverrors "github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/safefs"
+	"github.com/openhoo/hooversion/internal/tomledit"
 	"github.com/openhoo/hooversion/internal/types"
 )
+
+const maxManifestBytes = 16 << 20
 
 // Read returns the package name and current version from the package
 // manifest (mirrors readManifest).
 func Read(pkg types.NormalizedPackageConfig) (string, string, error) {
-	data, err := os.ReadFile(pkg.Manifest)
+	return ReadWithFS(pkg, safefs.Native{})
+}
+func ReadWithFS(pkg types.NormalizedPackageConfig, files safefs.FileSystem) (string, string, error) {
+	data, err := files.ReadRegularFile(pkg.Manifest, maxManifestBytes)
 	if err != nil {
 		return "", "", err
+	}
+
+	if pkg.Type == types.PackageRust {
+		d, err := tomledit.Parse(data)
+		if err != nil {
+			return "", "", err
+		}
+		if d.Get("package", "version", "workspace") == true {
+			root, err := workspaceManifestFS(pkg.Manifest, files)
+			if err != nil {
+				return "", "", err
+			}
+			workspace, err := files.ReadRegularFile(root, maxManifestBytes)
+			if err != nil {
+				return "", "", err
+			}
+			return ReadDataWithWorkspace(pkg, data, workspace)
+		}
 	}
 	return ReadData(pkg, data)
 }
@@ -52,10 +74,13 @@ func ReadData(pkg types.NormalizedPackageConfig, data []byte) (string, string, e
 // updateManifestVersion). Node manifests are re-emitted as 2-space JSON
 // with a trailing newline preserving document key order.
 func UpdateVersion(pkg types.NormalizedPackageConfig, next string) error {
+	return UpdateVersionWithFS(pkg, next, safefs.Native{})
+}
+func UpdateVersionWithFS(pkg types.NormalizedPackageConfig, next string, files safefs.FileSystem) error {
 	path := pkg.Manifest
 	switch pkg.Type {
 	case types.PackageNode:
-		data, err := os.ReadFile(path)
+		data, err := files.ReadRegularFile(path, maxManifestBytes)
 		if err != nil {
 			return err
 		}
@@ -64,15 +89,28 @@ func UpdateVersion(pkg types.NormalizedPackageConfig, next string) error {
 			return err
 		}
 		root.set("version", next)
-		return os.WriteFile(path, marshalOrderedJSON(root), 0o644)
+		return files.WriteFileAtomic(path, marshalOrderedJSON(root), 0o644)
 	case types.PackageVersionFile:
-		return os.WriteFile(path, []byte(next+"\n"), 0o644)
+		return files.WriteFileAtomic(path, []byte(next+"\n"), 0o644)
 	}
 	section := "project"
 	if pkg.Type == types.PackageRust {
 		section = "package"
 	}
-	return updateTomlSectionVersion(path, section, next)
+	if err := updateTomlSectionVersion(path, section, next, files); err != nil {
+		return err
+	}
+	if pkg.Type == types.PackageRust {
+		root, err := workspaceManifestFS(path, files)
+		if err != nil {
+			if !errors.Is(err, ErrNoWorkspace) {
+				return err
+			}
+			root = path
+		}
+		return updateCargoLock(filepath.Dir(root), map[string]string{pkg.Name: next}, files)
+	}
+	return nil
 }
 
 // UpdateLocalDependencyVersions rewrites dependency edges of pkg that point
@@ -83,9 +121,12 @@ func UpdateVersion(pkg types.NormalizedPackageConfig, next string) error {
 // (both ENOENT-tolerant). Mirrors updateLocalDependencyVersions scoped to a
 // single package.
 func UpdateLocalDependencyVersions(cwd string, pkg types.NormalizedPackageConfig, versions map[string]string) error {
+	return UpdateLocalDependencyVersionsWithFS(cwd, pkg, versions, safefs.Native{})
+}
+func UpdateLocalDependencyVersionsWithFS(cwd string, pkg types.NormalizedPackageConfig, versions map[string]string, files safefs.FileSystem) error {
 	localVersions := map[string]string{}
 	for _, dependency := range pkg.Dependencies {
-		if target, ok := findReleasedName(dependency, versions); ok {
+		if target, ok := dependencyReleasedName(pkg.Type, dependency, versions); ok {
 			localVersions[target] = versions[target]
 		}
 	}
@@ -96,19 +137,26 @@ func UpdateLocalDependencyVersions(cwd string, pkg types.NormalizedPackageConfig
 	path := filepath.Join(cwd, pkg.Manifest)
 	switch pkg.Type {
 	case types.PackageNode:
-		return updateNodeLocalDependencies(path, pkg, localVersions)
+		return updateNodeLocalDependencies(path, pkg, localVersions, files)
 	case types.PackagePython:
-		return updatePythonLocalDependencies(path, pkg, localVersions)
+		return updatePythonLocalDependencies(path, pkg, localVersions, files)
 	case types.PackageRust:
-		if err := updateRustDependencyTables(path, &pkg, localVersions, false); err != nil {
+		if err := updateRustDependencyTables(path, &pkg, localVersions, false, files); err != nil {
 			return err
 		}
-		if err := updateRustDependencyTables(filepath.Join(cwd, "Cargo.toml"), nil, localVersions, true); err != nil {
+		root, rootErr := workspaceManifestFS(path, files)
+		if rootErr != nil {
+			if !errors.Is(rootErr, ErrNoWorkspace) {
+				return rootErr
+			}
+			root = path
+		}
+		if err := updateRustDependencyTables(root, nil, localVersions, true, files); err != nil {
 			if !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
 		}
-		return updateCargoLock(cwd, localVersions)
+		return updateCargoLock(filepath.Dir(root), localVersions, files)
 	}
 	return nil
 }
@@ -140,6 +188,10 @@ func decodeOrderedJSON(data []byte) (*jsonObject, error) {
 	root, err := decodeJSONValue(dec)
 	if err != nil {
 		return nil, err
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return nil, errors.New("manifest must contain exactly one JSON value")
 	}
 	obj, ok := root.(*jsonObject)
 	if !ok {
@@ -329,69 +381,6 @@ func assertAllDependenciesFound(path, ownerName string, released map[string]stri
 	return nil
 }
 
-// splitLines mirrors text.split(/\r?\n/): CRLF pairs are separators, lone CR
-// characters stay inside lines.
-func splitLines(text string) []string {
-	return strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
-}
-
-// mapQuotedSegments walks line and invokes fn for every '...'/\"...\" span
-// whose content holds no quote characters — the same spans matched by
-// /(["'])([^"']*)\1/g — substituting fn's result (still quote-wrapped by the
-// caller contract below) only when fn reports a change.
-func mapQuotedSegments(line string, fn func(content string) (string, bool)) string {
-	var sb strings.Builder
-	i := 0
-	for i < len(line) {
-		c := line[i]
-		if c != '"' && c != '\'' {
-			sb.WriteByte(c)
-			i++
-			continue
-		}
-		close := -1
-		for k := i + 1; k < len(line); k++ {
-			ch := line[k]
-			if ch == '"' || ch == '\'' {
-				if ch == c {
-					close = k
-				}
-				break
-			}
-		}
-		if close < 0 {
-			sb.WriteByte(c)
-			i++
-			continue
-		}
-		content := line[i+1 : close]
-		if repl, changed := fn(content); changed {
-			sb.WriteString(repl)
-		} else {
-			sb.WriteString(line[i : close+1])
-		}
-		i = close + 1
-	}
-	return sb.String()
-}
-
-var (
-	tomlHeadingRE    = regexp.MustCompile(`^\s*\[([^\]]+)\]\s*$`)
-	tomlVersionKeyRE = regexp.MustCompile(`^\s*version\s*=`)
-)
-
-// replaceFirstTomlValue swaps the first `= "..."`-style quoted value,
-// mirroring String.replace with a non-global regex.
-var tomlAssignValueRE = regexp.MustCompile(`=\s*["'][^"']+["']`)
-
-func replaceFirstTomlValue(line, version string) string {
-	loc := tomlAssignValueRE.FindStringIndex(line)
-	if loc == nil {
-		return line
-	}
-	return line[:loc[0]] + `= "` + version + `"` + line[loc[1]:]
-}
-
 // --- node -------------------------------------------------------------------
 
 var nodeDependencySections = []string{"dependencies", "devDependencies", "peerDependencies", "optionalDependencies"}
@@ -415,8 +404,8 @@ func rewriteNodeRequirement(current, version, path, name string) (string, error)
 	return prefix + version, nil
 }
 
-func updateNodeLocalDependencies(path string, owner types.NormalizedPackageConfig, released map[string]string) error {
-	data, err := os.ReadFile(path)
+func updateNodeLocalDependencies(path string, owner types.NormalizedPackageConfig, released map[string]string, files safefs.FileSystem) error {
+	data, err := files.ReadRegularFile(path, maxManifestBytes)
 	if err != nil {
 		return err
 	}
@@ -461,545 +450,12 @@ func updateNodeLocalDependencies(path string, owner types.NormalizedPackageConfi
 		return err
 	}
 	if changed {
-		return os.WriteFile(path, marshalOrderedJSON(root), 0o644)
-	}
-	return nil
-}
-
-// --- python -----------------------------------------------------------------
-
-func isPythonDependencySection(section string) bool {
-	return section == "project" ||
-		section == "project.optional-dependencies" ||
-		strings.HasPrefix(section, "project.optional-dependencies.") ||
-		section == "tool.poetry.dependencies" ||
-		(strings.HasPrefix(section, "tool.poetry.group.") && strings.HasSuffix(section, ".dependencies"))
-}
-
-var pythonNameRE = regexp.MustCompile(`^\s*([A-Za-z0-9][A-Za-z0-9._-]*)`)
-
-var pythonAssignmentRE = regexp.MustCompile(`^\s*([A-Za-z0-9_.-]+)\s*=\s*(.*)$`)
-
-func rewritePythonRequirementsLine(line string, released map[string]string, found map[string]bool, path string) (string, bool, error) {
-	changed := false
-	cbErr := error(nil)
-	out := mapQuotedSegments(line, func(requirement string) (string, bool) {
-		if cbErr != nil {
-			return requirement, false
-		}
-		m := pythonNameRE.FindStringSubmatch(requirement)
-		if m == nil {
-			return requirement, false
-		}
-		target, ok := findReleasedName(m[1], released)
-		if !ok {
-			return requirement, false
-		}
-		found[target] = true
-		next, err := rewritePythonRequirement(requirement, released[target], path, m[1])
-		if err != nil {
-			cbErr = err
-			return requirement, false
-		}
-		if next == requirement {
-			return requirement, false
-		}
-		changed = true
-		return `"` + next + `"`, true
-	})
-	return out, changed, cbErr
-}
-
-func rewritePythonRequirement(requirement, version, path, name string) (string, error) {
-	suffix := requirement[len(name):]
-	if strings.HasPrefix(strings.TrimLeftFunc(suffix, unicode.IsSpace), "@") {
-		return "", hverrors.New("%s dependency %s has unsupported direct URL syntax", path, name)
-	}
-	constraint, err := rewritePythonConstraint(suffix, version, path, name)
-	if err != nil {
-		return "", err
-	}
-	return name + constraint, nil
-}
-
-var pythonConstraintRE = regexp.MustCompile(`([<>=!~]{1,3})\s*([0-9][^,\s;]*)`)
-
-func rewritePythonConstraint(current, version, path, name string) (string, error) {
-	if strings.Contains(current, "@") {
-		return "", hverrors.New("%s dependency %s has unsupported direct URL syntax", path, name)
-	}
-	m := pythonConstraintRE.FindStringSubmatch(current)
-	if m != nil {
-		// String.replace with a string pattern: first textual occurrence.
-		return strings.Replace(current, m[2], version, 1), nil
-	}
-	if idx := strings.Index(current, ";"); idx >= 0 {
-		// /\s*;/ anchors at the whitespace run preceding the marker.
-		for idx > 0 && unicode.IsSpace(rune(current[idx-1])) {
-			idx--
-		}
-		return current[:idx] + "==" + version + current[idx:], nil
-	}
-	return current + "==" + version, nil
-}
-
-func updatePythonLocalDependencies(path string, owner types.NormalizedPackageConfig, released map[string]string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	lines := splitLines(string(data))
-	found := map[string]bool{}
-	changed := false
-	section := ""
-	inArray := false
-
-	for index := 0; index < len(lines); index++ {
-		line := lines[index]
-		if heading := tomlHeadingRE.FindStringSubmatch(line); heading != nil {
-			section = heading[1]
-			inArray = false
-			continue
-		}
-		if !isPythonDependencySection(section) {
-			continue
-		}
-
-		if inArray {
-			out, lineChanged, err := rewritePythonRequirementsLine(line, released, found, path)
-			if err != nil {
-				return err
-			}
-			lines[index] = out
-			changed = changed || lineChanged
-			if strings.Contains(lines[index], "]") {
-				inArray = false
-			}
-			continue
-		}
-
-		assignment := pythonAssignmentRE.FindStringSubmatch(line)
-		if assignment == nil {
-			continue
-		}
-		key := assignment[1]
-		value := assignment[2]
-		if strings.HasPrefix(value, "[") &&
-			(key == "dependencies" || section == "project.optional-dependencies" || strings.HasPrefix(section, "project.optional-dependencies.")) {
-			out, lineChanged, err := rewritePythonRequirementsLine(line, released, found, path)
-			if err != nil {
-				return err
-			}
-			lines[index] = out
-			changed = changed || lineChanged
-			if !strings.Contains(value, "]") {
-				inArray = true
-			}
-			continue
-		}
-		if strings.HasPrefix(section, "tool.poetry") {
-			if target, ok := findReleasedName(key, released); ok {
-				if len(value) == 0 || (value[0] != '"' && value[0] != '\'') {
-					return hverrors.New("%s package %s has unsupported dependency %s", path, owner.Name, key)
-				}
-				quote := value[0]
-				end := strings.IndexByte(value[1:], quote)
-				if end < 0 {
-					return hverrors.New("%s has malformed dependency %s", path, key)
-				}
-				end++
-				inner := value[1:end]
-				next, err := rewritePythonConstraint(inner, released[target], path, key)
-				if err != nil {
-					return err
-				}
-				found[target] = true
-				if next != inner {
-					start := strings.Index(line, value)
-					lines[index] = line[:start+1] + next + value[end:]
-					changed = true
-				}
-			}
-		} else if key == "dependencies" && strings.HasPrefix(value, "{") {
-			for _, name := range sortedKeys(released) {
-				if strings.Contains(value, name) {
-					return hverrors.New("%s has unsupported inline dependency table", path)
-				}
-			}
-		}
-	}
-
-	if err := assertAllDependenciesFound(path, owner.Name, released, found); err != nil {
-		return err
-	}
-	if changed {
-		return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
-	}
-	return nil
-}
-
-// --- rust -------------------------------------------------------------------
-
-var (
-	rustWorkspaceTrueRE   = regexp.MustCompile(`workspace\s*=\s*true`)
-	rustTargetSectionRE   = regexp.MustCompile(`^target\..+\.(?:dependencies|dev-dependencies|build-dependencies)$`)
-	rustDottedRE          = regexp.MustCompile(`^(?:(?:dependencies|dev-dependencies|build-dependencies)|(?:target\..+\.(?:dependencies|dev-dependencies|build-dependencies)))\.((?:"[^"]+"|[A-Za-z0-9_-]+))$`)
-	rustWorkspaceDottedRE = regexp.MustCompile(`^workspace\.dependencies\.((?:"[^"]+"|[A-Za-z0-9_-]+))$`)
-	rustEntryRE           = regexp.MustCompile(`^\s*(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*=\s*(.*)$`)
-	rustInlineTableVerRE  = regexp.MustCompile(`(version\s*=\s*)["'][^"']+["']`)
-)
-
-func isRustDependencySection(section string, workspaceOnly bool) bool {
-	if workspaceOnly {
-		return section == "workspace.dependencies"
-	}
-	switch section {
-	case "dependencies", "dev-dependencies", "build-dependencies":
-		return true
-	}
-	return rustTargetSectionRE.MatchString(section)
-}
-
-func findRustDottedDependency(section string, released map[string]string, workspaceOnly bool) (string, bool) {
-	re := rustDottedRE
-	if workspaceOnly {
-		re = rustWorkspaceDottedRE
-	}
-	m := re.FindStringSubmatch(section)
-	if m == nil {
-		return "", false
-	}
-	name := strings.TrimSuffix(strings.TrimPrefix(m[1], `"`), `"`)
-	return findReleasedName(name, released)
-}
-
-type rustDotted struct {
-	target         string
-	workspace      bool
-	versionUpdated bool
-}
-
-type rustActive struct {
-	target         string
-	depth          int
-	workspace      bool
-	versionUpdated bool
-}
-
-func finishRustDottedDependency(path string, d rustDotted, found map[string]bool) error {
-	if !d.workspace && !d.versionUpdated {
-		return hverrors.New("%s dependency %s has no supported version field", path, d.target)
-	}
-	found[d.target] = true
-	return nil
-}
-
-func braceDelta(value string) int {
-	delta := 0
-	for i := 0; i < len(value); i++ {
-		switch value[i] {
-		case '{':
-			delta++
-		case '}':
-			delta--
-		}
-	}
-	return delta
-}
-
-func updateRustDependencyTables(path string, owner *types.NormalizedPackageConfig, released map[string]string, workspaceOnly bool) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	lines := splitLines(string(data))
-	found := map[string]bool{}
-	section := ""
-	var active *rustActive
-	var dotted *rustDotted
-	changed := false
-
-	for index := 0; index < len(lines); index++ {
-		line := lines[index]
-		if active != nil {
-			if rustWorkspaceTrueRE.MatchString(line) {
-				active.workspace = true
-			}
-			if !active.workspace && tomlVersionKeyRE.MatchString(line) {
-				lines[index] = replaceFirstTomlValue(line, released[active.target])
-				active.versionUpdated = true
-				changed = true
-			}
-			active.depth += braceDelta(line)
-			if active.depth <= 0 {
-				if !active.workspace && !active.versionUpdated {
-					return hverrors.New("%s dependency %s has no supported version field", path, active.target)
-				}
-				found[active.target] = true
-				active = nil
-			}
-			continue
-		}
-
-		if heading := tomlHeadingRE.FindStringSubmatch(line); heading != nil {
-			if dotted != nil {
-				if err := finishRustDottedDependency(path, *dotted, found); err != nil {
-					return err
-				}
-				dotted = nil
-			}
-			section = heading[1]
-			if target, ok := findRustDottedDependency(section, released, workspaceOnly); ok {
-				dotted = &rustDotted{target: target}
-			}
-			continue
-		}
-		if dotted != nil {
-			if rustWorkspaceTrueRE.MatchString(line) {
-				dotted.workspace = true
-			}
-			if !dotted.workspace && tomlVersionKeyRE.MatchString(line) {
-				lines[index] = replaceFirstTomlValue(line, released[dotted.target])
-				dotted.versionUpdated = true
-				changed = true
-			}
-			continue
-		}
-		if !isRustDependencySection(section, workspaceOnly) {
-			continue
-		}
-
-		entry := rustEntryRE.FindStringSubmatch(line)
-		if entry == nil {
-			continue
-		}
-		name := entry[1]
-		if name == "" {
-			name = entry[2]
-		}
-		target, ok := findReleasedName(name, released)
-		if !ok {
-			continue
-		}
-		value := strings.TrimSpace(entry[3])
-		if strings.HasPrefix(value, "{") {
-			workspace := rustWorkspaceTrueRE.MatchString(value)
-			versionMatched := rustInlineTableVerRE.MatchString(value)
-			depth := braceDelta(value)
-			switch {
-			case depth > 0:
-				active = &rustActive{target: target, depth: depth, workspace: workspace}
-			case workspace:
-				found[target] = true
-			case versionMatched:
-				loc := rustInlineTableVerRE.FindStringSubmatchIndex(line)
-				lines[index] = line[:loc[3]] + `"` + released[target] + `"` + line[loc[1]:]
-				found[target] = true
-				changed = true
-			default:
-				return hverrors.New("%s dependency %s has unsupported table syntax", path, name)
-			}
-			continue
-		}
-		if len(value) > 0 && (value[0] == '"' || value[0] == '\'') {
-			quote := value[0]
-			end := strings.IndexByte(value[1:], quote)
-			if end < 0 {
-				return hverrors.New("%s has malformed dependency %s", path, name)
-			}
-			end++
-			start := strings.Index(line, value)
-			lines[index] = line[:start+1] + released[target] + value[end:]
-			found[target] = true
-			changed = true
-			continue
-		}
-		return hverrors.New("%s dependency %s has unsupported value", path, name)
-	}
-
-	if dotted != nil {
-		if err := finishRustDottedDependency(path, *dotted, found); err != nil {
-			return err
-		}
-	}
-	if !workspaceOnly && owner != nil {
-		if err := assertAllDependenciesFound(path, owner.Name, released, found); err != nil {
-			return err
-		}
-	}
-	if changed {
-		return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
-	}
-	return nil
-}
-
-// --- Cargo.lock -------------------------------------------------------------
-
-var (
-	lockNameKeyRE   = regexp.MustCompile(`^\s*name\s*=`)
-	lockSourceKeyRE = regexp.MustCompile(`^\s*source\s*=`)
-	lockDepsStartRE = regexp.MustCompile(`^\s*dependencies\s*=\s*\[`)
-	lockParenRE     = regexp.MustCompile(`\s\(`)
-)
-
-func replaceLockDependencyEntry(line string, released map[string]string, changed *bool) string {
-	return mapQuotedSegments(line, func(content string) (string, bool) {
-		if content == "" {
-			return content, false
-		}
-		// Greedy [^"']+ followed by " \d": the LAST space-followed-by-digit
-		// boundary splits name from version.
-		split := -1
-		for k := len(content) - 2; k >= 1; k-- {
-			if content[k] == ' ' && content[k+1] >= '0' && content[k+1] <= '9' {
-				split = k
-				break
-			}
-		}
-		if split < 1 {
-			return content, false
-		}
-		dependencyName := content[:split]
-		target, ok := findReleasedName(dependencyName, released)
-		if !ok || lockParenRE.MatchString(content) {
-			return content, false
-		}
-		*changed = true
-		return `"` + dependencyName + " " + released[target] + `"`, true
-	})
-}
-
-func updateCargoLock(cwd string, released map[string]string) error {
-	path := filepath.Join(cwd, "Cargo.lock")
-	f, err := safefs.OpenReadWriteNoFollow(path)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return err
-	}
-	if !info.Mode().IsRegular() {
-		return hverrors.New("%s must be a regular file", path)
-	}
-	raw, err := io.ReadAll(f)
-	if err != nil {
-		return err
-	}
-	lines := splitLines(string(raw))
-	var starts []int
-	for i, line := range lines {
-		if strings.TrimSpace(line) == "[[package]]" {
-			starts = append(starts, i)
-		}
-	}
-	changed := false
-
-	for block := 0; block < len(starts); block++ {
-		start := starts[block]
-		end := len(lines)
-		if block+1 < len(starts) {
-			end = starts[block+1]
-		}
-		nameSeen := false
-		name := ""
-		hasSource := false
-		versionIndex := -1
-		for i := start; i < end; i++ {
-			line := lines[i]
-			if !nameSeen && lockNameKeyRE.MatchString(line) {
-				nameSeen = true
-				name, _ = readTomlString(line, "name")
-			}
-			if lockSourceKeyRE.MatchString(line) {
-				hasSource = true
-			}
-			if versionIndex < 0 && tomlVersionKeyRE.MatchString(line) {
-				versionIndex = i
-			}
-		}
-		target, ok := findReleasedName(name, released)
-		if ok && !hasSource {
-			if versionIndex < 0 {
-				return hverrors.New("%s package %s has no version field", path, name)
-			}
-			updated := replaceFirstTomlValue(lines[versionIndex], released[target])
-			if updated != lines[versionIndex] {
-				lines[versionIndex] = updated
-				changed = true
-			}
-		}
-
-		inDependencies := false
-		for i := start; i < end; i++ {
-			if lockDepsStartRE.MatchString(lines[i]) {
-				inDependencies = true
-				if strings.Contains(lines[i], "]") {
-					inDependencies = false
-				}
-				continue
-			}
-			if !inDependencies || hasSource {
-				continue
-			}
-			lines[i] = replaceLockDependencyEntry(lines[i], released, &changed)
-			if strings.Contains(lines[i], "]") {
-				inDependencies = false
-			}
-		}
-	}
-
-	if changed {
-		if _, err := f.Seek(0, io.SeekStart); err != nil {
-			return err
-		}
-		if err := f.Truncate(0); err != nil {
-			return err
-		}
-		if err := writeFileDescriptor(f, strings.Join(lines, "\n")); err != nil {
-			return err
-		}
-		if err := f.Sync(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func writeFileDescriptor(f *os.File, content string) error {
-	data := []byte(content)
-	offset := 0
-	for offset < len(data) {
-		written, err := f.Write(data[offset:])
-		if written <= 0 {
-			return hverrors.New("Failed to write Cargo.lock")
-		}
-		if err != nil {
-			return err
-		}
-		offset += written
+		return files.WriteFileAtomic(path, marshalOrderedJSON(root), 0o644)
 	}
 	return nil
 }
 
 // --- TOML [package]/[project] reading ---------------------------------------
-
-func escapeRegExp(value string) string {
-	return regexp.QuoteMeta(value)
-}
-
-func readPackageJSON(path string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	return readPackageJSONData(path, data)
-}
 
 func readPackageJSONData(path string, data []byte) (string, string, error) {
 	root, err := decodeOrderedJSON(data)
@@ -1016,95 +472,10 @@ func readPackageJSONData(path string, data []byte) (string, string, error) {
 	return name, version, nil
 }
 
-func readTomlPackage(path, sectionName string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	return readTomlPackageData(path, string(data), sectionName)
-}
-
-func readTomlPackageData(path, text, sectionName string) (string, string, error) {
-	section := getTomlSection(text, sectionName)
-	name, _ := readTomlString(section, "name")
-	version, _ := readTomlString(section, "version")
-	if name == "" || version == "" {
-		return "", "", hverrors.New("%s [%s] must contain name and version", path, sectionName)
-	}
-	return name, version, nil
-}
-
-func readVersionFile(path, name string) (string, string, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return "", "", err
-	}
-	return readVersionFileData(path, name, data)
-}
-
 func readVersionFileData(path, name string, data []byte) (string, string, error) {
 	version := strings.TrimSpace(string(data))
 	if version == "" {
 		return "", "", hverrors.New("%s must contain a version", path)
 	}
 	return name, version, nil
-}
-
-func getTomlSection(text, sectionName string) string {
-	lines := splitLines(text)
-	inSection := false
-	var sectionLines []string
-	for _, line := range lines {
-		heading := tomlHeadingRE.FindStringSubmatch(line)
-		if heading != nil {
-			if inSection {
-				break
-			}
-			inSection = heading[1] == sectionName
-			continue
-		}
-		if inSection {
-			sectionLines = append(sectionLines, line)
-		}
-	}
-	return strings.Join(sectionLines, "\n")
-}
-
-func readTomlString(section, key string) (string, bool) {
-	re := regexp.MustCompile(`(?m)^[ \t]*` + escapeRegExp(key) + `[ \t]*=[ \t]*(?:"([^"\r\n]+)"|'([^'\r\n]+)')[ \t]*(?:#[^\r\n]*)?$`)
-	m := re.FindStringSubmatch(section)
-	if m == nil {
-		return "", false
-	}
-	if m[1] != "" {
-		return m[1], true
-	}
-	return m[2], true
-}
-
-func updateTomlSectionVersion(path, sectionName, version string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	lines := splitLines(string(data))
-	inSection := false
-	updated := false
-
-	for i, line := range lines {
-		heading := tomlHeadingRE.FindStringSubmatch(line)
-		if heading != nil {
-			inSection = heading[1] == sectionName
-			continue
-		}
-		if inSection && tomlVersionKeyRE.MatchString(line) {
-			updated = true
-			lines[i] = replaceFirstTomlValue(line, version)
-		}
-	}
-
-	if !updated {
-		return hverrors.New("%s [%s] does not contain a version field", path, sectionName)
-	}
-	return os.WriteFile(path, []byte(strings.Join(lines, "\n")), 0o644)
 }

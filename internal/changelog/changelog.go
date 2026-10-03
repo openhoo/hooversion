@@ -2,11 +2,8 @@
 package changelog
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -15,7 +12,6 @@ import (
 	"unicode"
 
 	"github.com/openhoo/hooversion/internal/commit"
-	hverrors "github.com/openhoo/hooversion/internal/errors"
 	"github.com/openhoo/hooversion/internal/safefs"
 	"github.com/openhoo/hooversion/internal/types"
 )
@@ -108,40 +104,26 @@ func hash7(h string) string {
 // atomically: read with O_NOFOLLOW (must be a regular file), written to a
 // 0600 O_EXCL temp file that is fsynced and renamed over the target.
 func Update(path, notes, pkgName string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("create changelog directory: %w", err)
-	}
+	return UpdateWithFS(path, notes, pkgName, safefs.Native{})
+}
 
-	existing := ""
-	file, err := safefs.OpenReadNoFollow(path)
+// UpdateWithFS preserves changelog formatting through a rooted repository writer.
+func UpdateWithFS(path, notes, pkgName string, files safefs.FileSystem) error {
+	if directories, ok := files.(interface {
+		MkdirAll(string, os.FileMode) error
+	}); ok {
+		if err := directories.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return err
+		}
+	} else if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	data, err := files.ReadRegularFile(path, 16<<20)
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
-	if err == nil {
-		info, statErr := file.Stat()
-		if statErr == nil && !info.Mode().IsRegular() {
-			file.Close()
-			return hverrors.New("%s must be a regular file", path)
-		}
-		data, readErr := io.ReadAll(file)
-		closeErr := file.Close()
-		if readErr != nil {
-			return fmt.Errorf("read %s: %w", path, readErr)
-		}
-		if closeErr != nil {
-			return fmt.Errorf("close %s: %w", path, closeErr)
-		}
-		existing = string(data)
-	}
-
-	title := "# " + pkgName + " Changelog"
-	next := assemble(existing, title, notes)
-
-	tempPath, err := writeTemp(path, next)
-	if tempPath != "" {
-		os.Remove(tempPath) // no-op after successful rename
-	}
-	return err
+	next := assemble(string(data), "# "+pkgName+" Changelog", notes)
+	return files.WriteFileAtomic(path, []byte(next), 0644)
 }
 
 // assemble reproduces the header/body assembly of updateChangelog in
@@ -164,41 +146,4 @@ func assemble(existing, title, notes string) string {
 
 func trimEnd(s string) string {
 	return strings.TrimRightFunc(s, unicode.IsSpace)
-}
-
-// writeTemp writes content to "<path>.hooversion-<pid>-<rand>.tmp" and renames
-// it over path. It returns the temp path so the caller can clean up after any
-// failure; on success the returned path no longer exists.
-func writeTemp(path, content string) (string, error) {
-	var tempPath string
-	for attempt := 0; attempt < 10; attempt++ {
-		suffix := make([]byte, 16)
-		if _, err := rand.Read(suffix); err != nil {
-			return "", fmt.Errorf("generate changelog temp name: %w", err)
-		}
-		candidate := fmt.Sprintf("%s.hooversion-%d-%s.tmp", path, os.Getpid(), hex.EncodeToString(suffix))
-		f, err := safefs.CreateExclusive(candidate, 0o600)
-		if err == nil {
-			tempPath = candidate
-			if _, writeErr := f.Write([]byte(content)); writeErr != nil {
-				f.Close()
-				return tempPath, hverrors.New("Failed to write changelog")
-			}
-			if syncErr := f.Sync(); syncErr != nil {
-				f.Close()
-				return tempPath, fmt.Errorf("fsync %s: %w", candidate, syncErr)
-			}
-			if closeErr := f.Close(); closeErr != nil {
-				return tempPath, fmt.Errorf("close %s: %w", candidate, closeErr)
-			}
-			if renameErr := os.Rename(candidate, path); renameErr != nil {
-				return tempPath, fmt.Errorf("rename %s: %w", candidate, renameErr)
-			}
-			return "", nil
-		}
-		if !errors.Is(err, fs.ErrExist) {
-			return "", fmt.Errorf("create %s: %w", candidate, err)
-		}
-	}
-	return tempPath, hverrors.New("Could not create temporary changelog file next to %s", path)
 }

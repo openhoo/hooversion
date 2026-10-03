@@ -16,7 +16,10 @@ import (
 
 func privateSpoolTestDir(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -44,6 +47,11 @@ func TestWebhookSpoolAdmissionSurvivesQueueSaturation(t *testing.T) {
 	release := make(chan struct{})
 	var startedOnce sync.Once
 	queue := NewReleaseTaskQueue(func(error) {}, QueueOptions{MaxPending: 1})
+	defer func() {
+		spool.Stop()
+		close(release)
+		queue.Wait()
+	}()
 	deduper := NewWebhookDeduper(0, nil)
 	cfg := &AppConfig{
 		AppID: "123", WebhookSecret: testWebhookSecret, ApiURL: "https://api.github.com",
@@ -74,6 +82,9 @@ func TestWebhookSpoolAdmissionSurvivesQueueSaturation(t *testing.T) {
 	if _, ok := deduper.State("delivery:spool-second"); !ok {
 		t.Fatal("durably admitted delivery reservation was released")
 	}
+	// Stop the drainer before inspecting the backlog: it may transiently claim
+	// the second record while trying the saturated queue, then unclaim it.
+	spool.Stop()
 	pending, err := spool.Pending()
 	if err != nil {
 		t.Fatal(err)
@@ -81,9 +92,6 @@ func TestWebhookSpoolAdmissionSurvivesQueueSaturation(t *testing.T) {
 	if len(pending) != 1 || pending[0].Record.DeliveryKey != "delivery:spool-second" {
 		t.Fatalf("pending spool entries: %+v", pending)
 	}
-	spool.Stop()
-	close(release)
-	queue.Wait()
 }
 
 func TestWebhookSpoolRecoversPersistedBacklog(t *testing.T) {
