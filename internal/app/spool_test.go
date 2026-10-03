@@ -16,7 +16,10 @@ import (
 
 func privateSpoolTestDir(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}

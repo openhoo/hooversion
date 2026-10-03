@@ -47,16 +47,16 @@ func TestWebhookDeduperLifecycle(t *testing.T) {
 
 func TestQueueClamps(t *testing.T) {
 	q := NewReleaseTaskQueue(nil, QueueOptions{MaxAttempts: 99, RetryDelayMs: -5})
-	if q.maxAttempts != 3 || q.retryDelayMs != 0 {
-		t.Fatalf("clamps high: %d %v", q.maxAttempts, q.retryDelayMs)
+	if q.maxAttempts != 3 || q.retryDelay != 0 {
+		t.Fatalf("clamps high: %d %v", q.maxAttempts, q.retryDelay)
 	}
 	q2 := NewReleaseTaskQueue(nil, QueueOptions{MaxAttempts: -7, RetryDelayMs: 999999})
-	if q2.maxAttempts != 1 || q2.retryDelayMs != 30*time.Second {
-		t.Fatalf("clamps low: %d %v", q2.maxAttempts, q2.retryDelayMs)
+	if q2.maxAttempts != 1 || q2.retryDelay != 30*time.Second {
+		t.Fatalf("clamps low: %d %v", q2.maxAttempts, q2.retryDelay)
 	}
 	q3 := NewReleaseTaskQueue(nil, QueueOptions{})
-	if q3.maxAttempts != 1 || q3.retryDelayMs != 0 || q3.maxPending != DefaultQueueMaxPending {
-		t.Fatalf("defaults: %d %v %d", q3.maxAttempts, q3.retryDelayMs, q3.maxPending)
+	if q3.maxAttempts != 1 || q3.retryDelay != 0 || q3.maxPending != DefaultQueueMaxPending {
+		t.Fatalf("defaults: %d %v %d", q3.maxAttempts, q3.retryDelay, q3.maxPending)
 	}
 }
 

@@ -32,3 +32,22 @@ func TestRunReportsStartupConfigurationError(t *testing.T) {
 		t.Fatalf("stderr = %q, want %q", got, want)
 	}
 }
+
+func TestVersionDoesNotRequireAppConfiguration(t *testing.T) {
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = old; r.Close() }()
+	code := runArgs([]string{"--version"}, func(string) string { t.Fatal("version tried to read App credentials"); return "" })
+	w.Close()
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 || string(output) != "versionhoo-app "+version+"\n" {
+		t.Fatalf("code=%d output=%q", code, output)
+	}
+}

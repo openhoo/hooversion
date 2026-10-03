@@ -241,14 +241,14 @@ func TestInitRefusesAllModernConfigVariants(t *testing.T) {
 		yml := filepath.Join(cwd, "hooversion.yml")
 		writeFile(t, yml, nodeAppConfig)
 
-		stdout, _, code := runCLI(t, cwd, "dev", "init", "--no-workflow")
+		_, _, code := runCLI(t, cwd, "dev", "init", "--no-workflow")
 		if code == 0 {
 			t.Fatal("--force is required to replace an existing config")
 		}
 		_, stderr, _ := runCLI(t, cwd, "dev", "init")
 		mustContain(t, stderr, "Hooversion config already exists. Use --force to overwrite.", "stderr")
 
-		stdout, _, code = runCLI(t, cwd, "dev", "init", "--no-workflow", "--force")
+		stdout, _, code := runCLI(t, cwd, "dev", "init", "--no-workflow", "--force")
 		if code != 0 {
 			t.Fatalf("init --force over lone yml failed:\n%s", stdout)
 		}
@@ -306,7 +306,10 @@ func TestInitWorkflowCollisionKeepsConfigUnwritten(t *testing.T) {
 }
 
 func TestInitWritesConfigAndWorkflowsAndForceReplacesLegacy(t *testing.T) {
-	cwd := t.TempDir()
+	cwd, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeFile(t, filepath.Join(cwd, "package.json"), `{"name":"app","version":"1.0.0","packageManager":"bun@1.3.14","scripts":{"check":"echo ok"}}`)
 	writeFile(t, filepath.Join(cwd, "bun.lock"), "lockfileVersion: 1\n")
 	legacyJSON := filepath.Join(cwd, "hooversion.config.json")

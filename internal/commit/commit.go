@@ -4,6 +4,7 @@ package commit
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/openhoo/hooversion/internal/types"
 )
@@ -80,7 +81,7 @@ func Lint(c types.ParsedCommit, policy *types.CommitPolicy) []types.CommitLintIs
 	if strings.TrimSpace(description) == "" {
 		issues = append(issues, types.CommitLintIssue{Message: "description is required"})
 	}
-	if len(c.Subject) > 100 {
+	if utf8.RuneCountInString(c.Subject) > 100 {
 		issues = append(issues, types.CommitLintIssue{Message: "header must not exceed 100 characters"})
 	}
 	return issues

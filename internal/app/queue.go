@@ -39,7 +39,7 @@ type ReleaseTaskQueue struct {
 	onFailure      func(error)
 	onTaskComplete func()
 	maxAttempts    int
-	retryDelayMs   time.Duration
+	retryDelay     time.Duration
 	maxPending     int
 	pending        int
 }
@@ -58,11 +58,11 @@ func NewReleaseTaskQueue(onFailure func(error), options QueueOptions) *ReleaseTa
 		maxPending = DefaultQueueMaxPending
 	}
 	return &ReleaseTaskQueue{
-		chains:       make(map[string]*keyQueue),
-		onFailure:    onFailure,
-		maxAttempts:  maxAttempts,
-		retryDelayMs: time.Duration(retryDelayMs) * time.Millisecond,
-		maxPending:   maxPending,
+		chains:      make(map[string]*keyQueue),
+		onFailure:   onFailure,
+		maxAttempts: maxAttempts,
+		retryDelay:  time.Duration(retryDelayMs) * time.Millisecond,
+		maxPending:  maxPending,
 	}
 }
 
@@ -170,8 +170,8 @@ func (q *ReleaseTaskQueue) runWithRetry(task func() error) error {
 		if attempt >= q.maxAttempts {
 			return err
 		}
-		if q.retryDelayMs > 0 {
-			time.Sleep(q.retryDelayMs)
+		if q.retryDelay > 0 {
+			time.Sleep(q.retryDelay)
 		}
 	}
 }

@@ -238,8 +238,6 @@ func optionalStringField(m map[string]any, key string) (*string, bool) {
 	return &s, ok
 }
 
-func scalarButNotMissing(v any, present bool) bool { return !present || v != nil }
-
 // validateCloneMetadata applies the webhook-level clone URL rules of
 // validateWorkflowRunPayload and returns a verbatim error message or "".
 func validateCloneMetadata(cloneURL, fullName string, trustedCloneHosts []string) string {
