@@ -608,9 +608,12 @@ func tarContainsLicense(path, name string) error {
 		return fmt.Errorf("inspect %s: %w", name, err)
 	}
 	defer gz.Close()
-	reader := tar.NewReader(gz)
+	// Bound actual decompressed bytes too, including padding and extensions.
+	limited := &io.LimitedReader{R: gz, N: maxArchiveBytes + 1}
+	reader := tar.NewReader(limited)
+	found := false
 	var total int64
-	for entries := 0; entries < 10000; entries++ {
+	for entries := 0; ; entries++ {
 		header, err := reader.Next()
 		if errors.Is(err, io.EOF) {
 			break
@@ -618,22 +621,48 @@ func tarContainsLicense(path, name string) error {
 		if err != nil {
 			return fmt.Errorf("inspect %s: %w", name, err)
 		}
+		if entries >= maxArchiveEntries {
+			return fmt.Errorf("inspect %s: archive has too many entries", name)
+		}
 		if err := safeArchivePath(header.Name); err != nil {
 			return fmt.Errorf("inspect %s: %w", name, err)
 		}
-		total += header.Size
-		if header.Size < 0 || total > 512<<20 {
+		if header.Size < 0 || header.Size > maxArchiveBytes-total {
 			return fmt.Errorf("inspect %s: uncompressed archive exceeds 512 MiB", name)
+		}
+		total += header.Size
+		if header.Typeflag == tar.TypeSymlink || header.Typeflag == tar.TypeLink {
+			if err := safeArchivePath(header.Linkname); err != nil {
+				return fmt.Errorf("inspect %s: unsafe archive link: %w", name, err)
+			}
 		}
 		if header.Typeflag == tar.TypeReg && strings.EqualFold(filepath.Base(header.Name), "LICENSE") {
 			if header.Size <= 0 || header.Size > 1<<20 {
 				return fmt.Errorf("inspect %s: LICENSE has invalid size", name)
 			}
-			return nil
+			found = true
+		}
+		if _, err := io.Copy(io.Discard, reader); err != nil {
+			return fmt.Errorf("inspect %s: %w", name, err)
 		}
 	}
-	return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	// Reaching tar EOF does not yet validate the gzip trailer/CRC.
+	if _, err := io.Copy(io.Discard, limited); err != nil {
+		return fmt.Errorf("inspect %s: %w", name, err)
+	}
+	if limited.N == 0 {
+		return fmt.Errorf("inspect %s: uncompressed archive exceeds 512 MiB", name)
+	}
+	if !found {
+		return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	}
+	return nil
 }
+
+const (
+	maxArchiveBytes   = int64(512 << 20)
+	maxArchiveEntries = 10000
+)
 
 func zipContainsLicense(path, name string) error {
 	reader, err := zip.OpenReader(path)
@@ -641,32 +670,58 @@ func zipContainsLicense(path, name string) error {
 		return fmt.Errorf("inspect %s: %w", name, err)
 	}
 	defer reader.Close()
-	if len(reader.File) > 10000 {
+	if len(reader.File) > maxArchiveEntries {
 		return fmt.Errorf("inspect %s: archive has too many entries", name)
 	}
+	found := false
 	var total uint64
 	for _, entry := range reader.File {
 		if err := safeArchivePath(entry.Name); err != nil {
 			return fmt.Errorf("inspect %s: %w", name, err)
 		}
-		total += entry.UncompressedSize64
-		if total > 512<<20 {
+		if entry.UncompressedSize64 > uint64(maxArchiveBytes)-total {
 			return fmt.Errorf("inspect %s: uncompressed archive exceeds 512 MiB", name)
 		}
-		if !entry.FileInfo().IsDir() && strings.EqualFold(filepath.Base(entry.Name), "LICENSE") {
+		total += entry.UncompressedSize64
+		if entry.Mode().IsRegular() && strings.EqualFold(filepath.Base(entry.Name), "LICENSE") {
 			if entry.UncompressedSize64 == 0 || entry.UncompressedSize64 > 1<<20 {
 				return fmt.Errorf("inspect %s: LICENSE has invalid size", name)
 			}
-			return nil
+			found = true
+		}
+		content, err := entry.Open()
+		if err != nil {
+			return fmt.Errorf("inspect %s: %w", name, err)
+		}
+		read, readErr := io.Copy(io.Discard, io.LimitReader(content, int64(entry.UncompressedSize64)+1))
+		closeErr := content.Close()
+		if readErr != nil {
+			return fmt.Errorf("inspect %s: %w", name, readErr)
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if uint64(read) != entry.UncompressedSize64 {
+			return fmt.Errorf("inspect %s: entry size mismatch", name)
 		}
 	}
-	return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	if !found {
+		return fmt.Errorf("archive %s does not contain a regular LICENSE file", name)
+	}
+	return nil
 }
 
 func safeArchivePath(name string) error {
-	clean := filepath.Clean(filepath.FromSlash(strings.ReplaceAll(name, `\`, "/")))
-	if name == "" || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+	normalized := strings.ReplaceAll(name, `\`, "/")
+	clean := filepath.Clean(filepath.FromSlash(normalized))
+	if name == "" || strings.ContainsRune(name, '\x00') || strings.HasPrefix(normalized, "/") ||
+		(len(normalized) >= 2 && normalized[1] == ':') || filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("unsafe archive path %q", name)
+	}
+	for _, part := range strings.Split(normalized, "/") {
+		if part == ".." {
+			return fmt.Errorf("unsafe archive path %q", name)
+		}
 	}
 	return nil
 }

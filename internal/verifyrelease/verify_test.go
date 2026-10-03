@@ -2,6 +2,7 @@ package verifyrelease
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -289,5 +290,118 @@ func TestSafeArchivePathRejectsTraversal(t *testing.T) {
 	}
 	if err := safeArchivePath(filepath.ToSlash("demo/LICENSE")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestArchiveChecksEntriesAfterLicense(t *testing.T) {
+	var data bytes.Buffer
+	gz := gzip.NewWriter(&data)
+	tw := tar.NewWriter(gz)
+	for _, name := range []string{"LICENSE", "../escape"} {
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: 1, Typeflag: tar.TypeReg}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tw.Write([]byte("x")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "artifact.tar.gz")
+	if err := os.WriteFile(path, data.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveContainsLicense(path, "artifact.tar.gz"); err == nil {
+		t.Fatal("accepted unsafe entry after LICENSE")
+	}
+}
+
+func TestArchivePathsRejectWindowsTraversal(t *testing.T) {
+	for _, name := range []string{"C:/outside", "C:\\outside", "\\\\server\\share\\file", "../outside", "/outside", "file\x00"} {
+		if err := safeArchivePath(name); err == nil {
+			t.Errorf("accepted %q", name)
+		}
+	}
+}
+
+func TestZipLicenseMustBeRegularAndArchiveMustRemainValid(t *testing.T) {
+	for _, test := range []struct {
+		name                     string
+		symlink, unsafe, corrupt bool
+	}{{name: "symlink license", symlink: true}, {name: "traversal after license", unsafe: true}, {name: "corrupt license payload", corrupt: true}} {
+		t.Run(test.name, func(t *testing.T) {
+			var data bytes.Buffer
+			writer := zip.NewWriter(&data)
+			header := &zip.FileHeader{Name: "LICENSE", Method: zip.Store}
+			header.SetMode(0600)
+			if test.symlink {
+				header.SetMode(os.ModeSymlink | 0777)
+			}
+			file, err := writer.CreateHeader(header)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Write([]byte("license-content")); err != nil {
+				t.Fatal(err)
+			}
+			if test.unsafe {
+				entry, err := writer.Create("../outside")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := entry.Write([]byte("x")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			raw := data.Bytes()
+			if test.corrupt {
+				offset := bytes.Index(raw, []byte("license-content"))
+				if offset < 0 {
+					t.Fatal("payload missing")
+				}
+				raw[offset] ^= 1
+			}
+			path := filepath.Join(t.TempDir(), "artifact.zip")
+			if err := os.WriteFile(path, raw, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := archiveContainsLicense(path, "artifact.zip"); err == nil {
+				t.Fatal("invalid archive passed license verification")
+			}
+		})
+	}
+}
+
+func TestTarLicenseCheckValidatesGzipTrailer(t *testing.T) {
+	var data bytes.Buffer
+	gz := gzip.NewWriter(&data)
+	writer := tar.NewWriter(gz)
+	if err := writer.WriteHeader(&tar.Header{Name: "LICENSE", Mode: 0600, Size: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw := data.Bytes()
+	raw[len(raw)-8] ^= 1
+	path := filepath.Join(t.TempDir(), "artifact.tar.gz")
+	if err := os.WriteFile(path, raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveContainsLicense(path, "artifact.tar.gz"); err == nil {
+		t.Fatal("invalid gzip checksum passed verification")
 	}
 }
