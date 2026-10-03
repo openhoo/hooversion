@@ -144,6 +144,8 @@ release verifier also consumes the complete inventory.
   real subprocess exit without cleanup, interrupted commit/partial tag recovery,
   refused foreign HEAD changes, linked worktree ownership, canceled hooks, and
   uncertain-push retry against a real bare Git remote.
+- A fresh-clone App retry after a successful push and failed publication completes
+  publication without a second commit; other source commits and branches remain stale.
 - Actual HTTP App shutdown followed by spool reopening proved canceled delivery
   replay. Worker/repository bounds and cancellation through Git/HTTP/token paths
   have race-tested regressions.

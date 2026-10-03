@@ -165,6 +165,13 @@ missing tokens and trailing response documents are rejected. Authenticated
 mutations refuse redirects. Download redirects strip credentials whenever the
 origin changes and refuse HTTPS downgrades.
 
+If an App attempt pushes the release commit and tags before GitHub publication
+fails, a retry may clone that release commit instead of the original CI source.
+The runner resumes publication only when the reconstructed release has the
+exact webhook source commit as its parent and matches the requested branch.
+Other newer heads remain stale. This recovery survives deletion of the failed
+attempt's temporary clone and avoids creating another release commit.
+
 ## Release Flow
 
 1. Repository CI completes successfully on a configured release branch.
@@ -174,8 +181,9 @@ origin changes and refuse HTTPS downgrades.
 4. Versionhoo creates a GitHub App installation token scoped to the webhook
    repository id.
 5. The app creates a `Versionhoo Release` check run on the CI-passed commit.
-6. The app clones the repository and confirms the release branch still points at
-   the workflow head SHA. Stale runs are marked neutral and skipped.
+6. The app clones the repository and checks the workflow head SHA. An exact
+   release commit from an earlier attempt can resume publication; unrelated
+   newer heads are marked stale, neutral, and skipped.
 7. The app runs the normal Hooversion release engine.
 8. The app pushes release commits and tags with the installation token and
    creates GitHub Releases.

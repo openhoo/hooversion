@@ -15,6 +15,7 @@ import (
 
 	"github.com/openhoo/hooversion/internal/config"
 	hverr "github.com/openhoo/hooversion/internal/errors"
+	"github.com/openhoo/hooversion/internal/git"
 	"github.com/openhoo/hooversion/internal/plan"
 	"github.com/openhoo/hooversion/internal/process"
 	"github.com/openhoo/hooversion/internal/release"
@@ -334,7 +335,7 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
-		if branchHead != spec.HeadSha {
+		staleResult := func() Outcome {
 			return Outcome{
 				RepositoryFullName: spec.RepositoryFullName,
 				Branch:             spec.Branch,
@@ -346,6 +347,17 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 					"Skipped stale workflow run for %s@%s: branch is %s, workflow passed on %s.",
 					spec.RepositoryFullName, spec.Branch, branchHead, spec.HeadSha),
 				Releases: []ReleaseRef{},
+			}
+		}
+		if branchHead != spec.HeadSha {
+			message, err := git.CommitMessageWithEnv(repoDir, "HEAD", env, ctx)
+			if err != nil {
+				return failureOutcome(spec, err)
+			}
+			// Ordinary newer commits stay stale even if they have no release config.
+			// Only a possible release commit proceeds to validated resume derivation.
+			if !strings.HasPrefix(message, "chore(release): ") {
+				return staleResult()
 			}
 		}
 		if spec.InstallCommand != "" {
@@ -366,17 +378,31 @@ func runVersionhooRelease(spec JobSpec) Outcome {
 		if err != nil {
 			return failureOutcome(spec, err)
 		}
+		repoIdentity, err := ValidateRepositoryFullName(spec.RepositoryFullName)
+		if err != nil {
+			return failureOutcome(spec, err)
+		}
 		if cfg.GitHub.Enabled {
-			repoIdentity, err := ValidateRepositoryFullName(spec.RepositoryFullName)
-			if err != nil {
-				return failureOutcome(spec, err)
-			}
 			cfg.GitHub.Repository = repoIdentity
 			cfg.GitHub.ApiUrl = trustedApiURL
 		}
-		releasePlan, err := plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env, ctx)
-		if err != nil {
-			return failureOutcome(spec, err)
+		var releasePlan *types.ReleasePlan
+		if branchHead != spec.HeadSha {
+			resumed, err := release.DeriveResumableWithEnv(repoDir, cfg, env, ctx)
+			if err != nil {
+				return failureOutcome(spec, err)
+			}
+			// A prior App attempt may already have pushed this release before its
+			// publication failed. A fresh clone can resume only that exact CI source.
+			if resumed == nil || resumed.SourceSha != spec.HeadSha || resumed.Branch != spec.Branch {
+				return staleResult()
+			}
+			releasePlan = resumed
+		} else {
+			releasePlan, err = plan.CreatePlanWithEnv(repoDir, cfg, spec.Branch, nil, env, ctx)
+			if err != nil {
+				return failureOutcome(spec, err)
+			}
 		}
 		execution, err := release.Execute(repoDir, cfg, releasePlan, release.Options{
 			Context:     ctx,
